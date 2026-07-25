@@ -19,6 +19,11 @@ Tax/Compliance Functionality
 
 The portal could also be used to exchange (and verify) compliance information such as 499 status in the US.
 
+Maintenance/Outage Notifications
+
+Maintenance notifications listing service affecting issues. Optionally, these notifications could be passed on to affected customers.
+
+
 Desired integrations
 
 IXP Manager
