@@ -5,7 +5,7 @@ The purpose of Open Carrier Portal [OCP] is to facilite the sharing of informati
 
 The implementation will primarily consist of a rest API as well as a reference implementation. The reference implementation will be targeted at smaller carriers and data centers.
 
-Network Functionality
+Network Information Functionality
 
 For instance, a data center could date one of their customer a particular CFA space for the purpose of issueing LOAs. The carrier, in their own portal, could issue a LOA/CFA and notify both the data center and the other party of the availablity of the allocated port. The data center could optionally issue paperwork for the ordering party to place a cross connect order. Following completion, that port status could be available for either party to query. So during turn up the installing party could verify the light levels at the far end receiver without contacting a NOC. Further, the data center operator could automatically get a notification that the polairty and loss reading are within the expected ranges.
 
@@ -27,3 +27,4 @@ Observium
 LibreNMS
 PeeringDB
 NetBox
+Docusign/AdobeSign etc.
