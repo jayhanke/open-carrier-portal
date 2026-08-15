@@ -23,6 +23,10 @@ Maintenance/Outage Notifications
 
 Maintenance notifications listing service affecting issues. Optionally, these notifications could be passed on to affected customers.
 
+Escalation List Contacts
+
+Carriers can provide an up-to-date escalation list for issue resolution.
+
 
 Desired integrations
 
