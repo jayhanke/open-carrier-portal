@@ -10,3 +10,4 @@ dist/
 build/
 *.db
 .env
+app.env

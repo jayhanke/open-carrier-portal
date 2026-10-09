@@ -98,7 +98,14 @@ python -m venv .venv
 python -m pip install -e ".[dev]"
 ```
 
-Configure a development instance. Use a secret manager rather than shell environment
+The [`app.env.example`](./app.env.example) file lists the application environment
+settings. Copy it to a private environment file, replace the secret placeholders, and
+restrict its permissions (for example, `chmod 600 app.env`). Do not commit the live
+environment file. When running the API as a systemd service, point `EnvironmentFile` to
+that private file. The example uses an HTTPS issuer URL; set `OCP_ISSUER_URL` to the
+connector's actual HTTPS URL before using it outside localhost.
+
+For a local development instance, use a secret manager rather than shell environment
 variables in production:
 
 ```powershell
