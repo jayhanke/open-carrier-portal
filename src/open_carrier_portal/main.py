@@ -75,6 +75,7 @@ def create_app(
             username=profile.username,
             password_env_var=profile.password_env_var,
             tls_ca_path=profile.tls_ca_path,
+            allow_insecure=profile.allow_insecure,
             timeout_seconds=profile.timeout_seconds,
             mapping_json=profile.mapping_json,
             environment=os.environ,

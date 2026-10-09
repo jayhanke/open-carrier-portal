@@ -71,6 +71,11 @@ def main() -> None:
     source_parser.add_argument("--username")
     source_parser.add_argument("--password-env", default="OCP_SOURCE_DB_PASSWORD")
     source_parser.add_argument("--tls-ca")
+    source_parser.add_argument(
+        "--allow-insecure",
+        action="store_true",
+        help="Allow unencrypted remote MySQL traffic on a trusted isolated network",
+    )
     source_parser.add_argument("--timeout-seconds", type=int, default=10)
     source_parser.add_argument("--mapping-file", type=Path)
     source_parser.add_argument("--disabled", action="store_true")
@@ -162,6 +167,17 @@ def main() -> None:
     if args.command == "configure-source":
         if args.driver == "mysql" and (not args.host or not args.username):
             parser.error("mysql requires --host and --username")
+        if args.driver == "mysql" and args.tls_ca and args.allow_insecure:
+            parser.error("--tls-ca and --allow-insecure cannot be used together")
+        if (
+            args.driver == "mysql"
+            and not args.tls_ca
+            and not args.allow_insecure
+            and args.host.lower() not in {"localhost", "127.0.0.1", "::1"}
+        ):
+            parser.error("remote MySQL requires --tls-ca or explicit --allow-insecure opt-in")
+        if args.driver != "mysql" and args.allow_insecure:
+            parser.error("--allow-insecure applies only to remote MySQL profiles")
         mapping = (
             SourceMapping.nettool_defaults()
             if args.mapping_file is None
@@ -176,6 +192,7 @@ def main() -> None:
             username=args.username if args.driver == "mysql" else None,
             password_env_var=args.password_env if args.driver == "mysql" else None,
             tls_ca_path=args.tls_ca if args.driver == "mysql" else None,
+            allow_insecure=args.allow_insecure,
             timeout_seconds=args.timeout_seconds,
             mapping_json=mapping.to_json(),
             enabled=not args.disabled,
@@ -188,6 +205,7 @@ def main() -> None:
                     "driver": args.driver,
                     "database": args.database,
                     "password_env": (args.password_env if args.driver == "mysql" else None),
+                    "allow_insecure": args.allow_insecure,
                     "enabled": not args.disabled,
                 },
                 indent=2,
@@ -208,6 +226,7 @@ def main() -> None:
         username=profile.username,
         password_env_var=profile.password_env_var,
         tls_ca_path=profile.tls_ca_path,
+        allow_insecure=profile.allow_insecure,
         timeout_seconds=profile.timeout_seconds,
         mapping_json=profile.mapping_json,
         environment=os.environ,

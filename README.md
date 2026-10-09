@@ -140,7 +140,26 @@ with `ocp test-source`; if table or column names differ, provide a JSON mapping 
 table/column identifiers, not arbitrary SQL. Use a dedicated read-only database account.
 Remote MySQL connections require TLS with a CA file. Keep the password environment
 variable available to the connector process as well as to the CLI when testing the
-profile.
+profile. For a trusted, isolated network where the database cannot negotiate modern
+verified TLS, an administrator may instead explicitly select plaintext mode:
+
+```bash
+ocp configure-source \
+  --name nettool \
+  --driver mysql \
+  --host "10.0.0.20" \
+  --port 3306 \
+  --database "nettool" \
+  --username "ocp_reader" \
+  --password-env OCP_SOURCE_DB_PASSWORD \
+  --allow-insecure
+```
+
+Use either `--tls-ca` for verified TLS or `--allow-insecure` to disable MySQL TLS;
+they cannot be combined. Remote connections fail closed if neither option is provided.
+Plaintext mode exposes the database credentials and traffic to anyone able to monitor
+that network segment. Use it only on a controlled, isolated network with firewall rules
+limiting access to the connector host. Prefer verified TLS or an encrypted tunnel.
 
 To authorize a partner for circuits, create its client with the circuit scope and
 explicitly share each permitted circuit. `share-circuit` prints the opaque public circuit

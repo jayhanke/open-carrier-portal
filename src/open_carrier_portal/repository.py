@@ -43,6 +43,7 @@ class SourceDatabaseProfile:
     username: str | None
     password_env_var: str | None
     tls_ca_path: str | None
+    allow_insecure: bool
     timeout_seconds: int
     mapping_json: str
     enabled: bool
@@ -137,6 +138,7 @@ class Repository:
                     username TEXT,
                     password_env_var TEXT,
                     tls_ca_path TEXT,
+                    allow_insecure INTEGER NOT NULL DEFAULT 0,
                     timeout_seconds INTEGER NOT NULL,
                     mapping_json TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
@@ -169,40 +171,49 @@ class Repository:
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(source_database_profiles)")
         }
-        if "database_path" not in columns:
-            return
-        connection.executescript(
-            """
-            DROP TABLE IF EXISTS source_database_profiles_legacy;
-            ALTER TABLE source_database_profiles RENAME TO source_database_profiles_legacy;
-            CREATE TABLE source_database_profiles (
-                profile_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                driver TEXT NOT NULL,
-                host TEXT,
-                port INTEGER,
-                database_name TEXT NOT NULL,
-                username TEXT,
-                password_env_var TEXT,
-                tls_ca_path TEXT,
-                timeout_seconds INTEGER NOT NULL,
-                mapping_json TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            INSERT INTO source_database_profiles (
-                profile_id, name, driver, host, port, database_name, username,
-                password_env_var, tls_ca_path, timeout_seconds, mapping_json, enabled,
-                created_at, updated_at
+        if "database_path" in columns:
+            connection.executescript(
+                """
+                DROP TABLE IF EXISTS source_database_profiles_legacy;
+                ALTER TABLE source_database_profiles RENAME TO source_database_profiles_legacy;
+                CREATE TABLE source_database_profiles (
+                    profile_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    driver TEXT NOT NULL,
+                    host TEXT,
+                    port INTEGER,
+                    database_name TEXT NOT NULL,
+                    username TEXT,
+                    password_env_var TEXT,
+                    tls_ca_path TEXT,
+                    allow_insecure INTEGER NOT NULL DEFAULT 0,
+                    timeout_seconds INTEGER NOT NULL,
+                    mapping_json TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO source_database_profiles (
+                    profile_id, name, driver, host, port, database_name, username,
+                    password_env_var, tls_ca_path, allow_insecure, timeout_seconds,
+                    mapping_json, enabled, created_at, updated_at
+                )
+                SELECT
+                    profile_id, name, driver, NULL, NULL, database_path, NULL,
+                    NULL, NULL, 0, 10, mapping_json, enabled, created_at, updated_at
+                FROM source_database_profiles_legacy;
+                DROP TABLE source_database_profiles_legacy;
+                """
             )
-            SELECT
-                profile_id, name, driver, NULL, NULL, database_path, NULL,
-                NULL, NULL, 10, mapping_json, enabled, created_at, updated_at
-            FROM source_database_profiles_legacy;
-            DROP TABLE source_database_profiles_legacy;
-            """
-        )
+        current_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(source_database_profiles)")
+        }
+        if "allow_insecure" not in current_columns:
+            connection.execute(
+                "ALTER TABLE source_database_profiles "
+                "ADD COLUMN allow_insecure INTEGER NOT NULL DEFAULT 0"
+            )
 
     def put_source_database_profile(
         self,
@@ -217,6 +228,7 @@ class Repository:
         tls_ca_path: str | None,
         timeout_seconds: int,
         mapping_json: str,
+        allow_insecure: bool = False,
         enabled: bool = True,
     ) -> str:
         if not name.strip():
@@ -231,6 +243,16 @@ class Repository:
             raise ValueError(
                 "mysql source profiles require host, port, username, and password environment"
             )
+        if driver == "mysql":
+            is_remote = host.lower() not in {"localhost", "127.0.0.1", "::1"}
+            if tls_ca_path is not None and allow_insecure:
+                raise ValueError("TLS CA and insecure connection settings are mutually exclusive")
+            if is_remote and tls_ca_path is None and not allow_insecure:
+                raise ValueError(
+                    "remote mysql source profiles require a TLS CA or explicit insecure opt-in"
+                )
+        elif allow_insecure:
+            raise ValueError("insecure connection opt-in applies only to remote MySQL profiles")
         profile_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connection() as connection:
@@ -243,7 +265,8 @@ class Repository:
                     """
                     UPDATE source_database_profiles
                     SET driver = ?, host = ?, port = ?, database_name = ?, username = ?,
-                        password_env_var = ?, tls_ca_path = ?, timeout_seconds = ?,
+                        password_env_var = ?, tls_ca_path = ?, allow_insecure = ?,
+                        timeout_seconds = ?,
                         mapping_json = ?, enabled = ?, updated_at = ?
                     WHERE profile_id = ?
                     """,
@@ -255,6 +278,7 @@ class Repository:
                         username,
                         password_env_var,
                         tls_ca_path,
+                        int(allow_insecure),
                         timeout_seconds,
                         mapping_json,
                         int(enabled),
@@ -267,9 +291,9 @@ class Repository:
                     """
                     INSERT INTO source_database_profiles
                         (profile_id, name, driver, host, port, database_name, username,
-                         password_env_var, tls_ca_path, timeout_seconds, mapping_json,
-                         enabled, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         password_env_var, tls_ca_path, allow_insecure, timeout_seconds,
+                         mapping_json, enabled, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         profile_id,
@@ -281,6 +305,7 @@ class Repository:
                         username,
                         password_env_var,
                         tls_ca_path,
+                        int(allow_insecure),
                         timeout_seconds,
                         mapping_json,
                         int(enabled),
@@ -295,8 +320,8 @@ class Repository:
             row = connection.execute(
                 """
                 SELECT profile_id, name, driver, host, port, database_name, username,
-                       password_env_var, tls_ca_path, timeout_seconds, mapping_json,
-                       enabled, created_at, updated_at
+                       password_env_var, tls_ca_path, allow_insecure, timeout_seconds,
+                       mapping_json, enabled, created_at, updated_at
                 FROM source_database_profiles WHERE name = ?
                 """,
                 (name,),
@@ -315,6 +340,7 @@ class Repository:
                 None if row["password_env_var"] is None else str(row["password_env_var"])
             ),
             tls_ca_path=None if row["tls_ca_path"] is None else str(row["tls_ca_path"]),
+            allow_insecure=bool(row["allow_insecure"]),
             timeout_seconds=int(row["timeout_seconds"]),
             mapping_json=str(row["mapping_json"]),
             enabled=bool(row["enabled"]),

@@ -196,11 +196,12 @@ def test_mysql_source_uses_tls_and_quoted_mapped_columns(
         "ca": str(ca_file),
         "check_hostname": True,
     }
+    assert connect_arguments["ssl_disabled"] is False
     assert connect_arguments["autocommit"] is True
     assert connection.closed is True
 
 
-def test_remote_mysql_source_requires_tls_ca() -> None:
+def test_remote_mysql_source_requires_tls_or_explicit_insecure_opt_in() -> None:
     with pytest.raises(ConfigurationError, match="TLS CA"):
         MySQLSourceDatabaseSettings(
             host="nettool-db.internal",
@@ -208,6 +209,63 @@ def test_remote_mysql_source_requires_tls_ca() -> None:
             database="nettool",
             username="ocp_reader",
             password="secret",
+        )
+
+    settings = MySQLSourceDatabaseSettings(
+        host="nettool-db.internal",
+        port=3306,
+        database="nettool",
+        username="ocp_reader",
+        password="test-password",
+        allow_insecure=True,
+    )
+    assert settings.allow_insecure is True
+
+
+def test_insecure_remote_mysql_explicitly_disables_tls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cursor = _FakeCursor()
+    connection = _FakeConnection(cursor)
+    connect_arguments: dict[str, Any] = {}
+
+    def fake_connect(**kwargs: Any) -> _FakeConnection:
+        connect_arguments.update(kwargs)
+        return connection
+
+    monkeypatch.setattr("open_carrier_portal.source_database.pymysql.connect", fake_connect)
+    source = SourceDatabase(
+        MySQLSourceDatabaseSettings(
+            host="nettool-db.internal",
+            port=3306,
+            database="nettool",
+            username="ocp_reader",
+            password="test-password",
+            allow_insecure=True,
+        ),
+        SourceMapping({"circuits": ResourceMapping("LitCircuit", {"source_id": "LitCircuitID"})}),
+    )
+
+    source.health_check()
+
+    assert connect_arguments["ssl"] is None
+    assert connect_arguments["ssl_disabled"] is True
+
+
+def test_remote_mysql_rejects_conflicting_tls_and_insecure_settings(
+    tmp_path: Path,
+) -> None:
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_text("test CA", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="mutually exclusive"):
+        MySQLSourceDatabaseSettings(
+            host="nettool-db.internal",
+            port=3306,
+            database="nettool",
+            username="ocp_reader",
+            password="test-password",
+            tls_ca=ca_file,
+            allow_insecure=True,
         )
 
 
@@ -224,6 +282,22 @@ def test_profile_configuration_resolves_password_from_environment(tmp_path: Path
         tls_ca_path=str(ca_file),
         mapping_json=SourceMapping.nettool_defaults().to_json(),
         environment={"NETTOOL_PASSWORD": "secret"},
+    )
+
+    assert source.driver == "mysql"
+
+
+def test_profile_configuration_accepts_explicit_insecure_opt_in() -> None:
+    source = configured_source_database(
+        driver="mysql",
+        host="nettool-db.internal",
+        port=3306,
+        database_name="nettool",
+        username="ocp_reader",
+        password_env_var="NETTOOL_PASSWORD",
+        mapping_json=SourceMapping.nettool_defaults().to_json(),
+        environment={"NETTOOL_PASSWORD": "secret"},
+        allow_insecure=True,
     )
 
     assert source.driver == "mysql"

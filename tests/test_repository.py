@@ -130,7 +130,35 @@ def test_source_database_profile_stores_secret_reference_only(tmp_path: Path) ->
     assert profile.profile_id == profile_id
     assert profile.password_env_var == "NETTOOL_PASSWORD"
     assert profile.database_name == "nettool"
+    assert profile.allow_insecure is False
     assert b"database-password" not in database_path.read_bytes()
+
+
+def test_source_database_profile_persists_explicit_insecure_opt_in(
+    tmp_path: Path,
+) -> None:
+    repository = Repository(tmp_path / "test.db", "k" * 32)
+    repository.initialize()
+
+    repository.put_source_database_profile(
+        name="nettool",
+        driver="mysql",
+        host="10.210.4.229",
+        port=3306,
+        database_name="NPDB",
+        username="ocp_reader",
+        password_env_var="OCP_SOURCE_DB_PASSWORD",
+        tls_ca_path=None,
+        timeout_seconds=10,
+        mapping_json=SourceMapping.nettool_defaults().to_json(),
+        allow_insecure=True,
+    )
+
+    profile = repository.get_source_database_profile("nettool")
+
+    assert profile is not None
+    assert profile.allow_insecure is True
+    assert profile.tls_ca_path is None
 
 
 def test_initialize_migrates_partial_source_profile_schema(tmp_path: Path) -> None:
@@ -164,3 +192,4 @@ def test_initialize_migrates_partial_source_profile_schema(tmp_path: Path) -> No
     assert profile is not None
     assert profile.database_name == "nettool.db"
     assert profile.timeout_seconds == 10
+    assert profile.allow_insecure is False

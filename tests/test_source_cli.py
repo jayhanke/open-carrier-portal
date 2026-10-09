@@ -104,6 +104,62 @@ def test_configure_and_test_sqlite_source_profile(
     ]
 
 
+def test_configure_source_requires_explicit_insecure_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    metadata_database = tmp_path / "ocp.db"
+    monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("OCP_DATABASE_PATH", str(metadata_database))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ocp",
+            "configure-source",
+            "--driver",
+            "mysql",
+            "--host",
+            "10.210.4.229",
+            "--database",
+            "NPDB",
+            "--username",
+            "ocp_reader",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 2
+    assert "--allow-insecure" in capsys.readouterr().err
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ocp",
+            "configure-source",
+            "--driver",
+            "mysql",
+            "--host",
+            "10.210.4.229",
+            "--database",
+            "NPDB",
+            "--username",
+            "ocp_reader",
+            "--allow-insecure",
+        ],
+    )
+    main()
+    configured = json.loads(capsys.readouterr().out)
+
+    assert configured["allow_insecure"] is True
+    profile = Repository(metadata_database, "k" * 32).get_source_database_profile("nettool")
+    assert profile is not None
+    assert profile.allow_insecure is True
+
+
 def test_share_and_revoke_circuit_cli_commands(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

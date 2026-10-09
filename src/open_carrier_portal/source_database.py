@@ -59,6 +59,7 @@ class MySQLSourceDatabaseSettings:
     password: str
     timeout_seconds: int = 10
     tls_ca: Path | None = None
+    allow_insecure: bool = False
     driver: Literal["mysql"] = "mysql"
 
     def __post_init__(self) -> None:
@@ -74,9 +75,15 @@ class MySQLSourceDatabaseSettings:
             raise ConfigurationError("source database password is required")
         if self.timeout_seconds < 1:
             raise ConfigurationError("source database timeout must be at least 1 second")
-        if self.host.lower() not in _LOOPBACK_HOSTS and self.tls_ca is None:
+        is_remote = self.host.lower() not in _LOOPBACK_HOSTS
+        if is_remote and self.tls_ca is None and not self.allow_insecure:
             raise ConfigurationError(
-                "a TLS CA file is required for a non-loopback source database host"
+                "a TLS CA file or explicit insecure-connection opt-in is required "
+                "for a non-loopback source database host"
+            )
+        if self.tls_ca is not None and self.allow_insecure:
+            raise ConfigurationError(
+                "TLS CA and insecure connection settings are mutually exclusive"
             )
         if self.tls_ca is not None and not self.tls_ca.is_file():
             raise ConfigurationError("source database TLS CA file does not exist")
@@ -280,6 +287,7 @@ class SourceDatabase:
                     cursorclass=DictCursor,
                     autocommit=True,
                     ssl=ssl,
+                    ssl_disabled=self._settings.tls_ca is None,
                 )
         except (sqlite3.Error, pymysql.MySQLError) as exc:
             raise SourceDatabaseUnavailableError(
@@ -416,6 +424,7 @@ def configured_source_database(
     username: str | None = None,
     password_env_var: str | None = None,
     tls_ca_path: str | None = None,
+    allow_insecure: bool = False,
     timeout_seconds: int = 10,
 ) -> SourceDatabase:
     mapping = SourceMapping.from_json(mapping_json)
@@ -449,6 +458,7 @@ def configured_source_database(
             password=password,
             timeout_seconds=timeout_seconds,
             tls_ca=None if tls_ca_path is None else Path(tls_ca_path),
+            allow_insecure=allow_insecure,
         ),
         mapping,
     )
