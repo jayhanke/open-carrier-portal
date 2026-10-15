@@ -104,7 +104,8 @@ private environment file, replace the secret placeholders, and restrict its perm
 (for example, `chmod 600 app.env`). Do not commit the live environment file. When running
 the API as a systemd service, point `EnvironmentFile` to that private file. The example
 uses an HTTPS issuer URL; set `OCP_ISSUER_URL` to the connector's actual HTTPS URL before
-using it outside localhost.
+using it outside localhost. A full connector deployment requires both a configured
+source database profile and an Observium URL with a read-only API token.
 
 For a local development instance, use a secret manager rather than shell environment
 variables in production:
