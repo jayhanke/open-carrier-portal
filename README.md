@@ -154,7 +154,7 @@ ssh -L 8000:127.0.0.1:8000 YOUR_USER@CONNECTOR_SERVER
 ```
 
 Then browse the same localhost URL. The connector CLI refuses non-loopback
-bind addresses. For an HTTPS reverse proxy, pass `--base-url https://YOUR_ADMIN_HOSTNAME` while
+bind addresses by default. For an HTTPS reverse proxy, pass `--base-url https://YOUR_ADMIN_HOSTNAME` while
 keeping the listener loopback. The proxy must preserve that Host header and
 restrict `/admin` and `/admin/*` to authorized operators; publish only the required
 API routes to partners. With a different port, supply matching
@@ -165,6 +165,25 @@ needed. The connector starts the portal heartbeat task and stops it on shutdown.
 Do not run multiple workers or a separate portal agent for the same pairing file.
 The legacy `ocp serve-admin` command now starts the same combined application,
 also on port 8000 by default.
+
+For temporary testing on a trusted private network only, explicitly set
+`OCP_ALLOW_INSECURE_HTTP=true` in the connector environment. This permits literal
+RFC1918/ULA private IPs, not public IPs or arbitrary HTTP hostnames. For example:
+
+```ini
+OCP_ALLOW_INSECURE_HTTP=true
+OCP_ISSUER_URL=http://10.210.4.223:8000
+OCP_ADMIN_BASE_URL=http://10.210.4.223:8000
+```
+
+Start with `ocp serve --host 10.210.4.223` and open
+`http://10.210.4.223:8000/admin/setup`. The bind IP must match the configured UI
+origin; wildcard network binds are not allowed. A warning is logged: admin
+passwords, session cookies, partner secrets and data travel without encryption.
+Restrict the listener to authorized test clients using your firewall. Disable
+the option and return to a loopback listener behind HTTPS after testing.
+This option does not relax TLS requirements for Observium, outbound partner
+connections, or hosted-portal pairing.
 
 Missing/disabled source profiles, invalid mappings, or missing saved integration
 credentials are logged and shown to signed-in administrators. Integration endpoints

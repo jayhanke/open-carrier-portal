@@ -45,7 +45,7 @@ def login(client: TestClient, password: str = "operator-password") -> None:
     response = client.post(
         "/admin/login",
         data={"username": "operator", "password": password, "csrf": csrf(client, "login")},
-        headers={"Origin": BASE},
+        headers={"Origin": str(client.base_url).rstrip("/")},
         follow_redirects=False,
     )
     assert response.status_code == 303
@@ -502,6 +502,66 @@ def test_cli_serves_api_and_admin_together(tmp_path: Path, monkeypatch, command)
         assert client.get("/health/live").status_code == 200
         assert client.get("/admin/setup").url.path == "/admin/login"
         assert client.get("/v1/devices").status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("host", "origin", "allowed"),
+    [
+        ("10.210.4.223", "http://10.210.4.223:8000", True),
+        ("10.210.4.223", "http://10.210.4.224:8000", False),
+        ("0.0.0.0", "http://10.210.4.223:8000", False),
+        ("8.8.8.8", "http://8.8.8.8:8000", False),
+    ],
+)
+def test_cli_private_network_testing_bind(tmp_path, monkeypatch, host, origin, allowed):
+    from open_carrier_portal import cli
+
+    monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "s" * 48)
+    monkeypatch.setenv("OCP_DATABASE_PATH", str(tmp_path / "metadata.db"))
+    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setattr("sys.argv", ["ocp", "serve", "--host", host, "--base-url", origin])
+    started = []
+    monkeypatch.setattr("uvicorn.run", lambda app, **options: started.append((app, options)))
+    if not allowed:
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2
+        assert not started
+        return
+    cli.main()
+    assert len(started) == 1
+    assert started[0][1]["host"] == host
+
+
+def test_combined_private_http_login_and_api(admin, caplog):
+    from dataclasses import replace
+
+    from open_carrier_portal.portal_agent import validate_portal_url
+
+    _, settings, connection_file = admin
+    origin = "http://10.210.4.223:8000"
+    settings = replace(settings, issuer_url=origin, allow_insecure_http=True)
+    app = create_app(settings, admin_base_url=origin, connection_file=connection_file)
+    with TestClient(app, base_url=origin) as client:
+        login(client)
+        assert client.get("/admin/setup").status_code == 200
+        assert client.get("/health/live").status_code == 200
+        assert client.cookies.get("ocp_admin") is not None
+        assert not next(
+            cookie for cookie in client.cookies.jar if cookie.name == "ocp_admin"
+        ).secure
+        assert client.get("/admin/setup", headers={"Host": "attacker.test"}).status_code == 400
+        assert (
+            client.post(
+                "/admin/identity",
+                data={"csrf": csrf(client), "name": "Attack"},
+                headers={"Origin": "http://attacker.test"},
+            ).status_code
+            == 403
+        )
+    assert "not encrypted" in caplog.text
+    with pytest.raises(ValueError):
+        validate_portal_url("http://10.210.4.224:8080")
 
 
 def test_observium_config_environment_precedence(admin, monkeypatch):

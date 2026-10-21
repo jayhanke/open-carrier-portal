@@ -2,9 +2,52 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from ipaddress import ip_address, ip_network
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from open_carrier_portal.errors import ConfigurationError
+
+PRIVATE_NETWORKS = tuple(
+    ip_network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
+)
+
+
+def is_private_network_host(host: str) -> bool:
+    try:
+        address = ip_address(host)
+    except ValueError:
+        return False
+    return any(address in network for network in PRIVATE_NETWORKS)
+
+
+def validate_connector_url(value: str, *, allow_insecure_http: bool = False) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigurationError("invalid connector URL") from exc
+    if (
+        not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or port == 0
+    ):
+        raise ConfigurationError("connector URL must be an origin without credentials or a path")
+    if parsed.scheme == "https":
+        return value.rstrip("/")
+    if parsed.scheme == "http" and (
+        parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        or (allow_insecure_http and is_private_network_host(parsed.hostname))
+    ):
+        return value.rstrip("/")
+    raise ConfigurationError(
+        "connector URL must use HTTPS outside localhost; trusted private-IP HTTP testing "
+        "requires OCP_ALLOW_INSECURE_HTTP=true"
+    )
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -44,14 +87,12 @@ class Settings:
     observium_ca_bundle: str | None = None
     observium_timeout_seconds: int = 15
     source_database_profile: str | None = None
+    allow_insecure_http: bool = False
 
     def __post_init__(self) -> None:
         if len(self.token_signing_key.encode("utf-8")) < 32:
             raise ConfigurationError("OCP_TOKEN_SIGNING_KEY must contain at least 32 bytes")
-        if not self.issuer_url.startswith("https://") and not self.issuer_url.startswith(
-            "http://localhost"
-        ):
-            raise ConfigurationError("OCP_ISSUER_URL must use HTTPS outside localhost")
+        validate_connector_url(self.issuer_url, allow_insecure_http=self.allow_insecure_http)
         if self.observium_base_url:
             if not self.observium_base_url.startswith("https://"):
                 raise ConfigurationError("OCP_OBSERVIUM_BASE_URL must use HTTPS")
@@ -87,4 +128,5 @@ class Settings:
             observium_ca_bundle=os.getenv("OCP_OBSERVIUM_CA_BUNDLE"),
             observium_timeout_seconds=_env_int("OCP_OBSERVIUM_TIMEOUT_SECONDS", 15, 1),
             source_database_profile=os.getenv("OCP_SOURCE_DB_PROFILE"),
+            allow_insecure_http=_env_bool("OCP_ALLOW_INSECURE_HTTP", False),
         )

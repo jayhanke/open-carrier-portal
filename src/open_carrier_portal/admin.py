@@ -23,7 +23,7 @@ from starlette.datastructures import FormData
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from open_carrier_portal.admin_store import AdminStore
-from open_carrier_portal.config import Settings
+from open_carrier_portal.config import Settings, is_private_network_host, validate_connector_url
 from open_carrier_portal.errors import ConnectorError, SourceDatabaseError
 from open_carrier_portal.models import ConnectorIdentity
 from open_carrier_portal.portal_agent import (
@@ -136,8 +136,13 @@ def create_admin_app(
     connection_file: Path = DEFAULT_CONNECTION_FILE,
     configuration_error: str = "",
 ) -> FastAPI:
-    base_url = validate_portal_url(base_url)
+    base_url = validate_connector_url(base_url, allow_insecure_http=settings.allow_insecure_http)
     parsed = urlsplit(base_url)
+    if parsed.scheme == "http" and is_private_network_host(parsed.hostname or ""):
+        logger.warning(
+            "Insecure private-network HTTP testing enabled: admin passwords, sessions and "
+            "partner credentials are not encrypted. Do not expose this listener publicly."
+        )
     repository = Repository(settings.database_path, settings.token_signing_key)
     repository.initialize()
     store = AdminStore(settings.database_path)

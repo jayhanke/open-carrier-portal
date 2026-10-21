@@ -7,10 +7,11 @@ import os
 import uuid
 from getpass import getpass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
-from open_carrier_portal.config import Settings
+from open_carrier_portal.config import Settings, is_private_network_host, validate_connector_url
 from open_carrier_portal.models import ConnectorIdentity
 from open_carrier_portal.portal_agent import (
     DEFAULT_CONNECTION_FILE,
@@ -136,15 +137,26 @@ def main() -> None:
 
             from open_carrier_portal.main import create_app
 
-            if args.host not in {"127.0.0.1", "::1", "localhost"}:
+            base_url = args.base_url or f"http://127.0.0.1:{args.port}"
+            if args.host not in {"127.0.0.1", "::1", "localhost"} and not (
+                settings.allow_insecure_http
+                and is_private_network_host(args.host)
+                and urlsplit(base_url).hostname == args.host
+            ):
                 parser.error(
-                    "connector listener must be loopback; "
-                    "use an SSH tunnel or trusted HTTPS reverse proxy"
+                    "use loopback with an SSH tunnel or HTTPS reverse proxy; direct private-IP "
+                    "testing requires OCP_ALLOW_INSECURE_HTTP=true and a matching --base-url"
                 )
+            try:
+                base_url = validate_connector_url(
+                    base_url, allow_insecure_http=settings.allow_insecure_http
+                )
+            except ValueError as exc:
+                parser.error(str(exc))
             uvicorn.run(
                 create_app(
                     settings,
-                    admin_base_url=args.base_url or f"http://127.0.0.1:{args.port}",
+                    admin_base_url=base_url,
                     connection_file=args.connection_file,
                 ),
                 host=args.host,
