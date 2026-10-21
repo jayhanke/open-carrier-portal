@@ -108,37 +108,44 @@ def main() -> None:
     for command in ("create-admin", "reset-admin-password"):
         admin_parser = subparsers.add_parser(command, help="Manage a local connector administrator")
         admin_parser.add_argument("--username", required=True)
-    serve_parser = subparsers.add_parser(
-        "serve-admin", help="Run the separate connector administration web UI"
-    )
-    serve_parser.add_argument("--host", default="127.0.0.1")
-    serve_parser.add_argument("--port", type=int, default=8081)
-    serve_parser.add_argument("--base-url", default="http://127.0.0.1:8081")
-    serve_parser.add_argument("--connection-file", type=Path, default=DEFAULT_CONNECTION_FILE)
+    for command in ("serve", "serve-admin"):
+        serve_parser = subparsers.add_parser(
+            command, help="Run the connector API and administration UI together"
+        )
+        serve_parser.add_argument("--host", default="127.0.0.1")
+        serve_parser.add_argument("--port", type=int, default=8000)
+        serve_parser.add_argument("--base-url", default=os.getenv("OCP_ADMIN_BASE_URL"))
+        serve_parser.add_argument(
+            "--connection-file",
+            type=Path,
+            default=Path(os.getenv("OCP_PORTAL_CONNECTION_FILE", str(DEFAULT_CONNECTION_FILE))),
+        )
 
     args = parser.parse_args()
     settings = Settings.from_env()
     repository = Repository(settings.database_path, settings.token_signing_key)
     repository.initialize()
 
-    if args.command in {"create-admin", "reset-admin-password", "serve-admin"}:
+    if args.command in {"create-admin", "reset-admin-password", "serve", "serve-admin"}:
         from open_carrier_portal.admin_store import AdminStore
 
         store = AdminStore(settings.database_path)
         store.initialize()
-        if args.command == "serve-admin":
+        if args.command in {"serve", "serve-admin"}:
             import uvicorn
 
-            from open_carrier_portal.admin import create_admin_app
+            from open_carrier_portal.main import create_app
 
             if args.host not in {"127.0.0.1", "::1", "localhost"}:
                 parser.error(
-                    "admin listener must be loopback; "
+                    "connector listener must be loopback; "
                     "use an SSH tunnel or trusted HTTPS reverse proxy"
                 )
             uvicorn.run(
-                create_admin_app(
-                    settings, base_url=args.base_url, connection_file=args.connection_file
+                create_app(
+                    settings,
+                    admin_base_url=args.base_url or f"http://127.0.0.1:{args.port}",
+                    connection_file=args.connection_file,
                 ),
                 host=args.host,
                 port=args.port,

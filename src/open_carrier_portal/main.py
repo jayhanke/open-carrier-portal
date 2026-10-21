@@ -1,10 +1,12 @@
 import base64
 import binascii
+import logging
 import os
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Form, Query, Request
@@ -38,6 +40,7 @@ from open_carrier_portal.models import (
     Page,
     TokenResponse,
 )
+from open_carrier_portal.portal_agent import DEFAULT_CONNECTION_FILE
 from open_carrier_portal.repository import Repository
 from open_carrier_portal.security import CursorCodec, TokenCodec
 from open_carrier_portal.source_database import (
@@ -46,6 +49,7 @@ from open_carrier_portal.source_database import (
 )
 
 bearer_scheme = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -54,38 +58,51 @@ def create_app(
     repository: Repository | None = None,
     adapter: MonitoringAdapter | None = None,
     source_database: SourceDatabase | None = None,
+    admin_base_url: str | None = None,
+    connection_file: Path = DEFAULT_CONNECTION_FILE,
 ) -> FastAPI:
     repository = repository or Repository(settings.database_path, settings.token_signing_key)
     repository.initialize()
-    from open_carrier_portal.admin import configured_settings
+    from open_carrier_portal.admin import configured_settings, create_admin_app
     from open_carrier_portal.admin_store import AdminStore
 
     admin_store = AdminStore(settings.database_path)
     admin_store.initialize()
-    settings = configured_settings(settings, admin_store)
-    if source_database is None and settings.source_database_profile:
-        profile = repository.get_source_database_profile(settings.source_database_profile)
-        if profile is None:
-            raise ConfigurationError(
-                f"source database profile {settings.source_database_profile!r} does not exist"
+    configuration_error = ""
+    try:
+        settings = configured_settings(settings, admin_store)
+        if source_database is None and settings.source_database_profile:
+            profile = repository.get_source_database_profile(settings.source_database_profile)
+            if profile is None or not profile.enabled:
+                raise ConfigurationError("selected source profile is missing or disabled")
+            source_database = configured_source_database(
+                driver=profile.driver,
+                host=profile.host,
+                port=profile.port,
+                database_name=profile.database_name,
+                username=profile.username,
+                password_env_var=profile.password_env_var,
+                tls_ca_path=profile.tls_ca_path,
+                allow_insecure=profile.allow_insecure,
+                timeout_seconds=profile.timeout_seconds,
+                mapping_json=profile.mapping_json,
+                environment=os.environ,
             )
-        if not profile.enabled:
-            raise ConfigurationError(
-                f"source database profile {settings.source_database_profile!r} is disabled"
+        if adapter is None and settings.observium_enabled:
+            adapter = ObserviumAdapter(
+                base_url=settings.observium_base_url or "",
+                api_token=settings.observium_api_token or "",
+                repository=repository,
+                timeout_seconds=settings.observium_timeout_seconds,
+                ca_bundle=settings.observium_ca_bundle,
             )
-        source_database = configured_source_database(
-            driver=profile.driver,
-            host=profile.host,
-            port=profile.port,
-            database_name=profile.database_name,
-            username=profile.username,
-            password_env_var=profile.password_env_var,
-            tls_ca_path=profile.tls_ca_path,
-            allow_insecure=profile.allow_insecure,
-            timeout_seconds=profile.timeout_seconds,
-            mapping_json=profile.mapping_json,
-            environment=os.environ,
+    except ValueError, OSError:
+        configuration_error = (
+            "Integration configuration is invalid. Check the selected source profile, mapping, "
+            "TLS CA paths, and source/Observium secret environment variables, "
+            "then restart the connector."
         )
+        logger.error(configuration_error)
     token_codec = TokenCodec(
         issuer=settings.issuer_url,
         audience=settings.token_audience,
@@ -95,21 +112,22 @@ def create_app(
     )
     auth_service = AuthenticationService(repository, token_codec)
     cursor_codec = CursorCodec(settings.token_signing_key)
-    if adapter is None and settings.observium_enabled:
-        adapter = ObserviumAdapter(
-            base_url=settings.observium_base_url or "",
-            api_token=settings.observium_api_token or "",
-            repository=repository,
-            timeout_seconds=settings.observium_timeout_seconds,
-            ca_bundle=settings.observium_ca_bundle,
-        )
+    admin_app = create_admin_app(
+        settings,
+        base_url=admin_base_url or settings.issuer_url,
+        connection_file=connection_file,
+        configuration_error=configuration_error,
+    )
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        yield
-        close = getattr(adapter, "close", None)
-        if close is not None:
-            await close()
+    async def lifespan(_: FastAPI) -> AsyncGenerator[None]:
+        try:
+            async with admin_app.router.lifespan_context(admin_app):
+                yield
+        finally:
+            close = getattr(adapter, "close", None)
+            if close is not None:
+                await close()
 
     app = FastAPI(
         title="Open Carrier Portal Connector",
@@ -121,6 +139,8 @@ def create_app(
     app.state.adapter = adapter
     app.state.source_database = source_database
     app.state.auth_service = auth_service
+    app.state.admin_store = admin_app.state.admin_store
+    app.state.admin_app = admin_app
 
     @app.middleware("http")
     async def correlation_id_middleware(
@@ -182,11 +202,15 @@ def create_app(
         return auth_service.authenticate(credentials.credentials)
 
     def require_adapter() -> MonitoringAdapter:
+        if configuration_error:
+            raise IntegrationUnavailableError(configuration_error)
         if adapter is None:
             raise IntegrationUnavailableError("Observium integration is not configured")
         return adapter
 
     def require_source_database() -> SourceDatabase:
+        if configuration_error:
+            raise IntegrationUnavailableError(configuration_error)
         if source_database is None:
             raise IntegrationUnavailableError("NetTool source database is not configured")
         return source_database
@@ -271,6 +295,8 @@ def create_app(
 
     @app.get("/health/ready")
     async def readiness() -> dict[str, str]:
+        if configuration_error:
+            raise IntegrationUnavailableError(configuration_error)
         identity = repository.get_connector_identity()
         if identity is None or not identity.enabled or adapter is None:
             raise IntegrationUnavailableError("Connector setup is incomplete")
@@ -626,11 +652,16 @@ def create_app(
             items=path_items,
         )
 
+    app.mount("/", admin_app)
     return app
 
 
 def create_app_from_env() -> FastAPI:
-    return create_app(Settings.from_env())
+    return create_app(
+        Settings.from_env(),
+        admin_base_url=os.getenv("OCP_ADMIN_BASE_URL"),
+        connection_file=Path(os.getenv("OCP_PORTAL_CONNECTION_FILE", str(DEFAULT_CONNECTION_FILE))),
+    )
 
 
 def _client_credentials(

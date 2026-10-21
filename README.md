@@ -125,8 +125,8 @@ Use the portal's **Disconnect connector** action to revoke the credential.
 ## Connector administration web UI
 
 This is a **local UI for the carrier connector**, not the separately deployed
-Carrier-Portal hosted application. It works without the hosted portal. The partner
-API remains separate and never mounts the administration pages.
+Carrier-Portal hosted application. It works without the hosted portal. **One connector
+process serves both the partner API and the authenticated UI on the same port.**
 
 ### First start
 
@@ -137,12 +137,12 @@ The hosted portal's Python environment and `open-portal` accounts are not used h
 ```bash
 # Run inside the connector checkout, with its virtual environment active:
 ocp create-admin --username admin
-ocp serve-admin
+ocp serve
 ```
 
 Choose a private password of 10-256 characters at the terminal prompts. There is no
 default account, public account registration, or web-based first-admin bootstrap.
-Open **http://127.0.0.1:8081/admin/setup**. The wizard checklist guides you through
+Open **http://127.0.0.1:8000/admin/setup**. The wizard checklist guides you through
 company identity, optional portal pairing, source connections, mapping validation,
 and sharing review. Existing `ocp init` identities and source profiles are reused.
 Changing the company name preserves organization and connector IDs.
@@ -150,20 +150,28 @@ Changing the company name preserves organization and connector IDs.
 For a connector on another server, use an SSH tunnel from your workstation:
 
 ```bash
-ssh -L 8081:127.0.0.1:8081 YOUR_USER@CONNECTOR_SERVER
+ssh -L 8000:127.0.0.1:8000 YOUR_USER@CONNECTOR_SERVER
 ```
 
-Then browse the same localhost URL. The administration CLI refuses non-loopback
-bind addresses: **do not expose it on the public partner API listener**. For an
-internal HTTPS reverse proxy, pass `--base-url https://YOUR_ADMIN_HOSTNAME` while
+Then browse the same localhost URL. The connector CLI refuses non-loopback
+bind addresses. For an HTTPS reverse proxy, pass `--base-url https://YOUR_ADMIN_HOSTNAME` while
 keeping the listener loopback. The proxy must preserve that Host header and
-restrict access to authorized operators. With a different port, supply matching
+restrict `/admin` and `/admin/*` to authorized operators; publish only the required
+API routes to partners. With a different port, supply matching
 `--port` and `--base-url` values.
 
-Keep the admin process supervised for persistent operation. It runs independently
-of the partner API, so source configuration errors do not prevent you from opening
-the UI to fix them. Both services must run under the same service account with the
-same absolute `OCP_DATABASE_PATH`, environment secrets, and filesystem permissions.
+Use one `ocp-connector` systemd service running `ocp serve`; no `ocp-admin` service is
+needed. The connector starts the portal heartbeat task and stops it on shutdown.
+Do not run multiple workers or a separate portal agent for the same pairing file.
+The legacy `ocp serve-admin` command now starts the same combined application,
+also on port 8000 by default.
+
+Missing/disabled source profiles, invalid mappings, or missing saved integration
+credentials are logged and shown to signed-in administrators. Integration endpoints
+and readiness return 503 while configuration is invalid; the UI remains available
+for repairs. Core configuration errors such as a missing signing key still prevent
+startup. Use the same existing absolute `OCP_DATABASE_PATH` and secrets when
+switching from the old two-process setup.
 Set a private umask (for example `umask 077`) before first initialization and protect
 the metadata database and its backups: they contain local admin credential hashes,
 session hashes, partner grants, configuration and audit events.
@@ -176,12 +184,12 @@ session hashes, partner grants, configuration and audit events.
 - **Portal:** enter the HTTPS portal URL and one-time company-admin pairing code.
   An optional PEM CA path supports an internal certificate authority. The pairing
   credential is saved locally using the existing protected connection file, never
-  rendered back into a page. While this admin service runs it sends heartbeats every
+  rendered back into a page. While the connector runs it sends heartbeats every
   30 seconds. Use **Test heartbeat now** to verify immediately. Do not run another
   `run-portal-agent` against the same connection file simultaneously.
   **Disconnect locally** deletes the saved credential; also revoke the connection
   in the hosted portal to invalidate the server-side credential. Disconnect before
-  replacing a pairing. `serve-admin --connection-file PATH` selects an existing
+  replacing a pairing. `serve --connection-file PATH` selects an existing
   CLI pairing file or a service-account-specific private location.
 - **Sources:** configure/reuse named MySQL or read-only SQLite profiles. Password
   fields accept an **environment variable name**, never the password itself.
@@ -235,11 +243,17 @@ rate-limited by client address. Password resets revoke existing admin sessions.
 ### Applying source changes and limitations
 
 After validating a source profile, use **Select for API restart**. Restart the
-partner API service to apply the selection and any Observium changes. Saved UI
+connector service to apply the selection and any Observium changes. Saved UI
 settings are read at API startup. Explicit environment settings
-`OCP_SOURCE_DB_PROFILE` and `OCP_OBSERVIUM_BASE_URL` take precedence; keep the UI
-and API services' secret environment variables in sync. Changes are not silently
+`OCP_SOURCE_DB_PROFILE` and `OCP_OBSERVIUM_BASE_URL` take precedence. Changes are not silently
 hot-reloaded into existing API workers.
+
+The existing Uvicorn factory entry point also serves both API and UI.
+With that entry point, `OCP_ADMIN_BASE_URL` sets the UI's trusted origin (default:
+`OCP_ISSUER_URL`) and `OCP_PORTAL_CONNECTION_FILE` can select a private pairing
+file. `ocp serve` defaults its UI origin to `http://127.0.0.1:8000`, or the chosen
+port; `--base-url`/`OCP_ADMIN_BASE_URL` override it. The issuer remains the OAuth
+token issuer and does not need changing just to use an SSH tunnel for the UI.
 
 The hosted portal connection still supports **pairing and heartbeats only**.
 Live portal resource retrieval, remote commands, and portal/connector grant

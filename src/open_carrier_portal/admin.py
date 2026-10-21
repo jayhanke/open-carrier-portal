@@ -132,8 +132,9 @@ def http_client(ca: str = "") -> httpx.Client:
 def create_admin_app(
     settings: Settings,
     *,
-    base_url: str = "http://127.0.0.1:8081",
+    base_url: str = "http://127.0.0.1:8000",
     connection_file: Path = DEFAULT_CONNECTION_FILE,
+    configuration_error: str = "",
 ) -> FastAPI:
     base_url = validate_portal_url(base_url)
     parsed = urlsplit(base_url)
@@ -187,6 +188,8 @@ def create_admin_app(
     app.state.admin_store = store
 
     def page(title: str, content: str, csrf: str, *, status: int = 200, signed_in: bool = True):
+        if signed_in and configuration_error:
+            content = f'<p class="notice">{escape(configuration_error)}</p>' + content
         nav = (
             "<nav>"
             + "".join(f'<a href="/admin/{s}">{escape(s.title())}</a>' for s in SECTIONS)
@@ -198,7 +201,7 @@ def create_admin_app(
         return HTMLResponse(
             f"""<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{escape(title)} | Connector administration</title><style>
+<title>{escape(title)} | Connector administration</title>
 body{{margin:0;background:#f1f5f9;color:#172b3a;font:16px system-ui,sans-serif}}
 main{{max-width:1100px;margin:2rem auto;padding:0 1rem}}
 nav,section{{background:white;border:1px solid #ccd8e3;border-radius:10px;
@@ -251,7 +254,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                 '<li><a href="/admin/mapping">Validate mappings and preview data</a></li>'
                 '<li><a href="/admin/partners">Review direct sharing permissions</a></li></ol>'
                 "<p class=notice>Pairing/heartbeats do not enable live portal retrieval. "
-                "Source and Observium changes require a partner API service restart. "
+                "Source and Observium changes require a connector service restart. "
                 "A configured source is not necessarily healthy: run its validation.</p>"
                 + form("readiness", csrf, "", "Run readiness checks")
             )
@@ -615,9 +618,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                 )
             store.save("portal", {"ca": ca})
             store.save("heartbeat", {})
-            return (
-                "<p>Paired. The admin service sends heartbeats every 30 seconds while running.</p>"
-            )
+            return "<p>Paired. The connector sends heartbeats every 30 seconds while running.</p>"
         elif action == "heartbeat":
             if not connection_file.exists():
                 raise ValueError("pair the connector first")
@@ -744,7 +745,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                 )
             env = env_name(text(data, "token_env"))
             if not os.getenv(env):
-                raise ValueError("token environment variable is missing in the admin service")
+                raise ValueError("token environment variable is missing in the connector service")
             ca = text(data, "ca", required=False)
             ssl.create_default_context(cafile=ca or None)
             store.save("observium", {"url": url, "token_env": env, "ca": ca})
@@ -890,6 +891,11 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
 
     @app.get("/")
     async def root():
+        return RedirectResponse("/admin/setup", status_code=303)
+
+    @app.get("/")
+    @app.get("/admin")
+    async def admin_home():
         return RedirectResponse("/admin/setup", status_code=303)
 
     @app.get("/admin/{section}")

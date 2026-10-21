@@ -19,7 +19,7 @@ from open_carrier_portal.portal_agent import PortalConnection
 from open_carrier_portal.repository import Repository
 from open_carrier_portal.security import verify_client_secret
 
-BASE = "http://127.0.0.1:8081"
+BASE = "http://127.0.0.1:8000"
 
 
 @pytest.fixture
@@ -299,10 +299,92 @@ def test_sources_mapping_preview_and_api_activation(admin, tmp_path: Path):
             == 200
         )
         assert post(client, "activate", name="custom").status_code == 200
-        api = create_app(settings)
+        api = create_app(settings, admin_base_url=BASE)
         assert api.state.source_database is not None
-        with TestClient(api) as api_client:
-            assert api_client.get("/admin/setup").status_code == 404
+        with TestClient(api, base_url=BASE) as api_client:
+            assert api_client.get("/admin/setup").url.path == "/admin/login"
+            login(api_client)
+            assert api_client.get("/admin/mapping").status_code == 200
+            assert api_client.get("/health/live").json() == {"status": "ok"}
+
+
+def test_combined_connector_admin_api_and_lifespan(admin, monkeypatch):
+    import threading
+    from unittest.mock import AsyncMock, MagicMock
+
+    from open_carrier_portal.adapters.observium import ObserviumAdapter
+
+    _, settings, connection_file = admin
+    heartbeat_seen = threading.Event()
+    closed = AsyncMock()
+
+    adapter = MagicMock(spec=ObserviumAdapter)
+    adapter.close = closed
+
+    monkeypatch.setattr(
+        "open_carrier_portal.admin.send_heartbeat",
+        lambda client, connection: heartbeat_seen.set(),
+    )
+    app = create_app(
+        settings, admin_base_url=BASE, connection_file=connection_file, adapter=adapter
+    )
+    with TestClient(app, base_url=BASE) as client:
+        assert client.get("/").url.path == "/admin/login"
+        assert client.get("/admin/login", headers={"Host": "attacker.test"}).status_code == 400
+        assert client.get("/health/live", headers={"Host": "partner.example"}).status_code == 200
+        assert client.get("/v1/devices").status_code == 401
+        assert client.post("/admin/identity", data={"name": "Attack"}).status_code == 403
+        login(client)
+        assert post(client, "identity", name="Carrier").status_code == 200
+        identity = app.state.repository.get_connector_identity()
+    closed.assert_awaited_once()
+    connection_file.touch(mode=0o600)
+    connection_file.write_text(
+        json.dumps(
+            {
+                "portal_url": "https://portal.example",
+                "organization_id": str(uuid4()),
+                "connector_id": identity.connector_id,
+                "token": "t" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    # A restart must start the mounted UI's heartbeat lifespan as well as the API.
+    with TestClient(app, base_url=BASE):
+        assert heartbeat_seen.wait(timeout=5)
+    assert closed.await_count == 2
+
+
+@pytest.mark.parametrize("failure", ["missing-profile", "missing-observium-token", "missing-ca"])
+def test_combined_connector_configuration_failure_keeps_admin_available(admin, failure, caplog):
+    _, settings, connection_file = admin
+    store = AdminStore(settings.database_path)
+    if failure == "missing-profile":
+        store.save("source", {"name": "nonexistent"})
+    elif failure == "missing-observium-token":
+        store.save(
+            "observium",
+            {"url": "https://monitoring.example", "token_env": "MISSING_TEST_OBSERVIUM_TOKEN"},
+        )
+    else:
+        from dataclasses import replace
+
+        settings = replace(
+            settings,
+            observium_base_url="https://monitoring.example",
+            observium_api_token="private-monitoring-token",
+            observium_ca_bundle=str(settings.database_path.parent / "missing-ca.pem"),
+        )
+    app = create_app(settings, admin_base_url=BASE, connection_file=connection_file)
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        response = client.get("/admin/setup")
+        assert response.status_code == 200
+        assert "Integration configuration is invalid" in response.text
+        assert client.get("/health/live").status_code == 200
+        assert client.get("/health/ready").status_code == 503
+    assert "Integration configuration is invalid" in caplog.text
 
 
 def test_pairing_heartbeat_and_local_disconnect(admin, monkeypatch):
@@ -401,6 +483,25 @@ def test_admin_cli_bootstrap_and_bind_restrictions(tmp_path: Path, monkeypatch, 
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("command", ["serve", "serve-admin"])
+def test_cli_serves_api_and_admin_together(tmp_path: Path, monkeypatch, command):
+    from open_carrier_portal import cli
+
+    monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "s" * 48)
+    monkeypatch.setenv("OCP_DATABASE_PATH", str(tmp_path / "metadata.db"))
+    monkeypatch.setattr("sys.argv", ["ocp", command])
+    started = []
+    monkeypatch.setattr("uvicorn.run", lambda app, **options: started.append((app, options)))
+    cli.main()
+    assert len(started) == 1
+    app, options = started[0]
+    assert options == {"host": "127.0.0.1", "port": 8000}
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        assert client.get("/health/live").status_code == 200
+        assert client.get("/admin/setup").url.path == "/admin/login"
+        assert client.get("/v1/devices").status_code == 401
 
 
 def test_observium_config_environment_precedence(admin, monkeypatch):
