@@ -253,6 +253,12 @@ session hashes, partner grants, configuration and audit events.
   ocp reset-admin-password --username admin
   ```
 
+Create/reset commands report the resolved connector metadata database path.
+Use the running connector service's environment, service user and working directory
+so these commands update the same database as the web UI. A successful reset takes
+effect without restarting the connector. Existing login-attempt throttling still
+applies; wait five minutes if the browser reports too many attempts.
+
 Admin sessions expire after one hour, are stored server-side as token hashes, and
 are separate from partner OAuth credentials. State-changing forms require CSRF
 tokens. The UI enforces its configured host, checks supplied Origin headers, and

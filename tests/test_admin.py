@@ -112,6 +112,81 @@ def test_authentication_csrf_host_and_reset(admin):
         assert post(client, "logout").url.path == "/admin/login"
 
 
+def test_page_css_is_inside_style_element(admin):
+    from html.parser import HTMLParser
+
+    class PageMarkup(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.in_style = False
+            self.styles = []
+            self.visible = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "style":
+                self.in_style = True
+
+        def handle_endtag(self, tag):
+            if tag == "style":
+                self.in_style = False
+
+        def handle_data(self, data):
+            (self.styles if self.in_style else self.visible).append(data)
+
+    app, _, _ = admin
+    with TestClient(app, base_url=BASE) as client:
+        responses = [client.get("/admin/login")]
+        responses.append(
+            client.post(
+                "/admin/login",
+                data={"username": "operator", "password": "wrong", "csrf": csrf(client, "login")},
+                headers={"Origin": BASE},
+            )
+        )
+        assert responses[-1].status_code == 401
+        login(client)
+        responses.append(client.get("/admin/setup"))
+    for response in responses:
+        markup = PageMarkup()
+        markup.feed(response.text)
+        assert "body{margin:0" in "".join(markup.styles)
+        assert "body{margin:0" not in "".join(markup.visible)
+
+
+def test_cli_password_reset_applies_to_running_private_http_app(tmp_path, monkeypatch, capsys):
+    from open_carrier_portal import cli
+
+    origin = "http://10.210.4.223:8000"
+    monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "s" * 48)
+    monkeypatch.setenv("OCP_DATABASE_PATH", str(tmp_path / "metadata.db"))
+    monkeypatch.setenv("OCP_ISSUER_URL", origin)
+    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setattr(cli, "getpass", lambda _: "original-password")
+    monkeypatch.setattr("sys.argv", ["ocp", "create-admin", "--username", "admin"])
+    cli.main()
+    settings = Settings.from_env()
+    app = create_app(settings, admin_base_url=origin, connection_file=tmp_path / "portal.json")
+    with TestClient(app, base_url=origin) as client:
+        monkeypatch.setattr(cli, "getpass", lambda _: "replacement-password")
+        monkeypatch.setattr("sys.argv", ["ocp", "reset-admin-password", "--username", "admin"])
+        cli.main()
+        result = client.post(
+            "/admin/login",
+            data={
+                "username": "admin",
+                "password": "replacement-password",
+                "csrf": csrf(client, "login"),
+            },
+            headers={"Origin": origin},
+            follow_redirects=False,
+        )
+        assert result.status_code == 303
+        assert client.get("/admin/setup").status_code == 200
+    output = capsys.readouterr().out
+    assert "saved" in output
+    assert str(settings.database_path.resolve()) in output
+
+
 def test_login_throttled_and_no_public_bootstrap(admin):
     app, _, _ = admin
     with TestClient(app, base_url=BASE) as client:

@@ -173,6 +173,7 @@ def main() -> None:
         except ValueError as exc:
             parser.error(str(exc))
         print("Local administrator saved. Existing admin sessions for this account were revoked.")
+        print(f"Connector metadata database: {settings.database_path.resolve()}")
         return
 
     if args.command in {"pair-portal", "run-portal-agent"}:

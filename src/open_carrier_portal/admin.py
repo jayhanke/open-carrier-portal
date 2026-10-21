@@ -206,7 +206,7 @@ def create_admin_app(
         return HTMLResponse(
             f"""<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{escape(title)} | Connector administration</title>
+<title>{escape(title)} | Connector administration</title><style>
 body{{margin:0;background:#f1f5f9;color:#172b3a;font:16px system-ui,sans-serif}}
 main{{max-width:1100px;margin:2rem auto;padding:0 1rem}}
 nav,section{{background:white;border:1px solid #ccd8e3;border-radius:10px;
