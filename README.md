@@ -75,6 +75,183 @@ Circuit path access additionally requires an active `circuits:read` grant and an
 explicit active share for that partner; a circuit share alone never exposes other
 circuit records or independent path-component routes.
 
+### Outbound hosted-portal connection
+
+The separate hosted OpenPortal application supports organization-admin pairing
+and outbound connection status. No inbound connector port is required for this
+connection. It currently carries **registration and heartbeats only**, not resource
+retrieval, remote commands, or synchronization of relationship/share grants.
+Partner API authorization remains unchanged.
+
+In the hosted portal, sign in as your **organization admin**, open **Connector**,
+and generate a pairing code. Platform owners create client organizations but do
+not implicitly become members of them.
+
+In this connector's installed environment with its usual `OCP_*` configuration:
+
+```powershell
+# Only if this connector has not already been initialized:
+ocp init --organization-name "Your Company"
+
+ocp pair-portal --portal-url http://127.0.0.1:8080
+# Paste the one-time code at the private prompt.
+ocp run-portal-agent
+```
+
+Use the portal's reachable HTTPS origin in production. Localhost HTTP is allowed
+only for development on the same machine. The agent verifies TLS and does not
+follow redirects or use environment-provided proxies. The portal's organization
+association comes from the pairing code, not a user-supplied tenant ID; pairing
+does not rewrite the connector's existing local identity or partner configuration.
+
+The pairing command stores a bearer credential in
+`~/.open-carrier-portal/portal-connection.json` and refuses to overwrite an existing
+file. On Unix it creates the directory with mode 700 and file with mode 600; on
+Windows keep this file in your private user profile and restrict its ACL to the
+service account. Do not commit, share, or log this file. Both commands accept
+`--connection-file` for a service-account-specific location. To replace a pairing,
+generate a new code in the portal and use a new private file path with **both**
+commands, then securely remove the old credential file.
+
+Run the agent under your service supervisor for persistent operation. It sends
+a heartbeat every 30 seconds, reports network/server errors, and retries those
+errors at that interval. Invalid/revoked credentials stop the agent with an error
+instead of silently reconnecting. `ocp run-portal-agent --once` sends a single
+heartbeat for troubleshooting. Stop an interactive agent with Ctrl+C.
+Refresh the portal page for current status; **Connected** means a heartbeat was
+received within 90 seconds, not that Observium or the source database is healthy.
+Use the portal's **Disconnect connector** action to revoke the credential.
+
+## Connector administration web UI
+
+This is a **local UI for the carrier connector**, not the separately deployed
+Carrier-Portal hosted application. It works without the hosted portal. The partner
+API remains separate and never mounts the administration pages.
+
+### First start
+
+Use this connector's Python **3.14+** virtual environment, with its usual private
+`OCP_TOKEN_SIGNING_KEY`, `OCP_DATABASE_PATH`, issuer, and source credentials loaded.
+The hosted portal's Python environment and `open-portal` accounts are not used here.
+
+```bash
+# Run inside the connector checkout, with its virtual environment active:
+ocp create-admin --username admin
+ocp serve-admin
+```
+
+Choose a private password of 10-256 characters at the terminal prompts. There is no
+default account, public account registration, or web-based first-admin bootstrap.
+Open **http://127.0.0.1:8081/admin/setup**. The wizard checklist guides you through
+company identity, optional portal pairing, source connections, mapping validation,
+and sharing review. Existing `ocp init` identities and source profiles are reused.
+Changing the company name preserves organization and connector IDs.
+
+For a connector on another server, use an SSH tunnel from your workstation:
+
+```bash
+ssh -L 8081:127.0.0.1:8081 YOUR_USER@CONNECTOR_SERVER
+```
+
+Then browse the same localhost URL. The administration CLI refuses non-loopback
+bind addresses: **do not expose it on the public partner API listener**. For an
+internal HTTPS reverse proxy, pass `--base-url https://YOUR_ADMIN_HOSTNAME` while
+keeping the listener loopback. The proxy must preserve that Host header and
+restrict access to authorized operators. With a different port, supply matching
+`--port` and `--base-url` values.
+
+Keep the admin process supervised for persistent operation. It runs independently
+of the partner API, so source configuration errors do not prevent you from opening
+the UI to fix them. Both services must run under the same service account with the
+same absolute `OCP_DATABASE_PATH`, environment secrets, and filesystem permissions.
+Set a private umask (for example `umask 077`) before first initialization and protect
+the metadata database and its backups: they contain local admin credential hashes,
+session hashes, partner grants, configuration and audit events.
+
+### Administration sections
+
+- **Setup:** readiness checklist and explicit source connectivity/mapping check.
+  Portal pairing is optional; a heartbeat does not mean source data is ready.
+- **Identity:** initialize or rename your company without rotating identity IDs.
+- **Portal:** enter the HTTPS portal URL and one-time company-admin pairing code.
+  An optional PEM CA path supports an internal certificate authority. The pairing
+  credential is saved locally using the existing protected connection file, never
+  rendered back into a page. While this admin service runs it sends heartbeats every
+  30 seconds. Use **Test heartbeat now** to verify immediately. Do not run another
+  `run-portal-agent` against the same connection file simultaneously.
+  **Disconnect locally** deletes the saved credential; also revoke the connection
+  in the hosted portal to invalidate the server-side credential. Disconnect before
+  replacing a pairing. `serve-admin --connection-file PATH` selects an existing
+  CLI pairing file or a service-account-specific private location.
+- **Sources:** configure/reuse named MySQL or read-only SQLite profiles. Password
+  fields accept an **environment variable name**, never the password itself.
+  Use absolute paths for SQLite. Remote MySQL requires a trusted TLS CA; existing
+  CLI plaintext opt-ins are preserved but cannot be newly enabled through the UI.
+  Connectivity/mapping tests are SELECT-only and **cannot prove** a MySQL account
+  has no write privileges; provision a dedicated read-only account yourself.
+  Save optional Observium URL, token environment-variable name and CA path, then
+  test it separately. Secrets remain on this connector, never in the hosted portal.
+- **Mapping:** use guided table/column fields, or advanced JSON. Discover up to
+  1,000 column identifiers and preview at most five rows of explicitly mapped
+  columns. No arbitrary SQL editor is provided. Every enabled mapped resource must
+  have a `source_id`. Blank table names remove a mapped resource; blank column
+  fields remove logical fields. Invalid mappings are not saved. Validation checks
+  tables and columns, not complete source-data referential integrity.
+- **Partners:** provision direct inbound partners after confirming bilateral
+  approval out of band. Select scopes and specific opaque resource IDs, or
+  explicitly opt in to all resources for those scopes. Client secrets appear
+  **once**, only in the successful creation response. Copy them privately;
+  diagnostics and subsequent pages do not reveal stored secrets/hashes.
+  Circuit shares additionally require a matching `circuits:read` grant. Revoking
+  a partner disables its relationship, OAuth clients and circuit shares; already
+  issued tokens then fail the API's existing live authorization checks.
+- **Remote:** configure named outbound connections to other companies' connectors,
+  using OAuth credentials they issue to you. Each secret stays in a named local
+  environment variable. Test token acquisition and capabilities, or retrieve an
+  explicitly authorized opaque circuit path. The connector's capabilities endpoint
+  requires `observium:devices:read` and an available monitoring adapter; circuits-only
+  connections report OAuth authentication separately without requesting capabilities.
+  HTTPS is required outside localhost;
+  TLS verification cannot be disabled, redirects are rejected, and tokens are
+  neither persisted nor displayed. This is manual browsing, not background
+  synchronization. Saving a new connection name preserves other saved connections.
+- **Diagnostics:** bounded, escaped views of the latest 50 local administration
+  and partner API audit events. No raw configuration/secret bundle is exported.
+- **Account:** change your password and invalidate that account's admin sessions.
+  Additional local admins and forgotten-password recovery require CLI operator
+  access:
+
+  ```bash
+  ocp create-admin --username another-admin
+  ocp reset-admin-password --username admin
+  ```
+
+Admin sessions expire after one hour, are stored server-side as token hashes, and
+are separate from partner OAuth credentials. State-changing forms require CSRF
+tokens. The UI enforces its configured host, checks supplied Origin headers, and
+uses HttpOnly/SameSite=Strict cookies (Secure cookies on HTTPS). Failed logins are
+rate-limited by client address. Password resets revoke existing admin sessions.
+
+### Applying source changes and limitations
+
+After validating a source profile, use **Select for API restart**. Restart the
+partner API service to apply the selection and any Observium changes. Saved UI
+settings are read at API startup. Explicit environment settings
+`OCP_SOURCE_DB_PROFILE` and `OCP_OBSERVIUM_BASE_URL` take precedence; keep the UI
+and API services' secret environment variables in sync. Changes are not silently
+hot-reloaded into existing API workers.
+
+The hosted portal connection still supports **pairing and heartbeats only**.
+Live portal resource retrieval, remote commands, and portal/connector grant
+synchronization are not implemented. Your private-network HTTP portal cannot be
+paired remotely until HTTPS and certificate trust are configured. Direct partner
+sharing and outbound partner browsing are independent of the hosted portal.
+
+Run the UI integration tests with `python -m pytest tests/test_admin.py`. They
+cover authentication, CSRF/Host/Origin checks, throttling, password reset,
+identity preservation, source/mapping discovery and previews, API activation,
+direct sharing/revocation, portal pairing/heartbeat, and outbound OAuth browsing.
+
 ## Requirements
 
 - Python 3.14 or newer

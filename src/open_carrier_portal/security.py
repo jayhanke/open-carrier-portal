@@ -11,6 +11,13 @@ from typing import Any
 
 from open_carrier_portal.errors import AuthenticationError
 
+DEFAULT_SCOPES = {
+    "observium:devices:read",
+    "observium:interfaces:read",
+    "observium:alarms:read",
+}
+ALLOWED_SCOPES = DEFAULT_SCOPES | {"circuits:read"}
+
 
 def _b64encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")

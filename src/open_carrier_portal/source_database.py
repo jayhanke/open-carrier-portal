@@ -324,6 +324,34 @@ class SourceDatabase:
         for resource_type in self._mapping.resources:
             self._select(resource_type, limit=0)
 
+    def describe_schema(self) -> list[dict[str, str]]:
+        """Discover identifiers only; never return source records or arbitrary SQL results."""
+        try:
+            with self._cursor() as cursor:
+                if self.driver == "mysql":
+                    cursor.execute(
+                        """SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name
+                        FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+                        ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT 1000"""
+                    )
+                    return [
+                        {"table": str(row["table_name"]), "column": str(row["column_name"])}
+                        for row in cursor.fetchall()
+                    ]
+                cursor.execute(
+                    """SELECT m.name AS table_name, p.name AS column_name
+                    FROM sqlite_master m JOIN pragma_table_info(m.name) p
+                    WHERE m.type = 'table' ORDER BY m.name, p.cid LIMIT 1000"""
+                )
+                return [
+                    {"table": str(row["table_name"]), "column": str(row["column_name"])}
+                    for row in cursor.fetchall()
+                ]
+        except SourceDatabaseUnavailableError:
+            raise
+        except (sqlite3.Error, pymysql.MySQLError) as exc:
+            raise SourceDatabaseQueryError("Source schema discovery failed") from exc
+
     def fetch(self, resource_type: str, limit: int = 100) -> list[dict[str, Any]]:
         if resource_type not in self._mapping.resources:
             raise ConfigurationError(f"no mapping configured for {resource_type}")

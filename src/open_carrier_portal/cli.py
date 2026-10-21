@@ -2,22 +2,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import uuid
+from getpass import getpass
 from pathlib import Path
+
+import httpx
 
 from open_carrier_portal.config import Settings
 from open_carrier_portal.models import ConnectorIdentity
+from open_carrier_portal.portal_agent import (
+    DEFAULT_CONNECTION_FILE,
+    PortalConnection,
+    pair_portal,
+    run_agent,
+)
 from open_carrier_portal.repository import Repository
-from open_carrier_portal.security import generate_client_secret, hash_client_secret
+from open_carrier_portal.security import (
+    ALLOWED_SCOPES,
+    DEFAULT_SCOPES,
+    generate_client_secret,
+    hash_client_secret,
+)
 from open_carrier_portal.source_database import SourceMapping, configured_source_database
-
-DEFAULT_SCOPES = {
-    "observium:devices:read",
-    "observium:interfaces:read",
-    "observium:alarms:read",
-}
-ALLOWED_SCOPES = DEFAULT_SCOPES | {"circuits:read"}
 
 
 def main() -> None:
@@ -86,10 +94,110 @@ def main() -> None:
     )
     test_source_parser.add_argument("--name", default="nettool")
 
+    pair_parser = subparsers.add_parser(
+        "pair-portal", help="Pair with a hosted portal using a code"
+    )
+    pair_parser.add_argument("--portal-url", required=True)
+    pair_parser.add_argument("--connection-file", type=Path, default=DEFAULT_CONNECTION_FILE)
+    agent_parser = subparsers.add_parser(
+        "run-portal-agent", help="Maintain an outbound connection to the hosted portal"
+    )
+    agent_parser.add_argument("--connection-file", type=Path, default=DEFAULT_CONNECTION_FILE)
+    agent_parser.add_argument("--once", action="store_true", help="Send one heartbeat and exit")
+
+    for command in ("create-admin", "reset-admin-password"):
+        admin_parser = subparsers.add_parser(command, help="Manage a local connector administrator")
+        admin_parser.add_argument("--username", required=True)
+    serve_parser = subparsers.add_parser(
+        "serve-admin", help="Run the separate connector administration web UI"
+    )
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8081)
+    serve_parser.add_argument("--base-url", default="http://127.0.0.1:8081")
+    serve_parser.add_argument("--connection-file", type=Path, default=DEFAULT_CONNECTION_FILE)
+
     args = parser.parse_args()
     settings = Settings.from_env()
     repository = Repository(settings.database_path, settings.token_signing_key)
     repository.initialize()
+
+    if args.command in {"create-admin", "reset-admin-password", "serve-admin"}:
+        from open_carrier_portal.admin_store import AdminStore
+
+        store = AdminStore(settings.database_path)
+        store.initialize()
+        if args.command == "serve-admin":
+            import uvicorn
+
+            from open_carrier_portal.admin import create_admin_app
+
+            if args.host not in {"127.0.0.1", "::1", "localhost"}:
+                parser.error(
+                    "admin listener must be loopback; "
+                    "use an SSH tunnel or trusted HTTPS reverse proxy"
+                )
+            uvicorn.run(
+                create_admin_app(
+                    settings, base_url=args.base_url, connection_file=args.connection_file
+                ),
+                host=args.host,
+                port=args.port,
+            )
+            return
+        password = getpass("Local administrator password (10-256 characters): ")
+        if password != getpass("Confirm password: "):
+            parser.error("passwords do not match")
+        try:
+            store.set_password(
+                args.username, password, reset=args.command == "reset-admin-password"
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        print("Local administrator saved. Existing admin sessions for this account were revoked.")
+        return
+
+    if args.command in {"pair-portal", "run-portal-agent"}:
+        identity = repository.get_connector_identity()
+        if identity is None or not identity.enabled:
+            parser.error("initialize an enabled connector first with ocp init")
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+        # Never log HTTP requests or credentials, including through httpx's info logger.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        try:
+            with httpx.Client(timeout=15, follow_redirects=False, trust_env=False) as client:
+                if args.command == "pair-portal":
+                    pair_portal(
+                        client=client,
+                        portal_url=args.portal_url,
+                        connector_id=identity.connector_id,
+                        code=getpass("One-time portal pairing code: ").strip(),
+                        connection_file=args.connection_file,
+                    )
+                    print(
+                        f"Paired. Private credentials saved to {args.connection_file}. "
+                        "Run ocp run-portal-agent to connect."
+                    )
+                else:
+                    connection = PortalConnection.load(args.connection_file)
+                    if connection.connector_id != identity.connector_id:
+                        parser.error("connection belongs to a different connector; pair again")
+                    run_agent(client, connection, once=args.once)
+        except FileExistsError:
+            parser.error(
+                "connection file already exists; choose a new --connection-file to replace pairing"
+            )
+        except httpx.HTTPStatusError as exc:
+            parser.error(
+                f"portal returned HTTP {exc.response.status_code}; "
+                "check the portal URL and pairing/connection status"
+            )
+        except httpx.RequestError:
+            parser.error("portal is unreachable; check the URL, TLS trust, and network")
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        except KeyboardInterrupt:
+            print("Portal agent stopped.")
+        return
 
     if args.command == "init":
         identity = ConnectorIdentity(
@@ -104,15 +212,11 @@ def main() -> None:
 
     if args.command == "add-partner":
         scopes = set(args.scopes or DEFAULT_SCOPES)
-        partner_id = repository.create_partner(args.name)
-        relationship_id = repository.create_active_relationship(partner_id)
-        for scope in scopes:
-            repository.create_grant(relationship_id, scope)
         client_secret = generate_client_secret()
-        client_id = repository.create_client(
-            partner_id,
-            hash_client_secret(client_secret),
-            scopes,
+        partner_id, relationship_id, client_id = repository.provision_partner(
+            name=args.name,
+            secret_hash=hash_client_secret(client_secret),
+            grants={scope: set() for scope in scopes},
         )
         print(
             json.dumps(

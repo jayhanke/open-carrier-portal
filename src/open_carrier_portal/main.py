@@ -57,6 +57,12 @@ def create_app(
 ) -> FastAPI:
     repository = repository or Repository(settings.database_path, settings.token_signing_key)
     repository.initialize()
+    from open_carrier_portal.admin import configured_settings
+    from open_carrier_portal.admin_store import AdminStore
+
+    admin_store = AdminStore(settings.database_path)
+    admin_store.initialize()
+    settings = configured_settings(settings, admin_store)
     if source_database is None and settings.source_database_profile:
         profile = repository.get_source_database_profile(settings.source_database_profile)
         if profile is None:

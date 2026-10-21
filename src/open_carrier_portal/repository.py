@@ -14,6 +14,7 @@ from pathlib import Path
 
 from open_carrier_portal.errors import AuthenticationError, AuthorizationError
 from open_carrier_portal.models import ConnectorIdentity, RelationshipState
+from open_carrier_portal.security import ALLOWED_SCOPES
 
 _CIRCUIT_VISIBILITIES = {
     "summary",
@@ -398,6 +399,80 @@ class Repository:
                 (partner_id, name),
             )
         return partner_id
+
+    def administration_snapshot(self) -> dict[str, list[dict[str, str]]]:
+        queries = {
+            "partners": "SELECT partner_id, name, state FROM partners ORDER BY name LIMIT 100",
+            "clients": """SELECT client_id, partner_id, scopes_json, state
+                FROM oauth_clients LIMIT 100""",
+            "grants": """SELECT grant_id, relationship_id, scope, resource_ids_json, state
+                FROM grants LIMIT 100""",
+            "shares": """SELECT partner_id, circuit_source_id, visibility, status
+                FROM circuit_shares LIMIT 100""",
+            "profiles": """SELECT name, driver, enabled
+                FROM source_database_profiles ORDER BY name LIMIT 100""",
+            "audit": """SELECT occurred_at, operation, outcome, correlation_id
+                FROM audit_events ORDER BY occurred_at DESC LIMIT 50""",
+        }
+        with self._connection() as db:
+            return {
+                key: [
+                    {field: str(value) for field, value in dict(row).items()}
+                    for row in db.execute(query).fetchall()
+                ]
+                for key, query in queries.items()
+            }
+
+    def provision_partner(
+        self, *, name: str, secret_hash: str, grants: dict[str, set[str]]
+    ) -> tuple[str, str, str]:
+        if not name.strip() or not grants or not set(grants) <= ALLOWED_SCOPES:
+            raise ValueError("partner name and at least one grant are required")
+        partner_id, relationship_id = str(uuid.uuid4()), str(uuid.uuid4())
+        client_id = f"ocp_{secrets_token(18)}"
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connection() as db:
+            db.execute("INSERT INTO partners VALUES (?, ?, 'active')", (partner_id, name.strip()))
+            db.execute(
+                """INSERT INTO relationships
+                (relationship_id, partner_id, state, owner_approved_at, partner_approved_at)
+                VALUES (?, ?, 'active', ?, ?)""",
+                (relationship_id, partner_id, now, now),
+            )
+            for scope, resources in grants.items():
+                db.execute(
+                    """INSERT INTO grants
+                    (grant_id, relationship_id, scope, resource_ids_json, state)
+                    VALUES (?, ?, ?, ?, 'active')""",
+                    (str(uuid.uuid4()), relationship_id, scope, json.dumps(sorted(resources))),
+                )
+            db.execute(
+                """INSERT INTO oauth_clients
+                (client_id, partner_id, secret_hash, scopes_json, state, created_at)
+                VALUES (?, ?, ?, ?, 'active', ?)""",
+                (client_id, partner_id, secret_hash, json.dumps(sorted(grants)), now),
+            )
+        return partner_id, relationship_id, client_id
+
+    def revoke_partner(self, partner_id: str) -> None:
+        with self._lock, self._connection() as db:
+            cursor = db.execute(
+                "UPDATE partners SET state = 'revoked' WHERE partner_id = ? AND state = 'active'",
+                (partner_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("active partner not found")
+            db.execute(
+                "UPDATE relationships SET state = 'revoked' WHERE partner_id = ?", (partner_id,)
+            )
+            db.execute(
+                "UPDATE oauth_clients SET state = 'revoked', revoked_at = ? WHERE partner_id = ?",
+                (datetime.now(UTC).isoformat(), partner_id),
+            )
+            db.execute(
+                "UPDATE circuit_shares SET status = 'revoked', revoked_at = ? WHERE partner_id = ?",
+                (datetime.now(UTC).isoformat(), partner_id),
+            )
 
     def create_client(self, partner_id: str, secret_hash: str, scopes: set[str]) -> str:
         client_id = f"ocp_{secrets_token(18)}"
