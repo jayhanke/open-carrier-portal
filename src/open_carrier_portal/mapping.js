@@ -212,6 +212,8 @@
       const title = name === "observium_id" ?
         (target === "ports" ? "Observium port ID" : "Observium device ID") :
         target === "racks" && name === "name" ? "Rack name" :
+        target === "rack_positions" && name === "name" ? "Position / unit label" :
+        target === "rack_positions" && name === "source_id" ? "Position record ID" :
         labels[name] || name.replaceAll("_", " ");
       label.append(make("code", target + "." + name));
       const monitoringField = (schema.monitoring_fields[target] || []).includes(name);
@@ -260,6 +262,65 @@
       card.querySelector("summary").addEventListener("click", event => {
         if (!focusResource(group.resources[0] || null)) event.preventDefault();
       });
+      const help = make("button", "?", "mapper-help-button");
+      help.type = "button";
+      help.setAttribute("aria-label", "About " + group.label);
+      help.setAttribute("aria-haspopup", "dialog");
+      help.setAttribute("aria-expanded", "false");
+      const hint = make("div", undefined, "mapper-hint");
+      hint.id = "map-hint-" + key;
+      hint.setAttribute("popover", "auto");
+      hint.setAttribute("role", "dialog");
+      hint.setAttribute("aria-labelledby", hint.id + "-title");
+      hint.tabIndex = -1;
+      const heading = make("h3", group.label);
+      heading.id = hint.id + "-title";
+      hint.append(heading, make("p", group.description), make("p", group.help));
+      hint.append(make("p", "Map columns, not literal ID values. References must match " +
+        "the source_id mapped in the related OCP table. Your table names can differ; " +
+        "use confirmed joins when fields come from several tables."));
+      hint.append(make("h4", "Example using the supplied database schema"));
+      hint.append(make("p", "These are examples, not required table names or automatic assignments."));
+      const examples = make("table"), head = make("thead"), row = make("tr");
+      row.append(make("th", "Source column"), make("th", "OCP field"));
+      head.append(row);
+      examples.append(head);
+      const body = make("tbody");
+      for (const [source, target] of group.examples) {
+        const row = make("tr"), left = make("td"), right = make("td");
+        left.append(make("code", source));
+        right.append(make("code", target));
+        row.append(left, right);
+        body.append(row);
+      }
+      examples.append(body);
+      hint.append(examples);
+      hint.append(button("Close", () => {
+        hint.hidePopover();
+        help.focus();
+      }));
+      help.setAttribute("aria-controls", hint.id);
+      help.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        hint.togglePopover();
+        if (hint.matches(":popover-open")) hint.focus();
+      });
+      help.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") event.stopPropagation();
+      });
+      hint.addEventListener("keydown", event => {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        event.stopPropagation();
+        hint.hidePopover();
+        help.focus();
+      });
+      hint.addEventListener("toggle", () => {
+        help.setAttribute("aria-expanded", String(hint.matches(":popover-open")));
+      });
+      card.querySelector("summary").append(help);
+      get("map-slots").append(hint);
       if (group.resources.length) {
         const headings = make("div", undefined, "mapper-row-headings");
         headings.append(make("span", "Customer database field"), make("span"),
@@ -460,6 +521,9 @@
     body.set("mapping", JSON.stringify({resources}));
     try {
       const response = await fetch("/admin/mapping/workspace", {method: "POST", body});
+      if (response.status === 401 || response.status === 403) {
+        document.dispatchEvent(new Event("ocp-admin-session-expired"));
+      }
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Mapping request failed.");
       message(result.message);

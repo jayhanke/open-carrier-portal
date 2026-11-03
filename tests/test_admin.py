@@ -846,6 +846,191 @@ def test_store_duplicate_and_reset_missing(tmp_path: Path):
     assert store.session(token) is None
 
 
+def test_authenticated_navigation_renews_server_session_and_cookie(admin, monkeypatch):
+    from types import SimpleNamespace
+
+    app, _, _ = admin
+    clock = [time.time()]
+    monkeypatch.setattr(
+        "open_carrier_portal.admin_store.time", SimpleNamespace(time=lambda: clock[0])
+    )
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        clock[0] += 3500
+        response = client.get("/admin/mapping")
+        assert response.status_code == 200
+        assert "Max-Age=3600" in response.headers.get("set-cookie", "")
+        with app.state.admin_store.connection() as db:
+            assert db.execute("SELECT expires FROM local_admin_sessions").fetchone()[0] == (
+                clock[0] + 3600
+            )
+        clock[0] += 3500
+        assert client.get("/admin/setup", follow_redirects=False).status_code == 200
+
+
+def test_session_activity_requires_valid_csrf_and_never_revives_expired_sessions(
+    admin, monkeypatch
+):
+    from types import SimpleNamespace
+
+    app, _, _ = admin
+    clock = [time.time()]
+    monkeypatch.setattr(
+        "open_carrier_portal.admin_store.time", SimpleNamespace(time=lambda: clock[0])
+    )
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        value = csrf(client)
+        clock[0] += 3500
+        response = client.post("/admin/session", headers={"Origin": BASE, "X-CSRF-Token": value})
+        assert response.status_code == 200, response.text
+        assert response.json()["idle_timeout_seconds"] == 3600
+        assert "Max-Age=3600" in response.headers["set-cookie"]
+        clock[0] += 3500
+        with app.state.admin_store.connection() as db:
+            expires = db.execute("SELECT expires FROM local_admin_sessions").fetchone()[0]
+        for headers in (
+            {"Origin": BASE},
+            {"Origin": BASE, "X-CSRF-Token": "invalid"},
+            {"Origin": "https://attacker.test", "X-CSRF-Token": value},
+        ):
+            rejected = client.post("/admin/session", headers=headers)
+            assert rejected.status_code == 403
+            assert "set-cookie" not in rejected.headers
+        # A status check and asset polling are not user activity.
+        status = client.get("/admin/session")
+        assert status.status_code == 200
+        assert status.json()["csrf"] == value
+        assert status.headers["cache-control"] == "no-store"
+        assert "set-cookie" not in status.headers
+        client.get("/admin/assets/session.js")
+        with app.state.admin_store.connection() as db:
+            assert db.execute("SELECT expires FROM local_admin_sessions").fetchone()[0] == expires
+        clock[0] = expires
+        expired = client.post("/admin/session", headers={"Origin": BASE, "X-CSRF-Token": value})
+        assert expired.status_code == 401
+        assert "set-cookie" not in expired.headers
+        assert client.get("/admin/session").status_code == 401
+        assert client.get("/admin/setup", follow_redirects=False).status_code == 303
+
+
+@pytest.mark.parametrize("revoke", ["logout", "password"])
+def test_activity_does_not_restore_revoked_sessions(admin, revoke):
+    app, _, _ = admin
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        value = csrf(client)
+        token = client.cookies.get("ocp_admin")
+        if revoke == "logout":
+            response = client.post("/admin/logout", data={"csrf": value}, follow_redirects=False)
+            assert "Max-Age=0" in response.headers["set-cookie"]
+        else:
+            app.state.admin_store.set_password("operator", "replacement-password", reset=True)
+        client.cookies.set("ocp_admin", token)
+        response = client.post("/admin/session", headers={"Origin": BASE, "X-CSRF-Token": value})
+        assert response.status_code == 401
+        assert app.state.admin_store.session(token) is None
+
+
+def test_session_activity_script_only_appears_on_signed_in_pages(admin):
+    app, _, _ = admin
+    with TestClient(app, base_url=BASE) as client:
+        assert "/admin/assets/session.js" not in client.get("/admin/login").text
+        login(client)
+        response = client.get("/admin/mapping")
+        assert 'src="/admin/assets/session.js"' in response.text
+        assert 'name="ocp-admin-csrf"' in response.text
+        assert 'name="ocp-admin-username" content="operator"' in response.text
+        assert 'id="admin-session-notice"' in response.text
+        script = client.get("/admin/assets/session.js")
+        assert script.status_code == 200
+        assert script.headers["cache-control"] == "no-cache"
+
+
+def test_mapping_preview_and_save_renew_only_after_session_verification(admin, tmp_path):
+    app, _, _ = admin
+    database = tmp_path / "source.db"
+    with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE circuit (id INTEGER PRIMARY KEY, name TEXT)")
+        db.execute("INSERT INTO circuit VALUES (1, 'Shared')")
+    mapping = json.dumps(
+        {
+            "resources": {
+                "circuits": {
+                    "table": "circuit",
+                    "columns": {"source_id": "id", "name": "name"},
+                }
+            }
+        }
+    )
+    app.state.repository.put_source_database_profile(
+        name="sample",
+        driver="sqlite",
+        database_name=str(database),
+        host=None,
+        port=None,
+        username=None,
+        password_env_var=None,
+        tls_ca_path=None,
+        timeout_seconds=10,
+        mapping_json=mapping,
+    )
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        value = csrf(client)
+        for operation in ("preview", "save"):
+            result = client.post(
+                "/admin/mapping/workspace",
+                data={
+                    "csrf": value,
+                    "name": "sample",
+                    "operation": operation,
+                    "resource": "circuits",
+                    "mapping": mapping,
+                },
+            )
+            assert result.status_code == 200
+            assert "Max-Age=3600" in result.headers["set-cookie"]
+        rejected = client.post(
+            "/admin/mapping/workspace",
+            data={
+                "csrf": "invalid",
+                "name": "sample",
+                "operation": "save",
+                "mapping": mapping,
+            },
+        )
+        assert rejected.status_code == 403
+        assert "set-cookie" not in rejected.headers
+
+
+def test_session_status_allows_explicit_resume_without_reusing_old_csrf(admin):
+    app, _, _ = admin
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        old_csrf = csrf(client)
+        app.state.admin_store.set_password("operator", "replacement-password", reset=True)
+        login(client, "replacement-password")
+        status = client.get("/admin/session")
+        assert status.status_code == 200
+        session = status.json()
+        assert session["username"] == "operator"
+        assert session["csrf"] != old_csrf
+        assert "set-cookie" not in status.headers
+        assert (
+            client.post(
+                "/admin/session", headers={"Origin": BASE, "X-CSRF-Token": old_csrf}
+            ).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                "/admin/session", headers={"Origin": BASE, "X-CSRF-Token": session["csrf"]}
+            ).status_code
+            == 200
+        )
+
+
 def test_admin_cli_bootstrap_and_bind_restrictions(tmp_path: Path, monkeypatch, capsys):
     from open_carrier_portal import cli
 
@@ -977,3 +1162,165 @@ def test_observium_config_environment_precedence(admin, monkeypatch):
         observium_api_token="explicit-token",
     )
     assert configured_settings(explicit, app.state.admin_store) == explicit
+
+
+def test_observium_page_explains_environment_setup_without_token_input(admin, monkeypatch):
+    app, _, _ = admin
+    monkeypatch.delenv("OCP_OBSERVIUM_API_TOKEN", raising=False)
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        page = client.get("/admin/sources").text
+        assert "variable NAME only, not the token" in page
+        assert "Token environment-variable NAME (not the API token)" in page
+        assert 'name="api_token"' not in page
+        assert 'name="token_source"' not in page
+        assert "Named token variable: missing" in page
+        assert "systemd or Docker" in page
+        assert "A .env file is not loaded automatically" in page
+        monkeypatch.setenv("OCP_OBSERVIUM_API_TOKEN", "private-test-token")
+        page = client.get("/admin/sources").text
+        assert "Named token variable: available" in page
+        assert "private-test-token" not in page
+
+
+def test_observium_missing_environment_error_explains_restart_and_never_saves(admin, monkeypatch):
+    from open_carrier_portal.source_credentials import credential_path
+
+    app, settings, _ = admin
+    monkeypatch.delenv("MISSING_OBSERVIUM_TOKEN", raising=False)
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        response = post(
+            client,
+            "observium",
+            url="https://monitoring.example",
+            token_env="MISSING_OBSERVIUM_TOKEN",
+        )
+    assert response.status_code == 400
+    assert "service&#x27;s environment and restart" in response.text
+    assert "Do not paste the token into this form" in response.text
+    assert not app.state.admin_store.get("observium")
+    assert not credential_path(settings.database_path, "unused").parent.exists()
+
+
+@pytest.mark.parametrize("action", ["observium", "test-observium"])
+def test_observium_stale_token_forms_are_rejected_without_saving(admin, monkeypatch, action):
+    from open_carrier_portal.source_credentials import credential_path
+
+    app, settings, _ = admin
+    monkeypatch.setenv("OCP_OBSERVIUM_API_TOKEN", "environment-test-token")
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        response = post(
+            client,
+            action,
+            url="https://monitoring.example",
+            api_token="submitted-test-token",
+            token_env="OCP_OBSERVIUM_API_TOKEN",
+            token_source="saved",
+        )
+    assert response.status_code == 400
+    assert "submitted-test-token" not in response.text
+    assert not app.state.admin_store.get("observium")
+    assert not credential_path(settings.database_path, "unused").parent.exists()
+
+
+def test_observium_environment_save_never_writes_credentials(admin, monkeypatch):
+    from unittest.mock import MagicMock
+
+    app, _, _ = admin
+    writer = MagicMock(side_effect=AssertionError("Observium must not save credential files"))
+    monkeypatch.setattr("open_carrier_portal.admin.save_password", writer)
+    monkeypatch.setenv("OBSERVIUM_TEST_TOKEN", "environment-test-token")
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        response = post(
+            client,
+            "observium",
+            url="https://monitoring.example",
+            token_env="OBSERVIUM_TEST_TOKEN",
+        )
+    assert response.status_code == 200, response.text
+    assert "No API token was stored" in response.text
+    assert app.state.admin_store.get("observium") == {
+        "url": "https://monitoring.example",
+        "token_env": "OBSERVIUM_TEST_TOKEN",
+        "ca": "",
+    }
+    writer.assert_not_called()
+
+
+def test_observium_never_falls_back_to_previously_saved_token_file(admin, monkeypatch):
+    from open_carrier_portal.admin import configured_settings
+    from open_carrier_portal.source_credentials import save_password
+
+    app, settings, _ = admin
+    save_password(
+        settings.database_path,
+        "open-carrier-portal-observium-api-token",
+        "old-file-test-token",
+    )
+    app.state.admin_store.save(
+        "observium",
+        {
+            "url": "https://monitoring.example",
+            "token_env": "OBSERVIUM_TEST_TOKEN",
+            "token_source": "saved",
+            "ca": "",
+        },
+    )
+    monkeypatch.delenv("OBSERVIUM_TEST_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="service's environment"):
+        configured_settings(settings, app.state.admin_store)
+    monkeypatch.setenv("OBSERVIUM_TEST_TOKEN", "environment-test-token")
+    assert configured_settings(settings, app.state.admin_store).observium_api_token == (
+        "environment-test-token"
+    )
+
+
+def test_observium_environment_restart_and_effective_test_see_ui_setting_changes(
+    admin, monkeypatch
+):
+    from unittest.mock import AsyncMock, MagicMock
+
+    app, settings, connection_file = admin
+    adapter = MagicMock()
+    adapter.health_check = AsyncMock()
+    adapter.close = AsyncMock()
+    factory = MagicMock(return_value=adapter)
+    monkeypatch.setattr("open_carrier_portal.adapters.observium.ObserviumAdapter", factory)
+    monkeypatch.setattr("open_carrier_portal.main.ObserviumAdapter", factory)
+    monkeypatch.setenv("FIRST_OBSERVIUM_TOKEN", "first-environment-token")
+    monkeypatch.setenv("SECOND_OBSERVIUM_TOKEN", "second-environment-token")
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        assert (
+            post(
+                client,
+                "observium",
+                url="https://first.example",
+                token_env="FIRST_OBSERVIUM_TOKEN",
+            ).status_code
+            == 200
+        )
+    restarted = create_app(settings, admin_base_url=BASE, connection_file=connection_file)
+    assert restarted.state.settings.observium_api_token == "first-environment-token"
+    assert factory.call_args.kwargs["api_token"] == "first-environment-token"
+    with TestClient(restarted, base_url=BASE) as client:
+        login(client)
+        assert (
+            "The running API uses environment-configured" not in client.get("/admin/sources").text
+        )
+        assert (
+            post(
+                client,
+                "observium",
+                url="https://second.example",
+                token_env="SECOND_OBSERVIUM_TOKEN",
+            ).status_code
+            == 200
+        )
+        assert post(client, "test-observium").status_code == 200
+        assert factory.call_args.kwargs["api_token"] == "second-environment-token"
+        assert factory.call_args.kwargs["base_url"] == "https://second.example"
+        assert restarted.state.settings.observium_api_token == "first-environment-token"

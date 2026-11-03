@@ -68,6 +68,7 @@ def create_app(
 
     admin_store = AdminStore(settings.database_path)
     admin_store.initialize()
+    environment_settings = settings
     configuration_error = ""
     try:
         settings = configured_settings(settings, admin_store)
@@ -100,7 +101,8 @@ def create_app(
     except ValueError, OSError:
         configuration_error = (
             "Integration configuration is invalid. Check the selected source profile, mapping, "
-            "TLS CA paths, and source/Observium secret environment variables, "
+            "TLS CA paths, saved database credentials, and source/Observium secret environment "
+            "variables, "
             "then restart the connector."
         )
         logger.error(configuration_error)
@@ -114,7 +116,7 @@ def create_app(
     auth_service = AuthenticationService(repository, token_codec)
     cursor_codec = CursorCodec(settings.token_signing_key)
     admin_app = create_admin_app(
-        settings,
+        environment_settings,
         base_url=admin_base_url or settings.issuer_url,
         connection_file=connection_file,
         configuration_error=configuration_error,

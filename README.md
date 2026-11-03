@@ -126,6 +126,13 @@ schema. The mapping board shows connected database tables on the left and twelve
 OCP target tables on the right: **Circuits, Devices, Ports/interfaces, Locations,
 Companies, Racks, Rack positions, Services, Circuit paths, Circuit path steps, Patches
 and Pseudowires**. Search the right-hand catalog by table or field.
+Each OCP table has a **?** button with its purpose, relationship meanings and example
+source-column assignments. Open it by mouse or keyboard; close with **Close**, Escape
+or a click outside. Opening help does not select a source section or change a draft.
+Examples illustrate the supplied schema, not mandatory customer table names.
+For example, `RackUnit` maps to **Rack positions**: `RackUnitID` to `source_id`,
+`RackUnitName` to `name`, `DeviceID` to `device_id`, and `CompanyLocationID` to `rack_id`.
+The last field points to the parent rack, not a company or physical address.
 Locations contain only address, floor, suite and coordinate fields; rack identity
 and company/location links belong to Racks. New connections start with empty mapping
 slots, not example source assignments. Each database-mapped OCP row has a customer
@@ -374,8 +381,22 @@ session hashes, partner grants, configuration and audit events.
   CLI plaintext opt-ins are preserved but cannot be newly enabled through the UI.
   Connectivity/mapping tests are SELECT-only and **cannot prove** a MySQL account
   has no write privileges; provision a dedicated read-only account yourself.
-  Save optional Observium URL, token environment-variable name and CA path, then
-  test it separately. Secrets remain on this connector, never in the hosted portal.
+  For optional Observium monitoring, set the actual read-only API token in the
+  **connector service's environment**, normally as `OCP_OBSERVIUM_API_TOKEN`.
+  Connections accepts the **environment-variable NAME**, never the token itself.
+  The form saves only the HTTPS URL, variable name and optional CA path;
+  Observium token entry and local token-file storage are not supported.
+  For a manual Linux launch, run `export OCP_OBSERVIUM_API_TOKEN='<your-read-only-api-token>'`
+  in the same shell before starting the connector. For systemd or Docker, configure
+  the service/container environment and restart it. Setting the variable in another
+  terminal does not update a running process. The app does not automatically load
+  `.env` files; the deployment must load them. Protect any environment files and
+  exclude secrets from source control.
+  Save the URL and variable name, then use **Test effective Observium connection**.
+  Explicit `OCP_OBSERVIUM_BASE_URL`/`OCP_OBSERVIUM_API_TOKEN` deployment settings
+  override saved UI settings, and the test checks those effective settings.
+  Restart after saving to apply changes to the partner API.
+  Secrets remain on this connector, never in the hosted portal.
 - **Mapping:** browse/filter your database schema, choose a connector resource and
   source table, then drag columns onto connector fields. Keyboard users can select
   a column and choose **Assign** instead. Schema discovery returns identifiers, not
@@ -436,7 +457,22 @@ so these commands update the same database as the web UI. A successful reset tak
 effect without restarting the connector. Existing login-attempt throttling still
 applies; wait five minutes if the browser reports too many attempts.
 
-Admin sessions expire after one hour, are stored server-side as token hashes, and
+Admin sessions expire after **one hour of inactivity**, not one hour after login.
+Authenticated page navigation and CSRF-validated actions renew both the server
+expiry and cookie. Signed-in pages also report real keyboard, pointer, scroll and
+drag/drop activity at most once per minute, so editing mappings without saving
+counts as activity. Hidden or untouched tabs do not send periodic keepalive requests;
+asset loads and status checks do not extend a session.
+
+The page warns five minutes before inactivity expiry. On expiry, it keeps the page
+and in-memory mapping draft rather than redirecting or clearing it. Sign in in a
+separate tab, then choose **Resume session** on the original page. Resume verifies
+the same administrator and refreshes CSRF values without replacing draft assignments
+or previews. Known-expired forms are blocked from submitting until resumed.
+Drafts are not persisted by this mechanism: closing or reloading a page can still
+discard unsaved edits. Network renewal failures are shown explicitly and retried.
+
+Sessions are stored server-side as token hashes, and
 are separate from partner OAuth credentials. State-changing forms require CSRF
 tokens. The UI enforces its configured host, checks supplied Origin headers, and
 uses HttpOnly/SameSite=Strict cookies (Secure cookies on HTTPS). Failed logins are

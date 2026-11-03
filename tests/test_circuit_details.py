@@ -619,6 +619,27 @@ def test_ocp_catalog_covers_inventory_and_device_port_monitoring_only():
     assert all(table["resources"] for table in OCP_TABLES.values())
 
 
+def test_ocp_table_explainers_cover_catalog_and_match_example_mapping():
+    from open_carrier_portal.source_contract import OCP_TABLES
+
+    template = SourceMapping.nettool_defaults()
+    for table in OCP_TABLES.values():
+        assert table["help"]
+        assert table["examples"]
+        for source_column, target in table["examples"]:
+            resource, field = target.split(".")
+            assert resource in table["resources"]
+            assert field in SOURCE_RESOURCES[resource].fields
+            mapping = template.resources[resource]
+            assert source_column == mapping.table + "." + mapping.columns[field]
+    assert dict(OCP_TABLES["rack_positions"]["examples"]) == {
+        "RackUnit.RackUnitID": "rack_positions.source_id",
+        "RackUnit.RackUnitName": "rack_positions.name",
+        "RackUnit.DeviceID": "rack_positions.device_id",
+        "RackUnit.CompanyLocationID": "rack_positions.rack_id",
+    }
+
+
 @pytest.mark.parametrize("visibility", ["summary", "endpoints", "full_shared_path"])
 def test_minimal_circuit_sharing_does_not_need_database_mirror(circuit_app, tmp_path, visibility):
     from open_carrier_portal.source_database import ResourceMapping

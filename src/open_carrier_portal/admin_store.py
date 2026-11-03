@@ -11,6 +11,8 @@ from pathlib import Path
 
 from open_carrier_portal.security import hash_client_secret, verify_client_secret
 
+ADMIN_SESSION_IDLE_SECONDS = 3600
+
 
 class AdminStore:
     """Local administration state, separate from partner OAuth credentials."""
@@ -110,7 +112,7 @@ class AdminStore:
                     hashlib.sha256(token.encode()).hexdigest(),
                     username.strip().casefold(),
                     csrf,
-                    now + 3600,
+                    now + ADMIN_SESSION_IDLE_SECONDS,
                 ),
             )
             db.execute(
@@ -134,6 +136,19 @@ class AdminStore:
                 "DELETE FROM local_admin_sessions WHERE token_hash = ?",
                 (hashlib.sha256(token.encode()).hexdigest(),),
             )
+
+    def renew_session(self, token: str) -> bool:
+        now = time.time()
+        with self.connection() as db:
+            result = db.execute(
+                "UPDATE local_admin_sessions SET expires = ? WHERE token_hash = ? AND expires > ?",
+                (
+                    now + ADMIN_SESSION_IDLE_SECONDS,
+                    hashlib.sha256(token.encode()).hexdigest(),
+                    now,
+                ),
+            )
+        return result.rowcount == 1
 
     def get(self, name: str) -> dict[str, str]:
         with self.connection() as db:

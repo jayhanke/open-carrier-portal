@@ -21,9 +21,10 @@ from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.datastructures import FormData
+from starlette.middleware.base import RequestResponseEndpoint
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from open_carrier_portal.admin_store import AdminStore
+from open_carrier_portal.admin_store import ADMIN_SESSION_IDLE_SECONDS, AdminStore
 from open_carrier_portal.config import Settings, is_private_network_host, validate_connector_url
 from open_carrier_portal.errors import ConnectorError, SourceDatabaseError
 from open_carrier_portal.models import ConnectorIdentity
@@ -106,7 +107,11 @@ def configured_settings(settings: Settings, store: AdminStore) -> Settings:
     if monitoring and not settings.observium_base_url:
         token = os.getenv(monitoring["token_env"])
         if not token:
-            raise ValueError("configured Observium token environment variable is missing")
+            raise ValueError(
+                "The named Observium token environment variable is missing in the connector "
+                "service. Set the actual API token in that service's environment, then restart "
+                "the connector. Do not enter the token on Connections."
+            )
         settings = replace(
             settings,
             observium_base_url=monitoring["url"],
@@ -219,7 +224,33 @@ def create_admin_app(
     app.state.repository = repository
     app.state.admin_store = store
 
-    def page(title: str, content: str, csrf: str, *, status: int = 200, signed_in: bool = True):
+    def set_session_cookie(response: Response, token: str) -> None:
+        response.set_cookie(
+            "ocp_admin",
+            token,
+            httponly=True,
+            samesite="strict",
+            secure=parsed.scheme == "https",
+            max_age=ADMIN_SESSION_IDLE_SECONDS,
+        )
+
+    @app.middleware("http")
+    async def renew_active_session(request: Request, call_next: RequestResponseEndpoint):
+        response = await call_next(request)
+        token = getattr(request.state, "admin_activity", "")
+        if token and await run_in_threadpool(store.renew_session, token):
+            set_session_cookie(response, token)
+        return response
+
+    def page(
+        title: str,
+        content: str,
+        csrf: str,
+        *,
+        status: int = 200,
+        signed_in: bool = True,
+        username: str = "",
+    ):
         if signed_in and configuration_error:
             content = f'<p class="notice">{escape(configuration_error)}</p>' + content
         nav = (
@@ -230,6 +261,15 @@ def create_admin_app(
             )
             + form("logout", csrf, "", "Sign out")
             + "</nav>"
+            if signed_in
+            else ""
+        )
+        session_ui = (
+            f'<meta name="ocp-admin-csrf" content="{escape(csrf)}">'
+            f'<meta name="ocp-admin-username" content="{escape(username)}">'
+            f'<meta name="ocp-admin-idle-timeout" content="{ADMIN_SESSION_IDLE_SECONDS}">'
+            '<div id="admin-session-notice" class="notice" role="status" hidden></div>'
+            '<script src="/admin/assets/session.js" defer></script>'
             if signed_in
             else ""
         )
@@ -249,6 +289,8 @@ margin:.8rem 0;cursor:pointer}}
 table{{border-collapse:collapse;width:100%}}
 td,th{{text-align:left;padding:.6rem;border-bottom:1px solid #ddd}}
 .scroll{{overflow:auto}}.notice{{padding:1rem;background:#fff7df;border-left:4px solid #c88c00}}
+#admin-session-notice{{position:sticky;top:.5rem;z-index:10}}
+#admin-session-notice a,#admin-session-notice button{{margin-left:.5rem}}
 pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
 .portal-intro{{margin-bottom:1.8rem;max-width:44rem;color:#475569;line-height:1.65}}
 .portal-grid{{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(240px,1fr);gap:2rem}}
@@ -324,6 +366,14 @@ padding:1.2rem;min-width:0}}.mapper-panel h3{{margin-top:0}}
 .mapper-ocp-table{{border:1px solid #cbd5e1;border-radius:9px;margin:0 0 1rem;background:#fff}}
 .mapper-ocp-table>summary{{cursor:pointer;padding:1rem;background:#f0f9ff;
 font-weight:700;color:#0c4a6e;border-radius:9px}}
+.mapper-help-button{{margin:0 0 0 .7rem;padding:.1rem .5rem;min-width:1.8rem;
+border:1px solid #7dd3fc;border-radius:50%;background:#fff;color:#075985;font-weight:700}}
+.mapper-help-button:focus-visible{{outline:2px solid #0369a1;outline-offset:3px}}
+.mapper-hint{{width:min(38rem,calc(100vw - 2rem));max-height:75vh;overflow:auto;
+box-sizing:border-box;padding:1.3rem;border:1px solid #94a3b8;border-radius:10px;
+background:#fff;color:#334155;box-shadow:0 10px 40px #0f172a33}}
+.mapper-hint h3{{margin-top:0}}.mapper-hint p{{line-height:1.6}}
+.mapper-hint table{{width:100%;table-layout:fixed}}.mapper-hint code{{overflow-wrap:anywhere}}
 .mapper-section{{padding:.6rem .8rem}}
 .mapper-api-fields{{padding:.6rem .8rem;border-top:1px solid #e2e8f0}}
 .mapper-api-fields h4{{margin:.5rem 0}}.mapper-api-field{{display:flex;align-items:center;
@@ -370,7 +420,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
 .setup-card .setup-secondary{{display:block;margin:.6rem 0 0}}
 .portal-step{{gap:.7rem}}main{{margin:1rem auto}}}}
 </style><main><h1>Carrier connector</h1><p>Local administration. Hosted portal is optional.</p>
-{nav}<section><h2>{escape(title)}</h2>{content}</section></main></html>""",
+{session_ui}{nav}<section><h2>{escape(title)}</h2>{content}</section></main></html>""",
             status_code=status,
             headers={
                 "Cache-Control": "no-store",
@@ -727,6 +777,12 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 else {}
             )
             monitoring = store.get("observium")
+            token_env = monitoring.get("token_env", "OCP_OBSERVIUM_API_TOKEN")
+            token_status = (
+                "Named token variable: available in the running connector's environment."
+                if os.getenv(token_env)
+                else "Named token variable: missing in the running connector's environment."
+            )
             existing_names = {p["name"] for p in snapshot["profiles"]}
             next_name = "database"
             suffix = 2
@@ -824,8 +880,27 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 )
                 + "</details>"
                 + '<details class="connection-card"><summary>Monitoring connection '
-                "(Observium, optional)</summary><p>Token stays in this server's environment. "
-                "Environment-configured Observium settings override saved UI settings.</p>"
+                "(Observium, optional)</summary><p><strong>The API token must be set in the "
+                "connector service's environment. This page accepts the variable NAME only, "
+                "not the token.</strong> This form never stores an API token.</p>"
+                + f"<p>{escape(token_status)}</p>"
+                + "<details><summary>How to set the token on the server (Linux)</summary>"
+                "<p>For a manual launch, set the variable in the same shell before starting "
+                "the connector. Example using the default variable name:</p>"
+                "<pre>export OCP_OBSERVIUM_API_TOKEN='&lt;your-read-only-api-token&gt;'</pre>"
+                "<p>For systemd or Docker, configure the variable in that service or "
+                "container's environment and restart it. Setting it in another terminal "
+                "does not change an already-running connector. A .env file is not loaded "
+                "automatically by this app; your deployment must load it. Keep tokens out "
+                "of source control and protect any environment files.</p></details>"
+                + (
+                    '<p class="connection-managed">The running API uses environment-configured '
+                    "Observium settings, which override saved UI settings. Update that environment "
+                    "and restart to change the deployed connection. The test checks those "
+                    "effective settings.</p>"
+                    if settings.observium_base_url
+                    else ""
+                )
                 + form(
                     "observium",
                     csrf,
@@ -836,14 +911,20 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     )
                     + field(
                         "token_env",
-                        "API token environment variable",
-                        monitoring.get("token_env", "OCP_OBSERVIUM_API_TOKEN"),
+                        "Token environment-variable NAME (not the API token)",
+                        token_env,
                     )
+                    + "<p>Enter <code>OCP_OBSERVIUM_API_TOKEN</code> above if you use the "
+                    "default name. Save the URL and variable name, then test the effective "
+                    "connection. Restart after saving to apply changes to the partner API.</p>"
+                    + "<details><summary>Advanced: TLS certificate</summary>"
                     + field(
                         "ca",
                         "Optional CA PEM path",
                         monitoring.get("ca", settings.observium_ca_bundle or ""),
-                    ),
+                    )
+                    + "</details>",
+                    "Save Observium settings (no token stored)",
                 )
                 + form("test-observium", csrf, "", "Test effective Observium connection")
                 + "</details>"
@@ -1196,6 +1277,12 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     "SELECT tests do not prove its database permissions.</p>"
                 ) + warning
         elif action == "observium":
+            if "api_token" in data or data.get("token_source") == "saved":
+                raise ValueError(
+                    "Observium tokens must be set in the connector service's environment, "
+                    "not submitted on this page. Refresh Connections and enter only the "
+                    "environment-variable name."
+                )
             url = text(data, "url").rstrip("/")
             monitoring_url = urlsplit(url)
             if (
@@ -1211,12 +1298,26 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 )
             env = env_name(text(data, "token_env"))
             if not os.getenv(env):
-                raise ValueError("token environment variable is missing in the connector service")
+                raise ValueError(
+                    "The named token environment variable is missing in the connector service. "
+                    "Set the actual API token in that service's environment and restart the "
+                    "connector, then save these settings. Do not paste the token into this form."
+                )
             ca = text(data, "ca", required=False)
             ssl.create_default_context(cafile=ca or None)
             store.save("observium", {"url": url, "token_env": env, "ca": ca})
-            return "<p>Saved. Restart the partner API service to apply; no secret was stored.</p>"
+            return (
+                "<p>Saved the URL, token environment-variable name and TLS settings only. "
+                "No API token was stored. Restart the connector to apply changes to the "
+                'partner API.</p><p><a href="/admin/sources">Back to connections</a></p>'
+            )
         elif action == "test-observium":
+            if "api_token" in data or "url" in data:
+                raise ValueError(
+                    "Direct token testing has been removed. Set the token in the connector "
+                    "service's environment, restart, and refresh Connections to save and test "
+                    "the effective settings."
+                )
             from open_carrier_portal.adapters.observium import ObserviumAdapter
 
             effective = configured_settings(settings, store)
@@ -1237,7 +1338,10 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     await adapter.close()
 
             asyncio.run(check())
-            return "<p>Observium health check passed.</p>"
+            return (
+                "<p>Observium health check passed.</p>"
+                + '<p><a href="/admin/sources">Back to connections</a></p>'
+            )
         elif action == "partner":
             scopes = {str(s) for s in data.getlist("scope")}
             if not scopes or not scopes <= SCOPES or text(data, "consent") != "yes":
@@ -1373,10 +1477,48 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
         )
 
+    @app.get("/admin/assets/session.js")
+    async def session_script():
+        return Response(
+            Path(__file__).with_name("session.js").read_text(encoding="utf-8"),
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/admin/session")
+    @app.post("/admin/session")
+    async def session_activity(request: Request):
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        token = request.cookies.get("ocp_admin", "")
+        session = store.session(token)
+        if not session:
+            return JSONResponse({"error": "Sign in to continue."}, status_code=401, headers=headers)
+        if request.method == "POST":
+            origin = request.headers.get("origin")
+            supplied = request.headers.get("X-CSRF-Token", "")
+            if origin not in {None, base_url} or not secrets.compare_digest(
+                supplied, session["csrf"]
+            ):
+                return JSONResponse(
+                    {"error": "Session verification failed. Sign in again."},
+                    status_code=403,
+                    headers=headers,
+                )
+            request.state.admin_activity = token
+        return JSONResponse(
+            {
+                "csrf": session["csrf"],
+                "username": session["username"],
+                "idle_timeout_seconds": ADMIN_SESSION_IDLE_SECONDS,
+            },
+            headers=headers,
+        )
+
     @app.get("/admin/mapping/data")
     async def mapping_data(request: Request):
         if not store.session(request.cookies.get("ocp_admin", "")):
             return JSONResponse({"error": "Sign in to load database schema."}, status_code=401)
+        request.state.admin_activity = request.cookies["ocp_admin"]
         name = request.query_params.get("profile", "")
 
         def discover():
@@ -1445,6 +1587,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         supplied = data.get("csrf")
         if not isinstance(supplied, str) or not secrets.compare_digest(supplied, session["csrf"]):
             return JSONResponse({"error": "Form expired. Reload and sign in."}, status_code=403)
+        request.state.admin_activity = request.cookies["ocp_admin"]
 
         def apply():
             name = text(data, "name")
@@ -1534,7 +1677,14 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         if not session:
             return RedirectResponse("/admin/login", status_code=303)
         if section not in SECTIONS:
-            return page("Not found", "<p>Unknown page.</p>", session["csrf"], status=404)
+            return page(
+                "Not found",
+                "<p>Unknown page.</p>",
+                session["csrf"],
+                status=404,
+                username=session["username"],
+            )
+        request.state.admin_activity = request.cookies["ocp_admin"]
         return page(
             "Connect to Carrier Portal"
             if section == "portal"
@@ -1543,6 +1693,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 render, section, session["csrf"], request.query_params.get("profile", "")
             ),
             session["csrf"],
+            username=session["username"],
         )
 
     @app.post("/admin/{action}")
@@ -1562,6 +1713,8 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         )
         if not expected or not isinstance(csrf, str) or not secrets.compare_digest(expected, csrf):
             return Response("Form expired or unauthorized. Reload and sign in.", status_code=403)
+        if session is not None and action != "login":
+            request.state.admin_activity = request.cookies["ocp_admin"]
         try:
             if action == "login":
                 result = await run_in_threadpool(
@@ -1579,14 +1732,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                         signed_in=False,
                     )
                 response = RedirectResponse("/admin/setup", status_code=303)
-                response.set_cookie(
-                    "ocp_admin",
-                    result[0],
-                    httponly=True,
-                    samesite="strict",
-                    secure=parsed.scheme == "https",
-                    max_age=3600,
-                )
+                set_session_cookie(response, result[0])
                 response.delete_cookie("ocp_admin_login")
                 return response
             if session is None:
@@ -1615,7 +1761,10 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             content = await run_in_threadpool(execute, action, data, session["username"])
             store.audit(session["username"], action + ".success")
             return page(
-                "Result", content + '<p><a href="/admin/setup">Back to setup</a></p>', expected
+                "Result",
+                content + '<p><a href="/admin/setup">Back to setup</a></p>',
+                expected,
+                username=session["username"],
             )
         except (ValueError, ConnectorError, SourceDatabaseError) as exc:
             store.audit(session["username"] if session else "anonymous", action + ".failed")
@@ -1625,6 +1774,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 expected,
                 status=400,
                 signed_in=session is not None,
+                username=session["username"] if session else "",
             )
         except httpx.HTTPError, OSError:
             store.audit(session["username"] if session else "anonymous", action + ".failed")
@@ -1635,6 +1785,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 expected,
                 status=400,
                 signed_in=session is not None,
+                username=session["username"] if session else "",
             )
 
     return app
