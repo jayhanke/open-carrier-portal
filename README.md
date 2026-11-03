@@ -379,8 +379,11 @@ session hashes, partner grants, configuration and audit events.
 - **Mapping:** browse/filter your database schema, choose a connector resource and
   source table, then drag columns onto connector fields. Keyboard users can select
   a column and choose **Assign** instead. Schema discovery returns identifiers, not
-  records, up to 1,000 columns (larger schemas require advanced JSON or a smaller
-  source schema). Declared single-column foreign keys suggest joins; explicitly confirm
+  records, up to 50,000 columns and 50,000 foreign-key columns. Larger databases
+  fail explicitly without truncating the schema; expose a dedicated read-only schema
+  containing the tables needed for sharing if those bounds are exceeded.
+  Collapsed source tables create their column controls only when expanded or found
+  by search, keeping large catalogs usable. Declared single-column foreign keys suggest joins; explicitly confirm
   each suggestion or select a relationship manually. Similar column names are
   never treated as a relationship automatically.
   Up to eight joins per resource are supported. Each target must have a

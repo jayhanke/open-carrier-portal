@@ -43,6 +43,98 @@ def joined_source(tmp_path: Path):
     return database, mapping
 
 
+def test_large_sqlite_schema_loads_completely_in_authenticated_mapper(tmp_path):
+    from test_admin import BASE, login
+
+    database = tmp_path / "large.db"
+    with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        for number in range(101):
+            columns = ", ".join(
+                f"field_{column} INTEGER REFERENCES parent(id)" for column in range(10)
+            )
+            db.execute(f"CREATE TABLE inventory_{number:03d} (id INTEGER PRIMARY KEY, {columns})")
+    source = SourceDatabase(SQLiteSourceDatabaseSettings(database), SourceMapping({}))
+    columns = source.describe_schema()
+    relationships = source.describe_relationships()
+    assert len(columns) == 1112
+    assert len(relationships) == 1010
+    assert {"table": "inventory_100", "column": "field_9"} in columns
+    assert {
+        "source_table": "inventory_100",
+        "source_column": "field_9",
+        "target_table": "parent",
+        "target_column": "id",
+    } in relationships
+    app = create_admin_app(
+        Settings(tmp_path / "metadata.db", "http://localhost:8000", "test", "s" * 48)
+    )
+    app.state.admin_store.set_password("operator", "operator-password")
+    app.state.repository.put_source_database_profile(
+        name="large",
+        driver="sqlite",
+        database_name=str(database),
+        host=None,
+        port=None,
+        username=None,
+        password_env_var=None,
+        tls_ca_path=None,
+        timeout_seconds=10,
+        mapping_json=SourceMapping({}).to_json(),
+    )
+    with TestClient(app, base_url=BASE) as client:
+        assert client.get("/admin/mapping/data?profile=large").status_code == 401
+        login(client)
+        response = client.get("/admin/mapping/data?profile=large")
+    assert response.status_code == 200, response.text
+    assert response.json()["columns"] == columns
+    assert response.json()["relationships"] == relationships
+
+
+@pytest.mark.parametrize("kind", ["columns", "relationships"])
+@pytest.mark.parametrize("count", [1001, 50_000, 50_001])
+def test_mysql_discovery_bounds_return_complete_results_or_explicit_error(monkeypatch, kind, count):
+    connection = MagicMock()
+    cursor = connection.cursor.return_value
+    if kind == "columns":
+        rows = [{"table_name": "inventory", "column_name": f"field_{i}"} for i in range(count)]
+    else:
+        rows = [
+            {
+                "source_table": "inventory",
+                "source_column": f"field_{i}",
+                "target_table": "parent",
+                "target_column": "id",
+                "relation_id": f"fk_{i}",
+            }
+            for i in range(count)
+        ]
+    cursor.fetchall.return_value = rows
+    monkeypatch.setattr(
+        "open_carrier_portal.source_database.pymysql.connect",
+        MagicMock(return_value=connection),
+    )
+    source = SourceDatabase(
+        MySQLSourceDatabaseSettings(
+            host="localhost", port=3306, database="inventory", username="reader", password="test"
+        ),
+        SourceMapping({}),
+    )
+    discover = source.describe_schema if kind == "columns" else source.describe_relationships
+    if count > 50_000:
+        with pytest.raises(ConfigurationError, match="at most 50000"):
+            discover()
+    else:
+        result = discover()
+        assert len(result) == count
+        assert (
+            result[-1]["column" if kind == "columns" else "source_column"] == f"field_{count - 1}"
+        )
+    query, parameters = cursor.execute.call_args.args
+    assert "LIMIT %s" in query
+    assert parameters == (50_001,)
+
+
 def test_joined_mapping_serialization_filtering_and_preview(joined_source):
     database, mapping = joined_source
     restored = SourceMapping.from_json(mapping.to_json())

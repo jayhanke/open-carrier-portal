@@ -120,24 +120,30 @@
           heading.append(make("span", "Linked", "mapper-linked"));
         }
         group.append(heading);
-        for (const column of visible) {
-          const value = {table, column, alias: instance.alias, resource};
-          const node = button(column, () => {
-            selected = value;
-            renderTables();
-            message("Selected " + table + "." + column + ". Choose Assign beside an OCP field.");
-          });
-          node.className = "mapper-field";
-          node.draggable = true;
-          node.setAttribute("aria-pressed", String(
-            selected?.table === table && selected?.column === column &&
-            selected?.alias === instance.alias));
-          node.addEventListener("dragstart", event => {
-            event.dataTransfer.setData("application/json", JSON.stringify(value));
-            event.dataTransfer.effectAllowed = "copy";
-          });
-          group.append(node);
-        }
+        const renderColumns = () => {
+          if (!group.open || group.dataset.loaded) return;
+          group.dataset.loaded = "true";
+          for (const column of visible) {
+            const value = {table, column, alias: instance.alias, resource};
+            const node = button(column, () => {
+              selected = value;
+              renderTables();
+              message("Selected " + table + "." + column + ". Choose Assign beside an OCP field.");
+            });
+            node.className = "mapper-field";
+            node.draggable = true;
+            node.setAttribute("aria-pressed", String(
+              selected?.table === table && selected?.column === column &&
+              selected?.alias === instance.alias));
+            node.addEventListener("dragstart", event => {
+              event.dataTransfer.setData("application/json", JSON.stringify(value));
+              event.dataTransfer.effectAllowed = "copy";
+            });
+            group.append(node);
+          }
+        };
+        group.addEventListener("toggle", renderColumns);
+        renderColumns();
         container.append(group);
       }
     }

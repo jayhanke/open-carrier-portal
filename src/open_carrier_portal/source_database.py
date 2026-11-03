@@ -28,6 +28,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ENVIRONMENT_VARIABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESOURCE_TYPES = tuple(SOURCE_RESOURCES)
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_SCHEMA_DISCOVERY_LIMIT = 50_000
 
 
 def _identifier(value: str, field_name: str) -> str:
@@ -538,19 +539,22 @@ class SourceDatabase:
                     cursor.execute(
                         """SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name
                         FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
-                        ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT 1001"""
+                        ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT %s""",
+                        (_SCHEMA_DISCOVERY_LIMIT + 1,),
                     )
                 else:
                     cursor.execute(
                         """SELECT m.name AS table_name, p.name AS column_name
                         FROM sqlite_master m JOIN pragma_table_info(m.name) p
-                        WHERE m.type = 'table' ORDER BY m.name, p.cid LIMIT 1001"""
+                        WHERE m.type = 'table' ORDER BY m.name, p.cid LIMIT ?""",
+                        (_SCHEMA_DISCOVERY_LIMIT + 1,),
                     )
                 rows = cursor.fetchall()
-                if len(rows) > 1000:
+                if len(rows) > _SCHEMA_DISCOVERY_LIMIT:
                     raise ConfigurationError(
-                        "schema discovery supports at most 1000 columns; "
-                        "use a smaller source schema or configure advanced JSON mappings"
+                        f"schema discovery supports at most {_SCHEMA_DISCOVERY_LIMIT} columns; "
+                        "use a dedicated read-only schema exposing only the tables "
+                        "needed for sharing"
                     )
                 return [
                     {"table": str(row["table_name"]), "column": str(row["column_name"])}
@@ -579,7 +583,8 @@ class SourceDatabase:
                         CONSTRAINT_NAME AS relation_id
                         FROM information_schema.KEY_COLUMN_USAGE
                         WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_SCHEMA = DATABASE()
-                        AND REFERENCED_TABLE_NAME IS NOT NULL LIMIT 1001"""
+                        AND REFERENCED_TABLE_NAME IS NOT NULL LIMIT %s""",
+                        (_SCHEMA_DISCOVERY_LIMIT + 1,),
                     )
                 else:
                     cursor.execute(
@@ -592,11 +597,16 @@ class SourceDatabase:
                         )) AS target_column,
                         CAST(f.id AS TEXT) AS relation_id
                         FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) f
-                        WHERE m.type = 'table' LIMIT 1001"""
+                        WHERE m.type = 'table' LIMIT ?""",
+                        (_SCHEMA_DISCOVERY_LIMIT + 1,),
                     )
                 rows = cursor.fetchall()
-                if len(rows) > 1000:
-                    raise ConfigurationError("too many foreign keys; use a smaller source schema")
+                if len(rows) > _SCHEMA_DISCOVERY_LIMIT:
+                    raise ConfigurationError(
+                        f"relationship discovery supports at most {_SCHEMA_DISCOVERY_LIMIT} "
+                        "foreign-key columns; use a dedicated read-only schema exposing only "
+                        "the tables needed for sharing"
+                    )
                 counts: dict[tuple[str, str], int] = {}
                 for row in rows:
                     key = (str(row["source_table"]), str(row["relation_id"]))
