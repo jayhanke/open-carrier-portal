@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -18,7 +19,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.datastructures import FormData
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -35,6 +36,15 @@ from open_carrier_portal.portal_agent import (
 )
 from open_carrier_portal.repository import Repository, SourceDatabaseProfile
 from open_carrier_portal.security import ALLOWED_SCOPES, generate_client_secret, hash_client_secret
+from open_carrier_portal.source_contract import (
+    BASIC_FIELDS,
+    CORE_RESOURCES,
+    MAPPING_GROUPS,
+    MONITORING_FIELDS,
+    OCP_TABLES,
+    SOURCE_RESOURCES,
+)
+from open_carrier_portal.source_credentials import save_password
 from open_carrier_portal.source_database import (
     ResourceMapping,
     SourceMapping,
@@ -53,6 +63,11 @@ SECTIONS = (
     "diagnostics",
     "account",
 )
+SECTION_LABELS = {
+    "portal": "Carrier Portal",
+    "sources": "Connections",
+    "remote": "Partner connections",
+}
 logger = logging.getLogger(__name__)
 
 
@@ -101,7 +116,12 @@ def configured_settings(settings: Settings, store: AdminStore) -> Settings:
     return settings
 
 
-def source_for(repository: Repository, name: str):
+def source_for(
+    repository: Repository,
+    name: str,
+    metadata_path: Path,
+    mapping: SourceMapping | None = None,
+):
     profile = repository.get_source_database_profile(name)
     if profile is None or not profile.enabled:
         raise ValueError("enabled source profile not found")
@@ -115,8 +135,9 @@ def source_for(repository: Repository, name: str):
         tls_ca_path=profile.tls_ca_path,
         allow_insecure=profile.allow_insecure,
         timeout_seconds=profile.timeout_seconds,
-        mapping_json=profile.mapping_json,
+        mapping_json=mapping.to_json() if mapping is not None else profile.mapping_json,
         environment=os.environ,
+        metadata_path=metadata_path,
     )
 
 
@@ -148,6 +169,12 @@ def create_admin_app(
     store = AdminStore(settings.database_path)
     store.initialize()
 
+    def monitoring_enabled() -> bool:
+        return bool(settings.observium_base_url or store.get("observium").get("url"))
+
+    def portal_ca() -> str:
+        return settings.portal_ca_bundle or store.get("portal").get("ca", "")
+
     def heartbeat() -> None:
         if not connection_file.exists():
             return
@@ -159,7 +186,7 @@ def create_admin_app(
             or identity.connector_id != connection.connector_id
         ):
             raise ValueError("portal connection does not match enabled connector identity")
-        with http_client(store.get("portal").get("ca", "")) as client:
+        with http_client(portal_ca()) as client:
             send_heartbeat(client, connection)
         store.save("heartbeat", {"seen": str(time.time())})
 
@@ -197,7 +224,10 @@ def create_admin_app(
             content = f'<p class="notice">{escape(configuration_error)}</p>' + content
         nav = (
             "<nav>"
-            + "".join(f'<a href="/admin/{s}">{escape(s.title())}</a>' for s in SECTIONS)
+            + "".join(
+                f'<a href="/admin/{s}">{escape(SECTION_LABELS.get(s, s.title()))}</a>'
+                for s in SECTIONS
+            )
             + form("logout", csrf, "", "Sign out")
             + "</nav>"
             if signed_in
@@ -220,6 +250,125 @@ table{{border-collapse:collapse;width:100%}}
 td,th{{text-align:left;padding:.6rem;border-bottom:1px solid #ddd}}
 .scroll{{overflow:auto}}.notice{{padding:1rem;background:#fff7df;border-left:4px solid #c88c00}}
 pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
+.portal-intro{{margin-bottom:1.8rem;max-width:44rem;color:#475569;line-height:1.65}}
+.portal-grid{{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(240px,1fr);gap:2rem}}
+.portal-steps{{list-style:none;padding:0;margin:0;counter-reset:portal-step}}
+.portal-step{{display:flex;gap:1rem;padding:0 0 1.8rem;counter-increment:portal-step}}
+.portal-step::before{{content:counter(portal-step);flex:0 0 2.3rem;height:2.3rem;
+border-radius:50%;background:#e0f2fe;color:#075985;display:grid;place-items:center;font-weight:700}}
+.portal-step h3{{margin:.2rem 0 .65rem;font-size:1.1rem}}
+.portal-step p{{line-height:1.65;margin:.6rem 0;color:#475569}}
+.portal-step-content{{min-width:0;flex:1}}
+.portal-button{{display:inline-block;background:#075985;color:white;text-decoration:none;
+padding:.7rem 1rem;border-radius:6px;font-weight:600}}
+.portal-button:hover,button:hover{{background:#0c4a6e}}
+.portal-summary{{align-self:start;padding:1.4rem;border:1px solid #dbe5ee;
+border-radius:10px;background:#f8fafc}}
+.portal-summary h3{{margin-top:0}}.portal-summary p{{line-height:1.65;color:#475569}}
+.portal-badge{{display:inline-block;padding:.35rem .7rem;border-radius:20px;
+background:#e2e8f0;color:#334155;font-size:.85rem;font-weight:600}}
+.portal-badge.connected{{background:#dcfce7;color:#166534}}
+.portal-note{{font-size:.9rem}}.portal-note strong{{color:#334155}}
+.portal-code{{box-sizing:border-box;width:100%;font-family:ui-monospace,monospace;
+padding:.8rem;letter-spacing:.04em}}
+.portal-step label{{font-weight:600}}.portal-step button{{padding:.75rem 1rem;font-weight:600}}
+.portal-warning{{padding:.8rem 1rem;background:#fff7df;border-radius:6px;line-height:1.6}}
+.portal-link{{color:#075985}}.portal-summary button{{font-size:.9rem}}
+.setup-intro{{color:#475569;line-height:1.65;margin:0 0 1.5rem}}
+.setup-badge{{display:inline-block;border-radius:20px;padding:.3rem .65rem;
+font-size:.78rem;font-weight:600;background:#f1f5f9;color:#475569;max-width:100%;
+box-sizing:border-box;overflow-wrap:anywhere}}
+.setup-badge.good{{background:#dcfce7;color:#166534}}
+.setup-badge.attention{{background:#fef3c7;color:#854d0e}}
+.setup-badge.selected{{background:#e0f2fe;color:#075985}}
+.setup-steps{{padding:0;margin:0;list-style:none;counter-reset:setup-step}}
+.setup-card{{position:relative;counter-increment:setup-step;border:1px solid #dbe5ee;
+border-radius:10px;padding:1.2rem 1.2rem 1.2rem 4.2rem;margin-bottom:1rem}}
+.setup-card::before{{content:counter(setup-step);position:absolute;left:1rem;top:1.2rem;
+width:2.2rem;height:2.2rem;border-radius:50%;display:grid;place-items:center;
+background:#f1f5f9;color:#475569;font-weight:700}}
+.setup-card-head{{display:flex;align-items:center;justify-content:space-between;
+gap:.7rem;flex-wrap:wrap}}
+.setup-card h3{{margin:0;font-size:1.05rem}}.setup-card p{{font-size:.93rem;
+line-height:1.65;color:#475569;margin:.65rem 0;overflow-wrap:anywhere}}
+.setup-card a{{display:inline-block;margin-top:.2rem;color:#075985;font-weight:600;
+font-size:.9rem;text-decoration:none}}
+.setup-card a:hover{{text-decoration:underline}}
+.setup-card .setup-secondary{{margin-left:1.2rem;font-weight:400}}
+.setup-verify{{background:#f8fafc}}
+.setup-verify form{{margin:0}}.setup-verify button{{font-size:.9rem;font-weight:600;
+padding:.7rem 1rem;margin:.4rem 0}}
+.setup-footnote{{font-size:.85rem;line-height:1.65;color:#64748b;margin-top:1.3rem}}
+.connection-card{{max-width:48rem;border:1px solid #dbe5ee;border-radius:10px;
+padding:1.5rem;margin:1rem 0 1.5rem}}
+.connection-card h3{{margin-top:0}}.connection-card p{{line-height:1.65;color:#475569}}
+.connection-fields{{display:grid;grid-template-columns:1fr 1fr;gap:0 1.2rem}}
+.connection-fields label{{min-width:0}}.connection-fields input{{box-sizing:border-box;width:100%}}
+.connection-card details{{border-top:1px solid #e2e8f0;padding:1rem 0;margin-top:1rem}}
+.connection-card summary{{cursor:pointer;font-weight:600;color:#075985}}
+.connection-card pre{{font-size:.85rem;padding:1rem;background:#f1f5f9}}
+.connection-actions{{display:flex;gap:.7rem;flex-wrap:wrap}}
+.connection-actions .secondary{{background:#e0f2fe;color:#075985}}
+.connection-list{{display:flex;gap:.8rem;flex-wrap:wrap;margin:.8rem 0}}
+.connection-list a{{color:#075985}}.connection-managed{{padding:.7rem;background:#f0f9ff;
+border-radius:6px;font-size:.9rem}}
+.mapper-toolbar{{display:flex;align-items:end;gap:1rem;flex-wrap:wrap}}
+.mapper-toolbar label{{flex:1}}.mapper-toolbar select{{width:100%;box-sizing:border-box}}
+.mapper-grid{{display:grid;grid-template-columns:minmax(210px,1fr) minmax(340px,1.8fr);
+gap:1.2rem;margin:1rem 0}}.mapper-panel{{border:1px solid #dbe5ee;border-radius:10px;
+padding:1.2rem;min-width:0}}.mapper-panel h3{{margin-top:0}}
+.mapper-tables,.mapper-targets{{height: min(65vh,46rem);overflow:auto;padding-right:.4rem}}
+.mapper-tables details{{margin:.6rem 0;border:1px solid #dbe5ee;border-radius:8px;padding:.7rem}}
+.mapper-tables summary{{cursor:pointer;font-weight:600;overflow-wrap:anywhere}}
+.mapper-linked{{font-size:.75rem;color:#0369a1;margin-left:.5rem}}
+.mapper-ocp-table{{border:1px solid #cbd5e1;border-radius:9px;margin:0 0 1rem;background:#fff}}
+.mapper-ocp-table>summary{{cursor:pointer;padding:1rem;background:#f0f9ff;
+font-weight:700;color:#0c4a6e;border-radius:9px}}
+.mapper-section{{padding:.6rem .8rem}}
+.mapper-api-fields{{padding:.6rem .8rem;border-top:1px solid #e2e8f0}}
+.mapper-api-fields h4{{margin:.5rem 0}}.mapper-api-field{{display:flex;align-items:center;
+justify-content:space-between;gap:.7rem;padding:.7rem 0;border-bottom:1px solid #e2e8f0;
+overflow-wrap:anywhere}}.mapper-api-field code{{min-width:0}}
+.mapper-api-badge{{color:#475569;background:#f1f5f9;padding:.2rem .4rem;border-radius:4px;
+font-size:.75rem;white-space:nowrap}}
+.mapper-section>summary{{cursor:pointer;font-weight:600;font-size:.9rem;padding:.4rem 0}}
+.mapper-section.active>summary{{color:#0369a1}}.mapper-extra>summary{{cursor:pointer;
+font-size:.8rem;padding:.6rem 0;color:#475569}}
+.mapper-field{{display:block;width:100%;text-align:left;box-sizing:border-box;background:#f1f5f9;
+color:#334155;margin:.4rem 0;padding:.5rem .7rem;border:1px solid #dbe5ee;overflow-wrap:anywhere}}
+.mapper-field:hover,.mapper-field[aria-pressed="true"]{{background:#e0f2fe;color:#075985}}
+.mapper-slot{{display:grid;grid-template-columns:minmax(0,1fr) 1.5rem minmax(0,1fr);
+align-items:center;gap:.4rem;margin:.6rem 0}}
+.mapper-drop{{padding:.7rem;border:1px dashed #94a3b8;border-radius:7px;
+min-width:0;background:#f8fafc}}.mapper-drop.linked{{border-style:solid;border-color:#7dd3fc;
+background:#f0f9ff}}.mapper-drop.over{{background:#e0f2fe;border-color:#0284c7}}
+.mapper-drop code{{display:block;font-size:.8rem}}.mapper-arrow{{text-align:center;
+color:#0284c7;font-size:1.3rem}}.mapper-target{{min-width:0;overflow-wrap:anywhere}}
+.mapper-target{{padding:.7rem;border:1px solid #dbe5ee;border-radius:7px;background:#fff}}
+.mapper-target code{{display:block;font-size:.85rem;font-weight:700;overflow-wrap:anywhere}}
+.mapper-target small{{display:block;color:#64748b;font-size:.75rem}}
+.mapper-row-headings{{display:grid;grid-template-columns:minmax(0,1fr) 1.5rem minmax(0,1fr);
+gap:.4rem;padding:.7rem .8rem 0;font-size:.8rem;color:#475569;font-weight:600}}
+.mapper-slot-actions{{display:flex;flex-wrap:wrap;gap:.3rem;margin-top:.5rem}}
+.mapper-slot button{{font-size:.8rem;margin:0;padding:.35rem .6rem}}
+.mapper-slot code{{overflow-wrap:anywhere}}.mapper-slot strong{{font-size:.9rem}}
+.mapper-help{{font-size:.9rem;color:#475569;line-height:1.6}}
+.mapper-join{{padding:1rem;background:#f8fafc;border:1px solid #dbe5ee;
+border-radius:8px;margin:.8rem 0}}.mapper-join label{{font-size:.9rem}}
+.mapper-join select{{max-width:100%;box-sizing:border-box}}.mapper-message{{padding:.8rem;
+border-radius:6px;background:#f0f9ff;margin:1rem 0;overflow-wrap:anywhere}}
+.mapper-message.error{{background:#fff1f2;color:#9f1239}}
+.mapper-actions{{display:flex;gap:.7rem;flex-wrap:wrap}}.mapper-sql{{background:#f1f5f9;
+padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
+.setup-card a:focus-visible,
+.portal-button:focus-visible{{outline:3px solid #38bdf8;outline-offset:4px}}
+@media(max-width:720px){{.portal-grid{{grid-template-columns:1fr}}
+.connection-fields{{grid-template-columns:1fr}}.connection-card{{padding:1rem}}
+.mapper-grid{{grid-template-columns:1fr}}.mapper-tables{{height:18rem}}
+.mapper-targets{{height:36rem}}.mapper-panel{{padding:.8rem}}
+.setup-card{{padding-left:3.6rem}}.setup-card::before{{left:.7rem}}
+.setup-card .setup-secondary{{display:block;margin:.6rem 0 0}}
+.portal-step{{gap:.7rem}}main{{margin:1rem auto}}}}
 </style><main><h1>Carrier connector</h1><p>Local administration. Hosted portal is optional.</p>
 {nav}<section><h2>{escape(title)}</h2>{content}</section></main></html>""",
             status_code=status,
@@ -228,6 +377,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                 "X-Content-Type-Options": "nosniff",
                 "Content-Security-Policy": (
                     "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+                    "script-src 'self'; connect-src 'self'; "
                     "frame-ancestors 'none'; base-uri 'none'"
                 ),
                 "Referrer-Policy": "same-origin",
@@ -246,22 +396,113 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
         snapshot = repository.administration_snapshot()
         if section == "setup":
             source = settings.source_database_profile or store.get("source").get("name", "")
+            profile = repository.get_source_database_profile(source) if source else None
+            identity_ready = bool(identity and identity.enabled)
+            source_selected = bool(profile and profile.enabled)
             portal = store.get("heartbeat")
-            connected = bool(portal.get("seen") and time.time() - float(portal["seen"]) < 90)
+            paired = connection_file.exists()
+            connected = bool(
+                paired
+                and not portal.get("error")
+                and portal.get("seen")
+                and time.time() - float(portal["seen"]) < 90
+            )
+            portal_status = (
+                "Connected"
+                if connected
+                else "Needs attention"
+                if paired and portal.get("error")
+                else "Paired"
+                if paired
+                else "Not connected"
+            )
+            steps = (
+                (
+                    "identity",
+                    "Company identity",
+                    "Configured" if identity_ready else "Disabled" if identity else "Get started",
+                    "good" if identity_ready else "attention" if identity else "",
+                    f"This connector belongs to {identity.organization_name}. "
+                    "Keep your company details up to date."
+                    if identity_ready
+                    else "Set your company name so partners can identify this connector. "
+                    "An enabled company identity is also needed for portal pairing.",
+                    "Review company" if identity else "Set up company",
+                ),
+                (
+                    "sources",
+                    "Set up your connections",
+                    "Selected"
+                    if source_selected
+                    else "Profile disabled"
+                    if profile
+                    else "Profile missing"
+                    if source
+                    else "Not selected",
+                    "selected" if source_selected else "attention" if source else "",
+                    "A database profile is selected. Test its connection before sharing data."
+                    if source_selected
+                    else f"The selected profile ({source}) is missing or disabled. "
+                    "Review your source settings before continuing."
+                    if source
+                    else "Add your database and monitoring connections. You can manage "
+                    "existing connections or add more as your setup grows.",
+                    "Manage connections",
+                ),
+                (
+                    "mapping",
+                    "Check your database mapping",
+                    "Review mapping" if source_selected else "After source setup",
+                    "",
+                    "Match your database tables and columns to the connector's fields. "
+                    "Validate the mapping and preview a few records before sharing.",
+                    "Review field mapping",
+                ),
+                (
+                    "portal",
+                    "Carrier Portal (optional)",
+                    portal_status,
+                    "good" if connected else "attention" if paired and portal.get("error") else "",
+                    "Link this connector to your company account with a one-time pairing code. "
+                    "Not required for direct partner sharing. Currently provides registration "
+                    "and online status only.",
+                    "View portal connection" if paired else "Connect to Carrier Portal",
+                ),
+            )
+            cards = "".join(
+                '<li class="setup-card"><div class="setup-card-head">'
+                f"<h3>{escape(title)}</h3>"
+                f'<span class="setup-badge {tone}">{escape(status)}</span></div>'
+                f"<p>{escape(description)}</p>"
+                f'<a href="/admin/{route}">{escape(action)} &rarr;</a>'
+                + (
+                    '<a class="setup-secondary" href="/admin/remote">'
+                    "Manage partner connections &rarr;</a>"
+                    if route == "sources"
+                    else ""
+                )
+                + "</li>"
+                for route, title, status, tone, description, action in steps
+            )
             return (
-                "<p>Follow these steps. Direct sharing does not require the hosted portal.</p><ol>"
-                "<li>Local administrator: configured</li>"
-                '<li><a href="/admin/identity">Company identity</a>: '
-                f"{'configured' if identity else 'required'}</li>"
-                '<li><a href="/admin/portal">Optional portal</a>: '
-                f"{'recent heartbeat' if connected else 'not connected'}</li>"
-                f'<li><a href="/admin/sources">Sources</a>: {escape(source or "not selected")}</li>'
-                '<li><a href="/admin/mapping">Validate mappings and preview data</a></li>'
-                '<li><a href="/admin/partners">Review direct sharing permissions</a></li></ol>'
-                "<p class=notice>Pairing/heartbeats do not enable live portal retrieval. "
-                "Source and Observium changes require a connector service restart. "
-                "A configured source is not necessarily healthy: run its validation.</p>"
+                '<p class="setup-intro">Complete these steps to set up your connector. '
+                "You can return to any step later to update your settings.</p>"
+                f'<ol class="setup-steps">{cards}'
+                '<li class="setup-card setup-verify"><div class="setup-card-head">'
+                '<h3>Verify your setup</h3><span class="setup-badge">Run checks</span></div>'
+                "<p>A saved source profile is not a health check. Run validation to check "
+                "the selected source connection and mapped columns.</p>"
                 + form("readiness", csrf, "", "Run readiness checks")
+                + '<p><a class="portal-link" href="/admin/diagnostics">View diagnostics &rarr;</a>'
+                '</p></li><li class="setup-card"><div class="setup-card-head">'
+                '<h3>Choose what to share</h3><span class="setup-badge">Your control</span></div>'
+                "<p>Add trusted partners and grant only the resources they need. "
+                "Circuit access also requires an explicit circuit share. "
+                "No partner access is granted just by completing setup.</p>"
+                '<a href="/admin/partners">Manage partner access &rarr;</a></li></ol>'
+                '<p class="setup-footnote">After selecting a database or changing monitoring '
+                "settings, restart the connector service to apply them. "
+                "A portal heartbeat does not confirm source-database health.</p>"
             )
         if section == "identity":
             return (
@@ -283,67 +524,183 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
             )
         if section == "portal":
             paired = connection_file.exists()
-            return (
-                f"<p>Paired locally: {paired}</p><p>{escape(store.get('heartbeat'))}</p>"
-                "<p>Use an HTTPS portal URL. For an internal CA, give its PEM path on this server. "
-                "Certificate verification cannot be disabled. "
-                "Get a pairing code from your company admin's portal.</p>"
-                + form(
+            portal_url = settings.portal_url
+            connection_error = ""
+            if paired:
+                try:
+                    portal_url = PortalConnection.load(connection_file).portal_url
+                except ValueError, OSError:
+                    logger.warning("Saved portal connection is invalid or unreadable")
+                    connection_error = (
+                        "The saved connection could not be read. Disconnect it locally, "
+                        "then obtain a new pairing code."
+                    )
+            state = store.get("heartbeat")
+            recent = bool(paired and state.get("seen") and time.time() - float(state["seen"]) < 90)
+            error = connection_error or state.get("error", "")
+            status = (
+                "Connection needs attention"
+                if paired and error
+                else "Connected"
+                if recent
+                else "Paired &mdash; waiting for a heartbeat"
+                if paired
+                else "Not connected"
+            )
+            open_portal = (
+                f'<a class="portal-button" href="{escape(portal_url)}/portal/connector" '
+                'target="_blank" rel="noopener noreferrer">Open Carrier Portal &nearr;</a>'
+                if portal_url
+                else '<p class="portal-warning"><strong>Portal connection is not configured yet.'
+                "</strong><br>Your connector administrator needs to configure the "
+                "Carrier Portal address before you can connect.</p>"
+            )
+            if paired:
+                code_form = (
+                    "<p>This connector is already paired. Use Check connection to verify "
+                    "it, or disconnect before entering a new code.</p>"
+                )
+            elif not settings.portal_url:
+                code_form = (
+                    "<p>Pairing will be available once the portal address is configured.</p>"
+                )
+            elif identity is None or not identity.enabled:
+                code_form = (
+                    '<p class="portal-warning"><a class="portal-link" href="/admin/identity">'
+                    "Set up your company identity</a> before connecting to Carrier Portal.</p>"
+                )
+            else:
+                code_form = form(
                     "pair",
                     csrf,
-                    field("url", "Portal HTTPS URL")
-                    + field("code", "One-time pairing code", kind="password")
-                    + field("ca", "Optional trusted CA PEM path"),
-                    "Pair connector",
+                    '<label for="pairing-code">Pairing code</label>'
+                    '<input class="portal-code" id="pairing-code" name="code" type="password" '
+                    'autocomplete="one-time-code" spellcheck="false" required '
+                    'minlength="40" maxlength="128" placeholder="Paste your pairing code here">'
+                    '<p class="portal-note">Use the code from Carrier Portal, not your '
+                    "account password.</p>",
+                    "Connect to Carrier Portal",
                 )
-                + form("heartbeat", csrf, "", "Test heartbeat now")
-                + form(
+            controls = ""
+            if paired:
+                controls = form("heartbeat", csrf, "", "Check connection") + form(
                     "disconnect",
                     csrf,
-                    "<p>Disconnect deletes this server's saved credential. "
-                    "Also revoke it in the hosted portal.</p>",
+                    '<p class="portal-note">Disconnecting stops this connector from checking in. '
+                    "Also disconnect it in Carrier Portal to revoke its credential.</p>",
                     "Disconnect locally",
                 )
+            status_detail = (
+                "A heartbeat was received within the last 90 seconds."
+                if recent and not error
+                else "The connector checks in automatically every 30 seconds."
+                if paired
+                else "Your connector has not been linked to a Carrier Portal account."
+            )
+            return (
+                '<p class="portal-intro">Link this connector to your company&rsquo;s '
+                "Carrier Portal account in three simple steps. "
+                "You can also use direct partner sharing without connecting to the portal.</p>"
+                '<div class="portal-grid"><ol class="portal-steps">'
+                '<li class="portal-step"><div class="portal-step-content">'
+                "<h3>Open Carrier Portal</h3>"
+                "<p>Sign in with your <strong>company administrator account</strong>, "
+                "then select <strong>Connector</strong> from the navigation. "
+                "The button below opens that page in a new tab.</p>"
+                + open_portal
+                + '</div></li><li class="portal-step"><div class="portal-step-content">'
+                "<h3>Get your pairing code</h3>"
+                "<p>Select <strong>Generate pairing code / replace connector</strong> "
+                "in Carrier Portal, then copy the code shown.</p>"
+                '<p class="portal-note">The code is shown only once, can be used once, '
+                "and expires after <strong>15 minutes</strong>.</p>"
+                '<p class="portal-warning"><strong>Replacing a connector?</strong> '
+                "Generating a new code immediately disconnects the previously paired connector."
+                '</p></div></li><li class="portal-step"><div class="portal-step-content">'
+                "<h3>Paste your code here</h3>"
+                + code_form
+                + '</div></li></ol><aside class="portal-summary"><h3>Your connection</h3>'
+                + f'<span class="portal-badge{" connected" if recent and not error else ""}" '
+                f'role="status">{status}</span><p>{status_detail}</p>'
+                + (f'<p class="portal-warning">{escape(error)}</p>' if error else "")
+                + controls
+                + "<hr><h3>Your credentials stay here</h3>"
+                "<p>Your database password and monitoring credentials stay on "
+                "this connector. They are not sent to Carrier Portal.</p>"
+                '<p class="portal-note"><strong>Available today:</strong> connector '
+                "registration and online status. Live data retrieval and sharing-permission "
+                "synchronization are not available yet.</p></aside></div>"
             )
         if section in {"sources", "mapping"}:
             name = (
                 selected_profile
                 or settings.source_database_profile
-                or store.get("source").get("name", "nettool")
+                or store.get("source").get("name")
+                or (
+                    "nettool"
+                    if any(p["name"] == "nettool" for p in snapshot["profiles"])
+                    else "database"
+                )
             )
             profile = repository.get_source_database_profile(name)
             if section == "mapping":
-                mapping = (
-                    profile.mapping_json if profile else SourceMapping.nettool_defaults().to_json()
-                )
-                mapped = SourceMapping.from_json(mapping)
-                mapping_fields = "".join(
-                    "<details><summary>"
-                    + escape(resource)
-                    + "</summary>"
-                    + field(f"table__{resource}", "Source table", entry.table)
-                    + "".join(
-                        field(f"column__{resource}__{logical}", f"Column for {logical}", column)
-                        for logical, column in entry.columns.items()
-                    )
-                    + "</details>"
-                    for resource, entry in mapped.resources.items()
-                )
+                if profile is None and not selected_profile and snapshot["profiles"]:
+                    name = snapshot["profiles"][0]["name"]
+                    profile = repository.get_source_database_profile(name)
+                mapping = profile.mapping_json if profile else SourceMapping({}).to_json()
                 return (
-                    "<p>Mappings use table/column identifiers, never SQL. "
-                    "Each resource maps logical fields to columns. source_id identifies records; "
-                    "layout IDs link circuits to ordered items. TableName/TablePK identify "
-                    "Port, Patch "
-                    "or PW items. Preview is limited to five mapped rows.</p>"
-                    "<p>Use the guided fields below. A blank table removes that resource; "
-                    "a blank column removes that field. Every enabled resource needs source_id. "
-                    "Validation checks tables and columns, not complete referential integrity.</p>"
-                    + form(
-                        "mapping-fields",
-                        csrf,
-                        field("name", "Profile", name) + mapping_fields,
-                        "Validate and save field mappings",
+                    '<p class="setup-intro">Your database is on the left. OCP tables are on '
+                    "the right. Drag a database field into the empty box beside its OCP field: "
+                    "<strong>Database field &rarr; OCP field</strong>.</p>"
+                    f'<div id="mapping-workspace" data-profile="{escape(name)}" '
+                    f'data-csrf="{escape(csrf)}">'
+                    '<div class="mapper-toolbar"><label>Database connection'
+                    '<select id="map-profile">'
+                    + "".join(
+                        f'<option value="{escape(p["name"])}"'
+                        f"{' selected' if p['name'] == name else ''}>{escape(p['name'])}</option>"
+                        for p in snapshot["profiles"]
                     )
+                    + "</select></label>"
+                    "</div>"
+                    '<p id="map-message" class="mapper-message" '
+                    'role="status" aria-live="polite">Loading database schema...</p>'
+                    '<div class="mapper-grid"><div class="mapper-panel">'
+                    "<h3>Linked database tables</h3><label>Find a table or field"
+                    '<input id="map-search" type="search"></label>'
+                    '<div id="map-tables" class="mapper-tables"></div></div>'
+                    '<div class="mapper-panel"><h3>OCP tables '
+                    '<span id="map-target-count"></span></h3>'
+                    "<label>Find an OCP table or field"
+                    '<input id="map-target-search" type="search"></label>'
+                    '<p class="mapper-help">Drop on the left side of a row to link it to the '
+                    "OCP field on the right. Or select a database field and choose Assign.</p>"
+                    '<div id="map-slots" class="mapper-targets"></div></div></div>'
+                    '<p id="map-active-label" class="mapper-help"></p>'
+                    '<div class="mapper-actions">'
+                    '<button id="map-preview" type="button">Preview 5 mapped rows</button>'
+                    '<button id="map-save" type="button">Validate and save mappings</button>'
+                    "</div><details><summary>Source configuration (advanced)</summary>"
+                    '<button id="map-template" type="button">'
+                    "Load example mappings as draft</button>"
+                    '<p class="mapper-help">Select an OCP section to configure its primary '
+                    "source table and confirmed joins. Changes stay a draft until saved.</p>"
+                    "<label>Source table for the selected OCP section"
+                    '<select id="map-base"></select></label>'
+                    '<details id="map-relationships"><summary>'
+                    "Source connections and joins (advanced)</summary>"
+                    '<p class="mapper-help">Foreign keys suggest '
+                    "relationships; you must confirm each join. Without a foreign key, select "
+                    "the matching columns yourself. Join targets must have a single-column "
+                    "primary or unique key to avoid duplicating records.</p>"
+                    '<div id="map-joins"></div><div id="map-add-join"></div></details>'
+                    '<button id="map-disable" type="button">Remove this resource mapping</button>'
+                    "</details><details><summary>Mapping checks</summary>"
+                    '<p id="map-contract" class="mapper-help" role="status"></p>'
+                    "</details><details><summary>Generated SQL (read-only)</summary>"
+                    '<pre id="map-sql" class="mapper-sql">Run a preview to see the generated SQL.'
+                    '</pre></details><div id="map-preview-result" class="mapper-preview"></div>'
+                    '</div><script src="/admin/assets/mapping.js" defer></script>'
                     + "<details><summary>Advanced JSON mapping</summary>"
                     + form(
                         "mapping",
@@ -355,19 +712,6 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                         "Validate and save mapping",
                     )
                     + "</details>"
-                    + form(
-                        "schema",
-                        csrf,
-                        field("name", "Profile", name),
-                        "Discover table/column names",
-                    )
-                    + form(
-                        "preview",
-                        csrf,
-                        field("name", "Profile", name)
-                        + field("resource", "Mapped resource (for example circuits)", "circuits"),
-                        "Preview 5 rows",
-                    )
                 )
             values = (
                 {
@@ -383,70 +727,104 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                 else {}
             )
             monitoring = store.get("observium")
+            existing_names = {p["name"] for p in snapshot["profiles"]}
+            next_name = "database"
+            suffix = 2
+            while next_name in existing_names:
+                next_name = f"database-{suffix}"
+                suffix += 1
+            password_variable = values.get("password_env", "OCP_SOURCE_DB_PASSWORD")
+            managed = bool(os.getenv(password_variable))
+            password_control = (
+                '<p class="connection-managed">Password managed by server configuration. '
+                "Update it in the connector service environment, then restart.</p>"
+                if managed
+                else '<label>Password<input name="password" type="password" '
+                'autocomplete="new-password" maxlength="4096" '
+                'placeholder="Leave blank to keep the saved password"></label>'
+            )
             return (
-                table(snapshot["profiles"])
-                + "<p>Use a dedicated read-only source account. "
-                + "<p>Edit profile: "
+                '<p class="setup-intro">Manage your database and monitoring connections. '
+                "Passwords are never displayed back in this page.</p>"
+                '<div class="connection-list">'
                 + " ".join(
                     f'<a href="/admin/sources?profile={quote(p["name"], safe="")}">'
-                    f"{escape(p['name'])}</a> "
-                    f'<a href="/admin/mapping?profile={quote(p["name"], safe="")}">Mapping</a>'
+                    f"{escape(p['name'])}</a>"
                     for p in snapshot["profiles"]
                 )
-                + "</p>"
-                + "<p>Use a dedicated read-only source account. "
-                "Enter the NAME of its password environment variable, not its value. "
-                "Existing CLI profiles are reused. Remote MySQL requires TLS; existing CLI "
-                "insecure opt-in is preserved but cannot be newly enabled here.</p>"
-                + form(
-                    "source",
-                    csrf,
-                    field("name", "Profile name", name)
-                    + "".join(
-                        field(key, label, values.get(key, default))
-                        for key, label, default in [
-                            ("driver", "Driver: mysql or sqlite", "mysql"),
-                            ("host", "MySQL host", ""),
-                            ("port", "MySQL port", "3306"),
-                            ("database", "Database name or absolute SQLite path", ""),
-                            ("username", "Read-only username", ""),
-                            (
-                                "password_env",
-                                "Password environment variable",
-                                "OCP_SOURCE_DB_PASSWORD",
-                            ),
-                            ("ca", "MySQL TLS CA path", ""),
-                        ]
-                    )
-                    + '<label>Profile status<select name="enabled">'
-                    + (
-                        '<option value="false">Disabled</option>'
-                        '<option value="true">Enabled</option>'
-                        if profile is not None and not profile.enabled
-                        else '<option value="true">Enabled</option>'
-                        '<option value="false">Disabled</option>'
-                    )
-                    + "</select></label>",
-                    "Save source profile",
+                + f'<a href="/admin/sources?profile={quote(next_name, safe="")}">'
+                "+ Add database connection</a>"
+                '</div><div class="connection-card"><h3>Database connection</h3>'
+                "<p><strong>Use a read-only database account.</strong> "
+                "Use a dedicated account with SELECT access only to the tables you intend "
+                "to share. Do not use root or an administrator.</p>"
+                '<form method="post" action="/admin/source">'
+                f'<input type="hidden" name="csrf" value="{escape(csrf)}">'
+                '<input type="hidden" name="connection_form" value="true">'
+                '<div class="connection-fields">'
+                + "".join(
+                    field(key, label, values.get(key, default))
+                    for key, label, default in [
+                        ("database", "Database name", ""),
+                        ("host", "IP address / hostname", ""),
+                        ("port", "Port", "3306"),
+                        ("username", "Username", ""),
+                    ]
                 )
+                + (password_control if values.get("driver", "mysql") == "mysql" else "")
+                + "</div><details><summary>Advanced settings</summary>"
+                + field("name", "Connection name", name)
+                + "".join(
+                    field(key, label, values.get(key, default))
+                    for key, label, default in [
+                        ("driver", "Driver: mysql or sqlite", "mysql"),
+                        (
+                            "password_env",
+                            "Password environment variable (optional)",
+                            "OCP_SOURCE_DB_PASSWORD" if managed else "",
+                        ),
+                        ("ca", "MySQL TLS CA path", ""),
+                    ]
+                )
+                + "<p>Remote MySQL requires a trusted TLS CA file. "
+                "SQLite connections use an absolute file path as the database name. "
+                "Existing plaintext opt-ins are preserved; this page cannot enable them.</p>"
+                + '<label>Profile status<select name="enabled">'
+                + (
+                    '<option value="false">Disabled</option><option value="true">Enabled</option>'
+                    if profile is not None and not profile.enabled
+                    else '<option value="true">Enabled</option>'
+                    '<option value="false">Disabled</option>'
+                )
+                + "</select></label></details>"
+                + '<div class="connection-actions"><button class="secondary" type="submit" '
+                'formaction="/admin/test-connection">Test connection</button>'
+                '<button type="submit">Save connection</button></div></form></div>'
                 + (
                     "<p>Profile disabled. Save it as Enabled before testing or selecting.</p>"
                     if profile is not None and not profile.enabled
                     else ""
                 )
+                + '<details class="connection-card"><summary>Mapping and activation</summary>'
+                "<p>Save the connection first. Review its field mapping before selecting "
+                "it for the connector API.</p>"
+                f'<p><a href="/admin/mapping?profile={quote(name, safe="")}">'
+                "Review database mapping</a></p>"
                 + form(
                     "test-source",
                     csrf,
-                    field("name", "Profile to test", name),
-                    "Test connectivity and mapping",
+                    f'<input type="hidden" name="name" value="{escape(name)}">',
+                    "Validate saved database mapping",
                 )
                 + form(
                     "activate",
                     csrf,
-                    field("name", "Profile to activate", name),
+                    f'<input type="hidden" name="name" value="{escape(name)}">',
                     "Validate and select for API restart",
                 )
-                + "<h3>Observium (optional)</h3><p>Token stays in this server's environment. "
+                + "</details>"
+                + '<details class="connection-card"><summary>Monitoring connection '
+                "(Observium, optional)</summary><p>Token stays in this server's environment. "
                 "Environment-configured Observium settings override saved UI settings.</p>"
                 + form(
                     "observium",
@@ -468,6 +846,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                     ),
                 )
                 + form("test-observium", csrf, "", "Test effective Observium connection")
+                + "</details>"
             )
         if section == "partners":
             return (
@@ -506,7 +885,11 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                     field("partner", "Partner ID")
                     + field("circuit", "Local source circuit ID")
                     + '<label>Detail<select name="visibility"><option>endpoints</option>'
-                    "<option>sfn_path</option><option>full_shared_path</option></select></label>",
+                    "<option>sfn_path</option><option>full_shared_path</option>"
+                    "<option>summary</option></select></label>"
+                    "<p>Visible circuit ports include current monitoring "
+                    "when linked and configured. "
+                    "This does not grant access to unrelated devices or ports.</p>",
                     "Share circuit",
                 )
                 + form(
@@ -555,7 +938,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                     csrf,
                     field("name", "Connection name", name)
                     + field("circuit", "Partner opaque circuit ID"),
-                    "View authorized circuit path",
+                    "View authorized circuit details",
                 )
             )
         if section == "account":
@@ -612,18 +995,26 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
             identity = repository.get_connector_identity()
             if identity is None or not identity.enabled:
                 raise ValueError("initialize an enabled company identity first")
-            ca = text(data, "ca", required=False)
+            if not settings.portal_url:
+                raise ValueError(
+                    "Carrier Portal address is not configured. Ask your connector administrator "
+                    "to set OCP_PORTAL_URL in the connector environment and restart."
+                )
+            ca = portal_ca()
             with http_client(ca) as client:
                 pair_portal(
                     client=client,
-                    portal_url=text(data, "url"),
+                    portal_url=settings.portal_url,
                     connector_id=identity.connector_id,
                     code=text(data, "code"),
                     connection_file=connection_file,
                 )
             store.save("portal", {"ca": ca})
             store.save("heartbeat", {})
-            return "<p>Paired. The connector sends heartbeats every 30 seconds while running.</p>"
+            return (
+                "<p>Paired successfully. The connector will confirm its connection with a "
+                'heartbeat.</p><p><a href="/admin/portal">View Carrier Portal connection</a></p>'
+            )
         elif action == "heartbeat":
             if not connection_file.exists():
                 raise ValueError("pair the connector first")
@@ -635,6 +1026,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
             store.save("heartbeat", {})
         elif action in {
             "source",
+            "test-connection",
             "mapping",
             "mapping-fields",
             "activate",
@@ -644,7 +1036,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
         }:
             name = text(data, "name")
             profile = repository.get_source_database_profile(name)
-            if action == "source":
+            if action in {"source", "test-connection"}:
                 driver = text(data, "driver")
                 enabled = text(data, "enabled", required=False) or (
                     "false" if profile is not None and not profile.enabled else "true"
@@ -654,9 +1046,53 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                 port = int(text(data, "port")) if driver == "mysql" else None
                 if port is not None and not 1 <= port <= 65535:
                     raise ValueError("MySQL port must be between 1 and 65535")
-                password_env = env_name(text(data, "password_env")) if driver == "mysql" else None
+                password_env = None
+                password = text(data, "password", required=False)
+                if len(password) > 4096:
+                    raise ValueError("database password must not exceed 4096 characters")
+                if driver == "mysql":
+                    variable = text(data, "password_env", required=False)
+                    password_env = env_name(
+                        variable
+                        or (profile.password_env_var if profile else "")
+                        or "OCP_SOURCE_DB_UI_"
+                        + hashlib.sha256(name.encode()).hexdigest()[:24].upper()
+                    )
+                    if os.getenv(password_env) and password:
+                        raise ValueError(
+                            "Password is managed by server configuration; update it there."
+                        )
                 if driver == "sqlite" and not Path(text(data, "database")).is_absolute():
                     raise ValueError("use an absolute SQLite source path")
+                if action == "test-connection" or data.get("connection_form") == "true":
+                    environment = dict(os.environ)
+                    if password and password_env:
+                        environment[password_env] = password
+                    candidate = configured_source_database(
+                        driver=driver,
+                        database_name=text(data, "database"),
+                        mapping_json=profile.mapping_json
+                        if profile
+                        else SourceMapping({}).to_json(),
+                        environment=environment,
+                        metadata_path=settings.database_path,
+                        host=text(data, "host", required=False) or None,
+                        port=port,
+                        username=text(data, "username", required=False) or None,
+                        password_env_var=password_env,
+                        tls_ca_path=text(data, "ca", required=False) or None,
+                        allow_insecure=profile.allow_insecure if profile else False,
+                        timeout_seconds=profile.timeout_seconds if profile else 10,
+                    )
+                    if action == "test-connection":
+                        candidate.health_check()
+                        return (
+                            "<p>Database connection succeeded. Nothing was saved. "
+                            "This does not verify read-only permissions or database mapping.</p>"
+                            '<p><a href="/admin/sources">Back to connections</a></p>'
+                        )
+                if password and password_env:
+                    save_password(settings.database_path, password_env, password)
                 repository.put_source_database_profile(
                     name=name,
                     driver=driver,
@@ -669,10 +1105,16 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                     allow_insecure=profile.allow_insecure if profile else False,
                     timeout_seconds=profile.timeout_seconds if profile else 10,
                     enabled=enabled == "true",
-                    mapping_json=profile.mapping_json
-                    if profile
-                    else SourceMapping.nettool_defaults().to_json(),
+                    mapping_json=profile.mapping_json if profile else SourceMapping({}).to_json(),
                 )
+                if data.get("connection_form") == "true":
+                    return (
+                        "<p>Database connection saved. No password is displayed or logged.</p>"
+                        f'<p><a href="/admin/sources?profile={quote(name, safe="")}">'
+                        "Back to this connection</a></p>"
+                        "<p>Review the database mapping and select the connection for the API "
+                        "when ready. Restart the connector to apply changes.</p>"
+                    )
             elif action in {"mapping", "mapping-fields"}:
                 if profile is None:
                     raise ValueError("save a source profile first")
@@ -692,7 +1134,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                                 )
                             )
                         }
-                        resources[resource] = ResourceMapping(table_name, columns)
+                        resources[resource] = ResourceMapping(table_name, columns, entry.joins)
                     mapping = SourceMapping(resources)
                 else:
                     mapping = SourceMapping.from_json(text(data, "mapping"))
@@ -705,6 +1147,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                     database_name=profile.database_name,
                     mapping_json=mapping.to_json(),
                     environment=os.environ,
+                    metadata_path=settings.database_path,
                     host=profile.host,
                     port=profile.port,
                     username=profile.username,
@@ -716,24 +1159,42 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                 source.validate_mapping()
                 save_mapping(repository, profile, mapping.to_json())
             elif action == "schema":
-                return table(source_for(repository, name).describe_schema())
+                return table(source_for(repository, name, settings.database_path).describe_schema())
             elif action == "preview":
-                rows = source_for(repository, name).fetch(text(data, "resource"), limit=5)
+                rows = source_for(repository, name, settings.database_path).fetch(
+                    text(data, "resource"), limit=5
+                )
                 return table([{k: str(v) for k, v in row.items()} for row in rows])
             else:
-                source = source_for(repository, name)
+                source = source_for(repository, name, settings.database_path)
                 source.health_check()
                 source.validate_mapping()
+                missing = source.missing_fields_for(monitoring=monitoring_enabled())
+                warning = (
+                    (
+                        "<p>Required mappings still missing: "
+                        + escape(
+                            ", ".join(
+                                resource + "." + field
+                                for resource, fields in missing.items()
+                                for field in fields
+                            )
+                        )
+                        + ".</p>"
+                    )
+                    if missing
+                    else ""
+                )
                 if action == "activate":
                     store.save("source", {"name": name})
                     return (
-                        "<p>Source validated and selected. Restart the partner API to apply. "
+                        "<p>Source connection selected. Restart the partner API to apply. "
                         "Explicit OCP_SOURCE_DB_PROFILE takes precedence.</p>"
-                    )
+                    ) + warning
                 return (
-                    "<p>Connectivity and mapping validated. Use a read-only account; "
+                    "<p>Connectivity and mapped source columns validated. Use a read-only account; "
                     "SELECT tests do not prove its database permissions.</p>"
-                )
+                ) + warning
         elif action == "observium":
             url = text(data, "url").rstrip("/")
             monitoring_url = urlsplit(url)
@@ -868,7 +1329,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                     circuit = text(data, "circuit")
                     if not re.fullmatch(r"circuit_[a-f0-9]{24}", circuit):
                         raise ValueError("use the opaque circuit ID provided by your partner")
-                    path = f"/v1/circuits/{circuit}/path"
+                    path = f"/v1/circuits/{circuit}"
                 response = client.get(
                     remote["url"] + path, headers={"Authorization": f"Bearer {token}"}
                 )
@@ -880,9 +1341,19 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
                 raise ValueError("company identity is not initialized")
             name = settings.source_database_profile or store.get("source").get("name")
             if name:
-                source = source_for(repository, name)
+                source = source_for(repository, name, settings.database_path)
                 source.health_check()
                 source.validate_mapping()
+                missing = source.missing_fields_for(monitoring=monitoring_enabled())
+                if missing:
+                    raise ValueError(
+                        "Source schema passed; core or enabled sections still need mappings: "
+                        + ", ".join(
+                            resource + "." + field
+                            for resource, fields in missing.items()
+                            for field in fields
+                        )
+                    )
                 checks.append("Source connectivity/mapping passed")
             else:
                 checks.append("No source selected: circuit retrieval is not ready")
@@ -893,6 +1364,137 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
         else:
             raise ValueError("unknown administration action")
         return "<p>Saved successfully.</p>"
+
+    @app.get("/admin/assets/mapping.js")
+    async def mapping_script():
+        return Response(
+            Path(__file__).with_name("mapping.js").read_text(encoding="utf-8"),
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/admin/mapping/data")
+    async def mapping_data(request: Request):
+        if not store.session(request.cookies.get("ocp_admin", "")):
+            return JSONResponse({"error": "Sign in to load database schema."}, status_code=401)
+        name = request.query_params.get("profile", "")
+
+        def discover():
+            source = source_for(repository, name, settings.database_path)
+            profile = repository.get_source_database_profile(name)
+            assert profile is not None
+            return {
+                "columns": source.describe_schema(),
+                "relationships": source.describe_relationships(),
+                "mapping": json.loads(SourceMapping.from_json(profile.mapping_json).to_json()),
+                "fields": {
+                    resource: list(entry.fields) for resource, entry in SOURCE_RESOURCES.items()
+                },
+                "groups": MAPPING_GROUPS,
+                "target_tables": OCP_TABLES,
+                "basic_fields": BASIC_FIELDS,
+                "core_resources": CORE_RESOURCES,
+                "monitoring_fields": MONITORING_FIELDS,
+                "monitoring_enabled": monitoring_enabled(),
+                "required_fields": {
+                    resource: list(
+                        entry.required
+                        + (MONITORING_FIELDS.get(resource, ()) if monitoring_enabled() else ())
+                    )
+                    for resource, entry in SOURCE_RESOURCES.items()
+                },
+                "private_fields": {
+                    resource: list(entry.private) for resource, entry in SOURCE_RESOURCES.items()
+                },
+                "hidden_fields": {
+                    resource: list(entry.legacy) for resource, entry in SOURCE_RESOURCES.items()
+                },
+                "resource_labels": {
+                    resource: entry.label for resource, entry in SOURCE_RESOURCES.items()
+                },
+                "template": json.loads(SourceMapping.sharing_defaults().to_json()),
+            }
+
+        try:
+            return JSONResponse(await run_in_threadpool(discover))
+        except (ValueError, SourceDatabaseError, OSError) as exc:
+            logger.warning("Mapping schema discovery failed for the selected database connection")
+            return JSONResponse(
+                {
+                    "error": (
+                        str(exc)
+                        if isinstance(exc, ValueError)
+                        else "Cannot load schema. Check the enabled database connection, "
+                        "credentials and certificate settings on Connections, "
+                        "then reload this page."
+                    )
+                },
+                status_code=400,
+            )
+
+    @app.post("/admin/mapping/workspace")
+    async def mapping_workspace(request: Request):
+        session = store.session(request.cookies.get("ocp_admin", ""))
+        if not session:
+            return JSONResponse({"error": "Sign in before editing mappings."}, status_code=401)
+        if request.headers.get("origin") not in {None, base_url}:
+            return JSONResponse({"error": "Invalid origin."}, status_code=403)
+        if len(await request.body()) > 131072:
+            return JSONResponse({"error": "Mapping is too large."}, status_code=413)
+        data = await request.form()
+        supplied = data.get("csrf")
+        if not isinstance(supplied, str) or not secrets.compare_digest(supplied, session["csrf"]):
+            return JSONResponse({"error": "Form expired. Reload and sign in."}, status_code=403)
+
+        def apply():
+            name = text(data, "name")
+            mapping = SourceMapping.from_json(text(data, "mapping"))
+            if not mapping.resources or any(
+                "source_id" not in entry.columns for entry in mapping.resources.values()
+            ):
+                raise ValueError(
+                    "Map at least one resource and a source_id for each enabled resource."
+                )
+            source = source_for(repository, name, settings.database_path, mapping)
+            action = text(data, "operation")
+            if action == "save":
+                source.validate_mapping()
+                profile = repository.get_source_database_profile(name)
+                assert profile is not None
+                save_mapping(repository, profile, mapping.to_json())
+                return {
+                    "message": "Mappings validated and saved. Restart the connector to apply "
+                    "them to the API. Source data was not changed.",
+                    "missing_fields": mapping.missing_fields_for(monitoring=monitoring_enabled()),
+                }
+            if action != "preview":
+                raise ValueError("Unknown mapping operation.")
+            resource = text(data, "resource")
+            if resource not in mapping.resources:
+                raise ValueError("Select a resource with at least its source_id mapped.")
+            rows = source.fetch(resource, limit=5)
+            return {
+                "message": (
+                    f"Preview returned {len(rows)} mapped rows. Preview does not save changes."
+                ),
+                "rows": [
+                    {k: None if v is None else str(v) for k, v in row.items()} for row in rows
+                ],
+                "sql": source.preview_sql(resource),
+            }
+
+        try:
+            result = await run_in_threadpool(apply)
+        except (ValueError, SourceDatabaseError) as exc:
+            store.audit(session["username"], "mapping.workspace.failed")
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError:
+            store.audit(session["username"], "mapping.workspace.failed")
+            return JSONResponse(
+                {"error": "Cannot read source credentials or certificate files."}, status_code=400
+            )
+        store.audit(session["username"], "mapping.workspace." + str(data.get("operation")))
+        return JSONResponse(result)
 
     @app.get("/")
     async def root():
@@ -934,7 +1536,9 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#475569}}
         if section not in SECTIONS:
             return page("Not found", "<p>Unknown page.</p>", session["csrf"], status=404)
         return page(
-            section.title(),
+            "Connect to Carrier Portal"
+            if section == "portal"
+            else SECTION_LABELS.get(section, section.title()),
             await run_in_threadpool(
                 render, section, session["csrf"], request.query_params.get("profile", "")
             ),

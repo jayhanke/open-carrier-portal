@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -151,6 +152,179 @@ def test_page_css_is_inside_style_element(admin):
         markup.feed(response.text)
         assert "body{margin:0" in "".join(markup.styles)
         assert "body{margin:0" not in "".join(markup.visible)
+
+
+@pytest.mark.parametrize(
+    ("source_state", "expected_status"),
+    [
+        ("unselected", "Not selected"),
+        ("missing", "Profile missing"),
+        ("disabled", "Profile disabled"),
+        ("selected", "Selected"),
+    ],
+)
+def test_setup_dashboard_status_and_actions(admin, tmp_path, source_state, expected_status):
+    app, _, _ = admin
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        initial = client.get("/admin/setup").text.split("<h2>Setup</h2>", 1)[1]
+        assert "Get started" in initial
+        assert initial.count('<li class="setup-card') == 6
+        assert "setup-hero" not in initial
+        assert "<aside" not in initial
+        assert "Get connected. Stay in control." not in initial
+        assert "Set up your connections" in initial
+        assert initial.index("Carrier Portal (optional)") < initial.index("Verify your setup")
+        assert initial.index("Verify your setup") < initial.index("Choose what to share")
+        assert initial.index("/admin/partners") > initial.index('action="/admin/readiness"')
+        assert post(client, "identity", name="Carrier <script>").status_code == 200
+        if source_state in {"selected", "disabled"}:
+            assert (
+                post(
+                    client,
+                    "source",
+                    name="company-db",
+                    driver="sqlite",
+                    database=str(tmp_path / "company.db"),
+                    enabled="false" if source_state == "disabled" else "true",
+                ).status_code
+                == 200
+            )
+        if source_state != "unselected":
+            app.state.admin_store.save("source", {"name": "company-db"})
+        response = client.get("/admin/setup")
+        content = response.text.split("<h2>Setup</h2>", 1)[1]
+        assert response.status_code == 200
+        assert expected_status in content
+        assert "Carrier &lt;script&gt;" in content
+        assert "Carrier <script>" not in content
+        assert "Configured" in content
+        assert 'action="/admin/readiness"' in content
+        assert "saved source profile is not a health check" in content
+        assert "Review field mapping" in content
+        assert content.index("/admin/mapping") < content.index("/admin/portal")
+        assert 'href="/admin/partners"' in content
+        assert "Connect to Carrier Portal" in content
+        assert "Not required for direct partner sharing" in content
+        assert 'href="/admin/sources"' in content
+        assert 'href="/admin/remote"' in content
+        assert "NetTool" not in content
+        assert content.index("/admin/portal") < content.index('action="/admin/readiness"')
+        assert ">Ready<" not in content
+
+
+def test_admin_database_wording_and_new_profile_default(admin):
+    app, _, _ = admin
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        for section in ("setup", "sources", "mapping", "portal"):
+            response = client.get("/admin/" + section)
+            assert response.status_code == 200
+            assert "nettool" not in response.text.lower()
+        connections = client.get("/admin/sources")
+        assert "<h2>Connections</h2>" in connections.text
+        assert 'name="name" type="text" value="database"' in connections.text
+
+
+def test_database_form_secret_save_reload_and_environment_precedence(
+    admin, monkeypatch, tmp_path, capsys
+):
+    from open_carrier_portal import cli
+    from open_carrier_portal.source_credentials import credential_path, read_password
+    from open_carrier_portal.source_database import SourceDatabase
+
+    app, settings, _ = admin
+    monkeypatch.delenv("OCP_SOURCE_DB_PASSWORD", raising=False)
+    data = {
+        "name": "database",
+        "driver": "mysql",
+        "database": "company",
+        "host": "localhost",
+        "port": "3306",
+        "username": "reader",
+        "password": " private-password $ ",
+        "connection_form": "true",
+    }
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        page = client.get("/admin/sources")
+        assert 'name="password"' in page.text
+        assert "Help creating a read-only account" not in page.text
+        assert "CREATE USER" not in page.text
+        assert 'formaction="/admin/test-connection"' in page.text
+        assert post(client, "source", **data).status_code == 200
+        profile = app.state.repository.get_source_database_profile("database")
+        variable = profile.password_env_var
+        assert read_password(settings.database_path, variable) == data["password"]
+        assert credential_path(settings.database_path, variable).exists()
+        assert data["password"] not in client.get("/admin/sources").text
+        assert data["password"] not in client.get("/admin/diagnostics").text
+        assert data["password"].encode() not in settings.database_path.read_bytes()
+        data["password"] = ""
+        assert post(client, "source", **data).status_code == 200
+        assert read_password(settings.database_path, variable) == " private-password $ "
+        restarted = create_app(settings, admin_base_url=BASE, connection_file=tmp_path / "portal")
+        assert restarted.state.source_database is None
+        app.state.admin_store.save("source", {"name": "database"})
+        restarted = create_app(settings, admin_base_url=BASE, connection_file=tmp_path / "portal")
+        assert restarted.state.source_database._settings.password == " private-password $ "
+        monkeypatch.setenv(variable, "environment-secret")
+        restarted = create_app(settings, admin_base_url=BASE, connection_file=tmp_path / "portal")
+        assert restarted.state.source_database._settings.password == "environment-secret"
+        page = client.get("/admin/sources").text
+        assert "Password managed by server configuration" in page
+        assert 'name="password"' not in page
+        assert "environment-secret" not in page
+        data["password"] = "attempted-override"
+        assert post(client, "source", **data).status_code == 400
+        assert read_password(settings.database_path, variable) == " private-password $ "
+        monkeypatch.delenv(variable)
+        calls = []
+        monkeypatch.setattr(SourceDatabase, "health_check", lambda self: calls.append(self))
+        data["password"] = "test-only-secret"
+        assert post(client, "test-connection", **data).status_code == 200
+        assert calls[0]._settings.password == "test-only-secret"
+        assert read_password(settings.database_path, variable) == " private-password $ "
+        monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", settings.token_signing_key)
+        monkeypatch.setenv("OCP_DATABASE_PATH", str(settings.database_path))
+        monkeypatch.setattr("sys.argv", ["ocp", "test-source", "--name", "database"])
+        monkeypatch.setattr(SourceDatabase, "validate_mapping", lambda self: None)
+        cli.main()
+        assert calls[-1]._settings.password == " private-password $ "
+        assert '"status": "ok"' in capsys.readouterr().out
+
+
+def test_database_form_failure_does_not_save_password_or_profile(admin):
+    from open_carrier_portal.source_credentials import credential_path
+
+    app, settings, _ = admin
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        response = post(
+            client,
+            "source",
+            name="invalid",
+            driver="mysql",
+            database="company",
+            host="10.1.1.1",
+            port="3306",
+            username="reader",
+            password="private-secret",
+            connection_form="true",
+        )
+        assert response.status_code == 400
+        assert app.state.repository.get_source_database_profile("invalid") is None
+        assert not credential_path(settings.database_path, "unused").parent.exists()
+
+
+def test_setup_dashboard_does_not_treat_stale_portal_status_as_connected(admin):
+    app, _, _ = admin
+    app.state.admin_store.save("heartbeat", {"seen": str(time.time())})
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        content = client.get("/admin/setup").text.split("<h2>Setup</h2>", 1)[1]
+        assert "Not connected" in content
+        assert ">Connected<" not in content
 
 
 def test_cli_password_reset_applies_to_running_private_http_app(tmp_path, monkeypatch, capsys):
@@ -315,6 +489,12 @@ def test_sources_mapping_preview_and_api_activation(admin, tmp_path: Path):
             post(client, "source", name="custom", driver="sqlite", database=str(source)).status_code
             == 200
         )
+        assert json.loads(
+            app.state.repository.get_source_database_profile("custom").mapping_json
+        ) == {"resources": {}}
+        catalog = client.get("/admin/mapping/data?profile=custom").json()
+        assert catalog["mapping"] == {"resources": {}}
+        assert len(catalog["target_tables"]) == 12
         discovered = post(client, "schema", name="custom")
         assert discovered.status_code == 200
         assert "circuits" in discovered.text
@@ -360,6 +540,9 @@ def test_sources_mapping_preview_and_api_activation(admin, tmp_path: Path):
             == 200
         )
         assert not app.state.repository.get_source_database_profile("custom").enabled
+        assert json.loads(
+            app.state.repository.get_source_database_profile("custom").mapping_json
+        ) == json.loads(mapping)
         assert "Profile disabled" in client.get("/admin/sources?profile=custom").text
         assert post(client, "test-source", name="custom").status_code == 400
         assert (
@@ -381,6 +564,67 @@ def test_sources_mapping_preview_and_api_activation(admin, tmp_path: Path):
             login(api_client)
             assert api_client.get("/admin/mapping").status_code == 200
             assert api_client.get("/health/live").json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize("monitoring", [False, True])
+def test_mapper_and_readiness_agree_on_required_relationships(admin, tmp_path, monitoring):
+    from npdb_fixture import create_npdb
+
+    from open_carrier_portal.source_database import SourceMapping
+
+    app, _, _ = admin
+    database = tmp_path / "inventory.db"
+    create_npdb(database)
+    mapping = json.loads(SourceMapping.sharing_defaults().to_json())
+    for resource in ("devices", "ports"):
+        del mapping["resources"][resource]["columns"]["observium_id"]
+    if monitoring:
+        app.state.admin_store.save(
+            "observium", {"url": "https://monitoring.example", "token_env": "MISSING_TEST_TOKEN"}
+        )
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        assert post(client, "identity", name="Carrier").status_code == 200
+        assert (
+            post(
+                client, "source", name="inventory", driver="sqlite", database=str(database)
+            ).status_code
+            == 200
+        )
+        saved = post(
+            client,
+            "mapping/workspace",
+            name="inventory",
+            mapping=json.dumps(mapping),
+            operation="save",
+        )
+        assert saved.status_code == 200, saved.text
+        expected_missing = (
+            {"devices": ["observium_id"], "ports": ["observium_id"]} if monitoring else {}
+        )
+        assert saved.json()["missing_fields"] == expected_missing
+        catalog = client.get("/admin/mapping/data?profile=inventory").json()
+        assert catalog["monitoring_enabled"] is monitoring
+        for resource in ("devices", "ports"):
+            assert "observium_id" in catalog["basic_fields"][resource]
+            assert ("observium_id" in catalog["required_fields"][resource]) is monitoring
+        for resource, field in (
+            ("ports", "device_id"),
+            ("devices", "rack_id"),
+            ("racks", "location_id"),
+            ("circuits", "circuit_layout_id"),
+        ):
+            assert field in catalog["required_fields"][resource]
+            assert field in catalog["basic_fields"][resource]
+        checked = post(client, "test-source", name="inventory")
+        assert checked.status_code == 200
+        assert ("ports.observium_id" in checked.text) is monitoring
+        assert post(client, "activate", name="inventory").status_code == 200
+        readiness = post(client, "readiness")
+        assert readiness.status_code == (400 if monitoring else 200)
+        if monitoring:
+            assert "devices.observium_id" in readiness.text
+            assert "ports.observium_id" in readiness.text
 
 
 def test_combined_connector_admin_api_and_lifespan(admin, monkeypatch):
@@ -463,35 +707,92 @@ def test_combined_connector_configuration_failure_keeps_admin_available(admin, f
 
 
 def test_pairing_heartbeat_and_local_disconnect(admin, monkeypatch):
-    app, _, connection_file = admin
+    from dataclasses import replace
+
+    _, settings, connection_file = admin
+    app = create_admin_app(
+        replace(
+            settings,
+            portal_url="https://portal.example",
+            portal_ca_bundle="trusted-portal-ca.pem",
+        ),
+        connection_file=connection_file,
+    )
     organization = str(uuid4())
     requests = []
+    cas = []
 
     def handler(request: httpx.Request):
+        assert request.url.host == "portal.example"
+        assert request.url.scheme == "https"
         requests.append(request.url.path)
         if request.url.path.endswith("/pair"):
             return httpx.Response(200, json={"organization_id": organization, "token": "t" * 64})
         return httpx.Response(200, json={"status": "connected"})
 
-    monkeypatch.setattr(
-        "open_carrier_portal.admin.http_client",
-        lambda ca="": httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    def client_for(ca=""):
+        cas.append(ca)
+        return httpx.Client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr("open_carrier_portal.admin.http_client", client_for)
     with TestClient(app, base_url=BASE) as client:
         login(client)
         post(client, "identity", name="Carrier")
-        assert post(client, "pair", url="https://portal.example", code="c" * 43).status_code == 200
+        page = client.get("/admin/portal")
+        assert "Connect to Carrier Portal" in page.text
+        assert 'href="https://portal.example/portal/connector"' in page.text
+        assert 'name="url"' not in page.text
+        assert 'name="ca"' not in page.text
+        assert "15 minutes" in page.text
+        assert 'name="code"' in page.text
+        assert (
+            post(
+                client, "pair", url="https://attacker.test", ca="untrusted.pem", code="c" * 43
+            ).status_code
+            == 200
+        )
         assert PortalConnection.load(connection_file).organization_id == organization
+        assert "Paired &mdash; waiting for a heartbeat" in client.get("/admin/portal").text
+        assert 'name="code"' not in client.get("/admin/portal").text
         assert post(client, "heartbeat").status_code == 200
         assert "seen" in app.state.admin_store.get("heartbeat")
-        assert "t" * 64 not in client.get("/admin/portal").text
+        connected = client.get("/admin/portal")
+        assert "Connected" in connected.text
+        assert "t" * 64 not in connected.text
+        assert "trusted-portal-ca.pem" not in connected.text
         assert post(client, "disconnect").status_code == 200
         assert not connection_file.exists()
         assert post(client, "heartbeat").status_code == 400
-        assert (
-            post(client, "pair", url="http://10.210.4.224:8080", code="c" * 43).status_code == 400
-        )
+        assert "Not connected" in client.get("/admin/portal").text
     assert "/api/connectors/heartbeat" in requests
+    assert cas and all(ca == "trusted-portal-ca.pem" for ca in cas)
+
+
+def test_portal_pairing_requires_installer_configuration_and_identity(admin):
+    from dataclasses import replace
+
+    app, settings, connection_file = admin
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        setup = client.get("/admin/setup").text.split("<h2>Setup</h2>", 1)[1]
+        assert setup.index("/admin/mapping") < setup.index("/admin/portal")
+        assert "Connect to Carrier Portal" in setup
+        assert post(client, "identity", name="Carrier").status_code == 200
+        page = client.get("/admin/portal").text
+        assert "Portal connection is not configured yet" in page
+        assert 'name="code"' not in page
+        assert post(client, "pair", url="https://attacker.test", code="c" * 43).status_code == 400
+        assert not connection_file.exists()
+    configured = create_admin_app(
+        replace(settings, portal_url="https://portal.example"),
+        connection_file=connection_file,
+    )
+    repo = configured.state.repository
+    repo.put_connector_identity(repo.get_connector_identity().model_copy(update={"enabled": False}))
+    with TestClient(configured, base_url=BASE) as client:
+        login(client)
+        assert "Set up your company identity" in client.get("/admin/portal").text
+        assert post(client, "pair", code="c" * 43).status_code == 400
 
 
 def test_remote_partner_oauth_and_circuit_query(admin, monkeypatch):

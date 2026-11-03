@@ -53,3 +53,16 @@ def test_http_opt_in_from_environment(monkeypatch):
     monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "invalid")
     with pytest.raises(ConfigurationError, match="must be true or false"):
         Settings.from_env()
+
+
+def test_portal_configuration_from_environment(monkeypatch):
+    monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "s" * 48)
+    monkeypatch.setenv("OCP_PORTAL_URL", "https://portal.example/")
+    monkeypatch.setenv("OCP_PORTAL_CA_BUNDLE", "trusted-portal-ca.pem")
+    settings = Settings.from_env()
+    assert settings.portal_url == "https://portal.example"
+    assert settings.portal_ca_bundle == "trusted-portal-ca.pem"
+    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setenv("OCP_PORTAL_URL", "http://10.210.4.224:8080")
+    with pytest.raises(ConfigurationError, match="OCP_PORTAL_URL"):
+        Settings.from_env()

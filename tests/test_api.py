@@ -23,6 +23,7 @@ from open_carrier_portal.models import (
 from open_carrier_portal.repository import Repository
 from open_carrier_portal.security import hash_client_secret
 from open_carrier_portal.source_database import (
+    JoinMapping,
     ResourceMapping,
     SourceDatabase,
     SourceMapping,
@@ -109,6 +110,7 @@ def _configured_circuit_app(
     tmp_path: Path,
     *,
     visibility: str | None,
+    joined_names: bool = False,
 ) -> tuple[FastAPI, str, str, Repository, str]:
     settings = Settings(
         database_path=tmp_path / "circuit-metadata.db",
@@ -132,7 +134,10 @@ def _configured_circuit_app(
     with sqlite3.connect(source_path) as connection:
         connection.executescript(
             """
-            CREATE TABLE LitCircuit (LitCircuitID INTEGER, CircuitLayoutID INTEGER);
+            CREATE TABLE LitCircuit (
+                LitCircuitID INTEGER, CircuitLayoutID INTEGER, Name TEXT,
+                SiteA INTEGER, SiteZ INTEGER
+            );
             CREATE TABLE CircuitLayout (
                 CircuitLayoutID INTEGER, PortA INTEGER, PortZ INTEGER
             );
@@ -140,14 +145,17 @@ def _configured_circuit_app(
                 CircuitLayoutItemID INTEGER, CircuitLayoutID INTEGER,
                 ItemIndex INTEGER, TableName TEXT, TablePK INTEGER
             );
-            CREATE TABLE Port (PortID INTEGER, DeviceID INTEGER, Name TEXT);
+            CREATE TABLE Port (PortID INTEGER, DeviceID INTEGER, Name TEXT, ObserviumID INTEGER);
+            CREATE TABLE Device (DeviceID INTEGER, Name TEXT, SiteID INTEGER, ObserviumID INTEGER);
+            CREATE TABLE CompanyLocation (SiteID INTEGER, Name TEXT, LocationID INTEGER);
+            CREATE TABLE Location (LocationID INTEGER, Address TEXT);
             CREATE TABLE Patch (
                 PatchID INTEGER, PatchType TEXT, PortID_A INTEGER, PortID_B INTEGER
             );
             CREATE TABLE PseudoWire (
                 PseudoWireID INTEGER, PortAID INTEGER, PortBID INTEGER
             );
-            INSERT INTO LitCircuit VALUES (926, 42);
+            INSERT INTO LitCircuit VALUES (926, 42, 'Shared circuit', 1, 2);
             INSERT INTO CircuitLayout VALUES (42, 101, 202);
             INSERT INTO CircuitLayoutItem VALUES
                 (1, 42, 10, 'Port', 101),
@@ -155,17 +163,34 @@ def _configured_circuit_app(
                 (3, 42, 30, 'PW', 601),
                 (4, 42, 40, 'Port', 202);
             INSERT INTO Port VALUES
-                (101, 301, 'xe-0/0/1'),
-                (202, 302, 'xe-0/0/2');
+                (101, 301, 'xe-0/0/1', NULL),
+                (202, 302, 'xe-0/0/2', NULL);
+            INSERT INTO Device VALUES (301, 'Device A', 1, NULL), (302, 'Device Z', 2, NULL);
+            INSERT INTO CompanyLocation VALUES (1, 'Site A', 11), (2, 'Site Z', 22);
+            INSERT INTO Location VALUES (11, 'A Street'), (22, 'Z Street');
             INSERT INTO Patch VALUES (501, 'fiber', 101, 202);
             INSERT INTO PseudoWire VALUES (601, 101, 202);
             """
         )
+        if joined_names:
+            connection.executescript(
+                """
+                CREATE TABLE PortLabel (PortID INTEGER PRIMARY KEY, Name TEXT);
+                INSERT INTO PortLabel SELECT PortID, Name FROM Port;
+                UPDATE Port SET Name = 'not-the-mapped-name';
+                """
+            )
     mapping = SourceMapping(
         {
             "circuits": ResourceMapping(
                 "LitCircuit",
-                {"source_id": "LitCircuitID", "circuit_layout_id": "CircuitLayoutID"},
+                {
+                    "source_id": "LitCircuitID",
+                    "name": "Name",
+                    "circuit_layout_id": "CircuitLayoutID",
+                    "a_company_location_id": "SiteA",
+                    "z_company_location_id": "SiteZ",
+                },
             ),
             "circuit_layouts": ResourceMapping(
                 "CircuitLayout",
@@ -187,7 +212,39 @@ def _configured_circuit_app(
             ),
             "ports": ResourceMapping(
                 "Port",
-                {"source_id": "PortID", "device_id": "DeviceID", "name": "Name"},
+                {
+                    "source_id": "PortID",
+                    "device_id": "DeviceID",
+                    "name": "label.Name" if joined_names else "Name",
+                    "observium_id": "ObserviumID",
+                },
+                (JoinMapping("PortLabel", "label", "base.PortID", "PortID"),)
+                if joined_names
+                else (),
+            ),
+            "devices": ResourceMapping(
+                "Device",
+                {
+                    "source_id": "DeviceID",
+                    "name": "Name",
+                    "company_location_id": "SiteID",
+                    "observium_id": "ObserviumID",
+                },
+            ),
+            "company_locations": ResourceMapping(
+                "CompanyLocation",
+                {
+                    "source_id": "SiteID",
+                    "name": "Name",
+                    "location_id": "LocationID",
+                },
+            ),
+            "locations": ResourceMapping(
+                "Location",
+                {
+                    "source_id": "LocationID",
+                    "address1": "Address",
+                },
             ),
             "patches": ResourceMapping(
                 "Patch",
@@ -324,12 +381,15 @@ async def test_circuit_path_is_hidden_until_circuit_is_explicitly_shared(
     assert response.status_code == 404, response.text
 
 
+@pytest.mark.parametrize("joined_names", [False, True])
 async def test_shared_circuit_path_preserves_order_and_uses_public_ids(
     tmp_path: Path,
+    joined_names: bool,
 ) -> None:
     app, client_id, client_secret, _, public_circuit_id = _configured_circuit_app(
         tmp_path,
         visibility="sfn_path",
+        joined_names=joined_names,
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

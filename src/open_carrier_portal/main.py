@@ -13,10 +13,12 @@ from fastapi import Depends, FastAPI, Form, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import ValidationError
 
 from open_carrier_portal.adapters.base import MonitoringAdapter
 from open_carrier_portal.adapters.observium import ObserviumAdapter
 from open_carrier_portal.auth import AuthenticationService, Principal
+from open_carrier_portal.circuits import CircuitReader
 from open_carrier_portal.config import Settings
 from open_carrier_portal.errors import (
     AuthenticationError,
@@ -24,15 +26,13 @@ from open_carrier_portal.errors import (
     ConnectorError,
     IntegrationUnavailableError,
     ResourceNotFoundError,
-    SourceDatabaseQueryError,
-    SourceDatabaseUnavailableError,
     UpstreamResponseError,
 )
 from open_carrier_portal.models import (
     Alarm,
     CapabilitySet,
+    CircuitDetails,
     CircuitPath,
-    CircuitPathItem,
     Device,
     ErrorResponse,
     Interface,
@@ -87,6 +87,7 @@ def create_app(
                 timeout_seconds=profile.timeout_seconds,
                 mapping_json=profile.mapping_json,
                 environment=os.environ,
+                metadata_path=settings.database_path,
             )
         if adapter is None and settings.observium_enabled:
             adapter = ObserviumAdapter(
@@ -480,13 +481,14 @@ def create_app(
         audit_success(request, principal, scope, resource_id)
         return result
 
-    @app.get("/v1/circuits/{circuit_id}/path", response_model=CircuitPath)
-    def get_circuit_path(
+    async def read_shared_circuit(
         circuit_id: str,
         request: Request,
-        principal: Annotated[Principal, Depends(current_principal)],
-        source: Annotated[SourceDatabase, Depends(require_source_database)],
-    ) -> CircuitPath:
+        principal: Principal,
+        source: SourceDatabase,
+        *,
+        path_only: bool,
+    ) -> CircuitDetails | CircuitPath:
         scope = "circuits:read"
         allowed_circuit_ids = authorize(request, principal, scope)
 
@@ -514,143 +516,87 @@ def create_app(
             partner_id=principal.partner_id,
             source_circuit_id=source_circuit_id,
         )
-        if visibility not in {"endpoints", "sfn_path", "full_shared_path"}:
+        permitted = {"endpoints", "sfn_path", "full_shared_path"}
+        if not path_only:
+            permitted |= {"summary", "metrics"}
+        if visibility not in permitted:
             hide_unavailable_circuit()
-
-        def query_source(
-            resource_type: str,
-            filters: dict[str, object],
-            *,
-            order_by: str | None = None,
-        ) -> list[dict[str, object]]:
-            try:
-                return source.fetch_matching(
-                    resource_type,
-                    filters,
-                    order_by=order_by,
-                    limit=1000,
+        assert source_circuit_id is not None and visibility is not None
+        reader = CircuitReader(repository, source, adapter)
+        try:
+            reader.require_view(visibility)
+            circuit = await reader.one("circuits", source_circuit_id)
+            if circuit is None:
+                raise ResourceNotFoundError()
+            result: CircuitPath | CircuitDetails
+            if path_only:
+                result = await reader.path(
+                    circuit_id,
+                    circuit,
+                    "endpoints"
+                    if visibility == "endpoints"
+                    else ("sfn_path" if visibility == "sfn_path" else "full_shared_path"),
                 )
-            except SourceDatabaseUnavailableError as exc:
-                raise IntegrationUnavailableError("NetTool source database is unavailable") from exc
-            except (ConfigurationError, SourceDatabaseQueryError) as exc:
-                raise UpstreamResponseError(
-                    "NetTool source database mapping or query failed"
-                ) from exc
-
-        circuit_rows = query_source("circuits", {"source_id": source_circuit_id})
-        if not circuit_rows:
-            hide_unavailable_circuit()
-        circuit = circuit_rows[0]
-        layout_id = circuit.get("circuit_layout_id")
-        if layout_id is None:
-            hide_unavailable_circuit()
-        layout_rows = query_source("circuit_layouts", {"source_id": str(layout_id)})
-        if not layout_rows:
-            raise UpstreamResponseError("The shared circuit references a missing NetTool layout")
-        layout = layout_rows[0]
-        path_items: list[CircuitPathItem] = []
-
-        def add_port(source_port_id: object, position: int) -> None:
-            port_id = str(source_port_id)
-            port_rows = query_source("ports", {"source_id": port_id})
-            if not port_rows:
-                raise UpstreamResponseError(
-                    "The shared circuit path references a missing NetTool port"
-                )
-            port = port_rows[0]
-            device_id = port.get("device_id")
-            path_items.append(
-                CircuitPathItem(
-                    position=position,
-                    kind="port",
-                    resource_id=repository.ocp_resource_id("nettool", "port", port_id),
-                    name=None if port.get("name") is None else str(port["name"]),
-                    device_id=(
-                        None
-                        if device_id is None
-                        else repository.ocp_resource_id("nettool", "device", str(device_id))
-                    ),
-                )
+            else:
+                result = await reader.details(circuit_id, circuit, visibility)
+        except ConnectorError as exc:
+            repository.record_audit(
+                partner_id=principal.partner_id,
+                client_id=principal.client_id,
+                operation=scope,
+                resource_summary=circuit_id,
+                outcome="denied" if exc.status_code == 404 else "error",
+                correlation_id=request.state.correlation_id,
             )
-
-        if visibility == "endpoints":
-            for position, endpoint in enumerate((layout.get("port_a_id"), layout.get("port_z_id"))):
-                if endpoint is not None:
-                    add_port(endpoint, position)
-        else:
-            layout_source_id = str(layout["source_id"])
-            layout_items = query_source(
-                "circuit_layout_items",
-                {"circuit_layout_id": layout_source_id},
-                order_by="position",
+            raise
+        except ValidationError as exc:
+            repository.record_audit(
+                partner_id=principal.partner_id,
+                client_id=principal.client_id,
+                operation=scope,
+                resource_summary=circuit_id,
+                outcome="error",
+                correlation_id=request.state.correlation_id,
             )
-            for row in layout_items:
-                source_id = row.get("item_source_id")
-                item_type = str(row.get("item_type", "")).strip().casefold()
-                if source_id is None:
-                    raise UpstreamResponseError(
-                        "A shared NetTool circuit path item has no source reference"
-                    )
-                position = int(row["position"])
-                if item_type == "port":
-                    add_port(source_id, position)
-                    continue
-                if item_type == "patch":
-                    resource_type = "patches"
-                    kind = "patch"
-                elif item_type in {"pw", "pseudowire"}:
-                    resource_type = "pseudowires"
-                    kind = "pseudowire"
-                else:
-                    raise UpstreamResponseError(
-                        "The shared NetTool circuit path contains an unsupported item type"
-                    )
-                component_rows = query_source(
-                    resource_type,
-                    {"source_id": str(source_id)},
-                )
-                if not component_rows:
-                    raise UpstreamResponseError(
-                        "The shared circuit path references a missing NetTool component"
-                    )
-                component = component_rows[0]
-
-                def public_port_id(
-                    component_record: dict[str, object],
-                    field: str,
-                ) -> str | None:
-                    value = component_record.get(field)
-                    return (
-                        None
-                        if value is None
-                        else repository.ocp_resource_id("nettool", "port", str(value))
-                    )
-
-                path_items.append(
-                    CircuitPathItem(
-                        position=position,
-                        kind=kind,
-                        resource_id=repository.ocp_resource_id(
-                            "nettool",
-                            kind,
-                            str(source_id),
-                        ),
-                        patch_type=(
-                            None
-                            if component.get("patch_type") is None
-                            else str(component["patch_type"])
-                        ),
-                        port_a_id=public_port_id(component, "port_a_id"),
-                        port_b_id=public_port_id(component, "port_b_id"),
-                    )
-                )
-
+            raise UpstreamResponseError(
+                "Source circuit data does not match the OCP contract"
+            ) from exc
         audit_success(request, principal, scope, circuit_id)
-        return CircuitPath(
-            circuit_id=circuit_id,
-            visibility=visibility,
-            items=path_items,
+        return result
+
+    @app.get("/v1/circuits/{circuit_id}", response_model=CircuitDetails)
+    async def get_circuit(
+        circuit_id: str,
+        request: Request,
+        principal: Annotated[Principal, Depends(current_principal)],
+        source: Annotated[SourceDatabase, Depends(require_source_database)],
+    ) -> CircuitDetails:
+        result = await read_shared_circuit(
+            circuit_id,
+            request,
+            principal,
+            source,
+            path_only=False,
         )
+        assert isinstance(result, CircuitDetails)
+        return result
+
+    @app.get("/v1/circuits/{circuit_id}/path", response_model=CircuitPath)
+    async def get_circuit_path(
+        circuit_id: str,
+        request: Request,
+        principal: Annotated[Principal, Depends(current_principal)],
+        source: Annotated[SourceDatabase, Depends(require_source_database)],
+    ) -> CircuitPath:
+        result = await read_shared_circuit(
+            circuit_id,
+            request,
+            principal,
+            source,
+            path_only=True,
+        )
+        assert isinstance(result, CircuitPath)
+        return result
 
     app.mount("/", admin_app)
     return app

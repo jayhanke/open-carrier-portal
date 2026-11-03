@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from open_carrier_portal.errors import ConfigurationError
+from open_carrier_portal.portal_agent import validate_portal_url
 
 PRIVATE_NETWORKS = tuple(
     ip_network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
@@ -88,11 +89,18 @@ class Settings:
     observium_timeout_seconds: int = 15
     source_database_profile: str | None = None
     allow_insecure_http: bool = False
+    portal_url: str | None = None
+    portal_ca_bundle: str | None = None
 
     def __post_init__(self) -> None:
         if len(self.token_signing_key.encode("utf-8")) < 32:
             raise ConfigurationError("OCP_TOKEN_SIGNING_KEY must contain at least 32 bytes")
         validate_connector_url(self.issuer_url, allow_insecure_http=self.allow_insecure_http)
+        if self.portal_url:
+            try:
+                validate_portal_url(self.portal_url)
+            except ValueError as exc:
+                raise ConfigurationError(f"OCP_PORTAL_URL: {exc}") from exc
         if self.observium_base_url:
             if not self.observium_base_url.startswith("https://"):
                 raise ConfigurationError("OCP_OBSERVIUM_BASE_URL must use HTTPS")
@@ -129,4 +137,6 @@ class Settings:
             observium_timeout_seconds=_env_int("OCP_OBSERVIUM_TIMEOUT_SECONDS", 15, 1),
             source_database_profile=os.getenv("OCP_SOURCE_DB_PROFILE"),
             allow_insecure_http=_env_bool("OCP_ALLOW_INSECURE_HTTP", False),
+            portal_url=os.getenv("OCP_PORTAL_URL", "").strip().rstrip("/") or None,
+            portal_ca_bundle=os.getenv("OCP_PORTAL_CA_BUNDLE", "").strip() or None,
         )

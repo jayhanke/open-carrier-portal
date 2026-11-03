@@ -90,6 +90,90 @@ class MetricSeries(BaseModel):
     points: list[MetricPoint]
 
 
+class CircuitCompany(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: str
+    name: str
+
+
+class CircuitLocation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: str
+    address1: str | None = None
+    address2: str | None = None
+    city: str | None = None
+    state: str | None = None
+    postal_code: str | None = None
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    floor: str | None = None
+    suite: str | None = None
+
+
+class CircuitSite(BaseModel):
+    """Rack context, retaining the existing site response shape for compatibility."""
+
+    model_config = ConfigDict(frozen=True)
+    id: str
+    name: str | None = None
+    site_code: str | None = None
+    rack_name: str | None = None
+    company: CircuitCompany | None = None
+    location: CircuitLocation | None = None
+
+
+class CircuitRackUnit(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: str
+    name: str | None = None
+    site: CircuitSite | None = None
+
+
+class CircuitDeviceStatus(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    vendor: str | None = None
+    model: str | None = None
+    operating_system: str | None = None
+    operational_status: str | None = None
+    last_observed_at: datetime | None = None
+
+
+class CircuitDevice(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: str
+    name: str
+    type: str | None = None
+    company: CircuitCompany | None = None
+    site: CircuitSite | None = None
+    rack_units: list[CircuitRackUnit] = Field(default_factory=list)
+    monitoring_state: Literal["available", "not_linked", "not_configured"] = "not_linked"
+    monitoring: CircuitDeviceStatus | None = None
+
+
+class CircuitPortStatus(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    name: str | None = None
+    description: str | None = None
+    speed_bps: int | None = Field(default=None, ge=0)
+    administrative_status: str | None = None
+    operational_status: str | None = None
+    optical_rx_dbm: float | None = None
+    optical_tx_dbm: float | None = None
+    last_observed_at: datetime | None = None
+    optical_state: Literal["available", "not_reported"] = "not_reported"
+
+
+class CircuitPort(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: str
+    name: str | None = None
+    device: CircuitDevice | None = None
+    owner_company: CircuitCompany | None = None
+    connector_type: str | None = None
+    monitoring_state: Literal["available", "not_linked", "not_configured"] = "not_linked"
+    monitoring: CircuitPortStatus | None = None
+
+
 class CircuitPathItem(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -101,6 +185,13 @@ class CircuitPathItem(BaseModel):
     patch_type: str | int | None = None
     port_a_id: str | None = None
     port_b_id: str | None = None
+    port: CircuitPort | None = None
+    port_a: CircuitPort | None = None
+    port_b: CircuitPort | None = None
+    port_a_secondary_id: str | None = None
+    port_b_secondary_id: str | None = None
+    port_a_secondary: CircuitPort | None = None
+    port_b_secondary: CircuitPort | None = None
 
 
 class CircuitPath(BaseModel):
@@ -109,6 +200,23 @@ class CircuitPath(BaseModel):
     circuit_id: str
     visibility: Literal["endpoints", "sfn_path", "full_shared_path"]
     items: list[CircuitPathItem]
+    mapping_state: Literal["complete", "incomplete"] = "incomplete"
+    omitted_enrichment: list[str] = Field(default_factory=list)
+
+
+class CircuitDetails(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: str
+    name: str | None = None
+    description: str | None = None
+    service_name: str | None = None
+    service_type: str | None = None
+    bandwidth: str | None = None
+    active: bool | None = None
+    a_location: CircuitSite | None = None
+    z_location: CircuitSite | None = None
+    path: CircuitPath | None = None
+    omitted_enrichment: list[str] = Field(default_factory=list)
 
 
 class CapabilitySet(BaseModel):

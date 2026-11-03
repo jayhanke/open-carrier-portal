@@ -17,19 +17,16 @@ from open_carrier_portal.errors import (
     SourceDatabaseQueryError,
     SourceDatabaseUnavailableError,
 )
+from open_carrier_portal.source_contract import (
+    CORE_RESOURCES,
+    MONITORING_FIELDS,
+    SHARING_FIELDS,
+    SOURCE_RESOURCES,
+)
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ENVIRONMENT_VARIABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_RESOURCE_TYPES = (
-    "locations",
-    "devices",
-    "ports",
-    "circuits",
-    "circuit_layouts",
-    "circuit_layout_items",
-    "patches",
-    "pseudowires",
-)
+_RESOURCE_TYPES = tuple(SOURCE_RESOURCES)
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
@@ -107,17 +104,55 @@ class _Connection(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class JoinMapping:
+    table: str
+    alias: str
+    left: str
+    right: str
+    kind: str = "left"
+
+    def __post_init__(self) -> None:
+        for value in (self.table, self.alias, self.right):
+            _identifier(value, "join identifier")
+        parts = self.left.split(".")
+        if len(parts) != 2:
+            raise ConfigurationError("join source must be alias.column")
+        for part in parts:
+            _identifier(part, "join source")
+        if self.kind not in {"left", "inner"}:
+            raise ConfigurationError("join type must be left or inner")
+        if self.alias == "base":
+            raise ConfigurationError("base is reserved for the primary table")
+
+
+@dataclass(frozen=True, slots=True)
 class ResourceMapping:
     table: str
     columns: Mapping[str, str]
+    joins: tuple[JoinMapping, ...] = ()
 
     def __post_init__(self) -> None:
         _identifier(self.table, "mapping table")
         if not self.columns:
             raise ConfigurationError(f"mapping for {self.table} must define columns")
+        if len(self.joins) > 8:
+            raise ConfigurationError("a resource supports at most eight joins")
+        aliases = {"base"}
+        for join in self.joins:
+            if join.alias in aliases or join.left.split(".")[0] not in aliases:
+                raise ConfigurationError("joins must use distinct aliases and earlier tables")
+            aliases.add(join.alias)
         for logical_name, column in self.columns.items():
             _identifier(logical_name, "mapping field")
-            _identifier(column, f"mapping column for {logical_name}")
+            parts = column.split(".")
+            if len(parts) == 2 and parts[0] in aliases:
+                _identifier(parts[1], f"mapping column for {logical_name}")
+            elif len(parts) == 1:
+                _identifier(column, f"mapping column for {logical_name}")
+            else:
+                raise ConfigurationError("mapped columns must use a known alias and column")
+        if self.joins and self.columns.get("source_id", "").split(".")[0] in aliases - {"base"}:
+            raise ConfigurationError("source_id must come from the primary table")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,29 +160,133 @@ class SourceMapping:
     resources: Mapping[str, ResourceMapping]
 
     def __post_init__(self) -> None:
-        unknown = set(self.resources) - set(_RESOURCE_TYPES)
+        resources: dict[str, ResourceMapping] = {}
+        aliases = {"company_locations": "racks", "rack_units": "rack_positions"}
+        for resource, mapping in self.resources.items():
+            target = aliases.get(resource, resource)
+            if target in resources:
+                raise ConfigurationError(f"duplicate legacy/current mapping for {target}")
+            columns = dict(mapping.columns)
+            if target in {"devices", "rack_positions"} and "company_location_id" in columns:
+                if "rack_id" in columns:
+                    raise ConfigurationError(
+                        f"duplicate legacy/current rack reference for {target}"
+                    )
+                columns["rack_id"] = columns.pop("company_location_id")
+            resources[target] = ResourceMapping(mapping.table, columns, mapping.joins)
+        unknown = set(resources) - set(_RESOURCE_TYPES)
         if unknown:
             raise ConfigurationError(f"unsupported mapped resources: {sorted(unknown)}")
+        object.__setattr__(self, "resources", resources)
+
+    @property
+    def missing_fields(self) -> dict[str, list[str]]:
+        return self.missing_fields_for()
+
+    def missing_fields_for(
+        self,
+        *,
+        monitoring: bool = False,
+        requirements: Mapping[str, tuple[str, ...]] | None = None,
+    ) -> dict[str, list[str]]:
+        if requirements is None:
+            requirements = {
+                resource: definition.required
+                for resource, definition in SOURCE_RESOURCES.items()
+                if resource in CORE_RESOURCES or resource in self.resources
+            }
+        missing = {}
+        for resource, fields in requirements.items():
+            required = set(fields)
+            if monitoring:
+                required.update(MONITORING_FIELDS.get(resource, ()))
+            configured = self.resources.get(resource)
+            absent = required - set(configured.columns if configured else ())
+            if absent:
+                missing[resource] = sorted(absent)
+        return missing
+
+    @classmethod
+    def sharing_defaults(cls) -> SourceMapping:
+        template = cls.nettool_defaults()
+        return cls(
+            {
+                resource: ResourceMapping(
+                    template.resources[resource].table,
+                    {field: template.resources[resource].columns[field] for field in selected},
+                )
+                for resource, selected in SHARING_FIELDS.items()
+            }
+        )
 
     @classmethod
     def nettool_defaults(cls) -> SourceMapping:
         return cls(
             resources={
+                "companies": ResourceMapping(
+                    "company",
+                    {"source_id": "Company_ID", "name": "CompanyName"},
+                ),
                 "locations": ResourceMapping(
                     "Location",
-                    {"source_id": "LocationID", "name": "Name", "address": "Address"},
+                    {
+                        "source_id": "LocationID",
+                        "address1": "Address1",
+                        "address2": "Address2",
+                        "city": "City",
+                        "state": "State",
+                        "postal_code": "Zip",
+                        "latitude": "Lat",
+                        "longitude": "Lng",
+                        "floor": "Floor",
+                        "suite": "Suite",
+                    },
+                ),
+                "racks": ResourceMapping(
+                    "CompanyLocation",
+                    {
+                        "source_id": "CompanyLocationID",
+                        "company_id": "Company_ID",
+                        "location_id": "LocationID",
+                        "name": "RackName",
+                        "site_code": "SiteCode",
+                        "rack_name": "RackName",
+                    },
+                ),
+                "rack_positions": ResourceMapping(
+                    "RackUnit",
+                    {
+                        "source_id": "RackUnitID",
+                        "rack_id": "CompanyLocationID",
+                        "name": "RackUnitName",
+                        "device_id": "DeviceID",
+                    },
                 ),
                 "devices": ResourceMapping(
                     "Device",
-                    {"source_id": "DeviceID", "name": "Name", "observium_id": "ObserviumID"},
+                    {
+                        "source_id": "DeviceID",
+                        "name": "DeviceName",
+                        "rack_id": "CompanyLocationID",
+                        "company_id": "CompanyID",
+                        "type": "DeviceType",
+                        "observium_id": "ObserviumID",
+                    },
                 ),
                 "ports": ResourceMapping(
                     "Port",
                     {
                         "source_id": "PortID",
                         "device_id": "DeviceID",
-                        "name": "Name",
+                        "name": "PortName",
                         "observium_id": "ObserviumID",
+                        "owner_company_id": "OwnerCompany",
+                        "connector_type": "ConnectorType",
+                        "nni": "NNI",
+                        "parent_port_id": "SubPortOf",
+                        "vlan": "Vlan",
+                        "ip_address": "IPAddress",
+                        "card_type_id": "CardTypeID",
                     },
                 ),
                 "circuits": ResourceMapping(
@@ -155,10 +294,23 @@ class SourceMapping:
                     {
                         "source_id": "LitCircuitID",
                         "circuit_layout_id": "CircuitLayoutID",
-                        "customer_id": "BillingCompanyID",
+                        "name": "LitCircuitName",
+                        "billing_company_id": "BillingCompanyID",
+                        "service_id": "ServiceID",
+                        "service_order_id": "ServiceOrderID",
                         "description": "Description",
-                        "a_location_id": "ALocationID",
-                        "z_location_id": "ZLocationID",
+                        "a_company_location_id": "CompanyLocationA",
+                        "z_company_location_id": "CompanyLocationZ",
+                        "active": "Active",
+                    },
+                ),
+                "services": ResourceMapping(
+                    "Service",
+                    {
+                        "source_id": "ServiceID",
+                        "name": "ServiceName",
+                        "type": "ServiceType",
+                        "bandwidth": "ServiceBW",
                     },
                 ),
                 "circuit_layouts": ResourceMapping(
@@ -217,6 +369,22 @@ class SourceMapping:
                     resource_type: {
                         "table": mapping.table,
                         "columns": dict(mapping.columns),
+                        **(
+                            {
+                                "joins": [
+                                    {
+                                        "table": j.table,
+                                        "alias": j.alias,
+                                        "left": j.left,
+                                        "right": j.right,
+                                        "kind": j.kind,
+                                    }
+                                    for j in mapping.joins
+                                ]
+                            }
+                            if mapping.joins
+                            else {}
+                        ),
                     }
                     for resource_type, mapping in self.resources.items()
                 }
@@ -246,7 +414,30 @@ class SourceMapping:
                 isinstance(key, str) and isinstance(column, str) for key, column in columns.items()
             ):
                 raise ConfigurationError(f"mapping columns for {resource_type} must be strings")
-            resources[resource_type] = ResourceMapping(table, columns)
+            raw_joins = raw_mapping.get("joins", [])
+            if not isinstance(raw_joins, list) or len(raw_joins) > 8:
+                raise ConfigurationError("joins must be a list of at most eight relationships")
+            joins = []
+            for join in raw_joins:
+                if (
+                    not isinstance(join, dict)
+                    or not all(
+                        isinstance(join.get(key), str)
+                        for key in ("table", "alias", "left", "right")
+                    )
+                    or not isinstance(join.get("kind", "left"), str)
+                ):
+                    raise ConfigurationError("invalid join definition")
+                joins.append(
+                    JoinMapping(
+                        join["table"],
+                        join["alias"],
+                        join["left"],
+                        join["right"],
+                        join.get("kind", "left"),
+                    )
+                )
+            resources[resource_type] = ResourceMapping(table, columns, tuple(joins))
         return cls(resources)
 
 
@@ -311,6 +502,21 @@ class SourceDatabase:
     def driver(self) -> str:
         return self._settings.driver
 
+    @property
+    def missing_fields(self) -> dict[str, list[str]]:
+        return self._mapping.missing_fields
+
+    def missing_fields_for(
+        self,
+        *,
+        monitoring: bool = False,
+        requirements: Mapping[str, tuple[str, ...]] | None = None,
+    ) -> dict[str, list[str]]:
+        return self._mapping.missing_fields_for(monitoring=monitoring, requirements=requirements)
+
+    def has_resource(self, resource: str) -> bool:
+        return resource in self._mapping.resources
+
     def health_check(self) -> None:
         try:
             with self._cursor() as cursor:
@@ -332,20 +538,23 @@ class SourceDatabase:
                     cursor.execute(
                         """SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name
                         FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
-                        ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT 1000"""
+                        ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT 1001"""
                     )
-                    return [
-                        {"table": str(row["table_name"]), "column": str(row["column_name"])}
-                        for row in cursor.fetchall()
-                    ]
-                cursor.execute(
-                    """SELECT m.name AS table_name, p.name AS column_name
-                    FROM sqlite_master m JOIN pragma_table_info(m.name) p
-                    WHERE m.type = 'table' ORDER BY m.name, p.cid LIMIT 1000"""
-                )
+                else:
+                    cursor.execute(
+                        """SELECT m.name AS table_name, p.name AS column_name
+                        FROM sqlite_master m JOIN pragma_table_info(m.name) p
+                        WHERE m.type = 'table' ORDER BY m.name, p.cid LIMIT 1001"""
+                    )
+                rows = cursor.fetchall()
+                if len(rows) > 1000:
+                    raise ConfigurationError(
+                        "schema discovery supports at most 1000 columns; "
+                        "use a smaller source schema or configure advanced JSON mappings"
+                    )
                 return [
                     {"table": str(row["table_name"]), "column": str(row["column_name"])}
-                    for row in cursor.fetchall()
+                    for row in rows
                 ]
         except SourceDatabaseUnavailableError:
             raise
@@ -358,6 +567,86 @@ class SourceDatabase:
         if limit < 1 or limit > 1000:
             raise ConfigurationError("source query limit must be between 1 and 1000")
         return self._select(resource_type, limit)
+
+    def describe_relationships(self) -> list[dict[str, str]]:
+        try:
+            with self._cursor() as cursor:
+                if self.driver == "mysql":
+                    cursor.execute(
+                        """SELECT TABLE_NAME AS source_table, COLUMN_NAME AS source_column,
+                        REFERENCED_TABLE_NAME AS target_table,
+                        REFERENCED_COLUMN_NAME AS target_column,
+                        CONSTRAINT_NAME AS relation_id
+                        FROM information_schema.KEY_COLUMN_USAGE
+                        WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_SCHEMA = DATABASE()
+                        AND REFERENCED_TABLE_NAME IS NOT NULL LIMIT 1001"""
+                    )
+                else:
+                    cursor.execute(
+                        """SELECT m.name AS source_table, f."from" AS source_column,
+                        f."table" AS target_table,
+                        COALESCE(f."to", (
+                            SELECT name FROM pragma_table_info(f."table") WHERE pk = 1
+                            AND (SELECT COUNT(*) FROM pragma_table_info(f."table")
+                                 WHERE pk > 0) = 1
+                        )) AS target_column,
+                        CAST(f.id AS TEXT) AS relation_id
+                        FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) f
+                        WHERE m.type = 'table' LIMIT 1001"""
+                    )
+                rows = cursor.fetchall()
+                if len(rows) > 1000:
+                    raise ConfigurationError("too many foreign keys; use a smaller source schema")
+                counts: dict[tuple[str, str], int] = {}
+                for row in rows:
+                    key = (str(row["source_table"]), str(row["relation_id"]))
+                    counts[key] = counts.get(key, 0) + 1
+                return [
+                    {
+                        key: str(row[key])
+                        for key in (
+                            "source_table",
+                            "source_column",
+                            "target_table",
+                            "target_column",
+                        )
+                    }
+                    for row in rows
+                    if counts[(str(row["source_table"]), str(row["relation_id"]))] == 1
+                    and row["target_column"] is not None
+                ]
+        except SourceDatabaseUnavailableError:
+            raise
+        except (sqlite3.Error, pymysql.MySQLError) as exc:
+            raise SourceDatabaseQueryError("Source relationship discovery failed") from exc
+
+    def _validate_join_targets(self, mapping: ResourceMapping) -> None:
+        for join in mapping.joins:
+            with self._cursor() as cursor:
+                if self.driver == "mysql":
+                    cursor.execute(
+                        """SELECT INDEX_NAME FROM information_schema.STATISTICS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND NON_UNIQUE = 0
+                        GROUP BY INDEX_NAME HAVING COUNT(*) = 1 AND MAX(COLUMN_NAME) = %s
+                        AND MAX(SUB_PART) IS NULL""",
+                        (join.table, join.right),
+                    )
+                else:
+                    cursor.execute(
+                        """SELECT name FROM pragma_table_info(?) WHERE name = ? AND pk = 1
+                        AND (SELECT COUNT(*) FROM pragma_table_info(?) WHERE pk > 0) = 1
+                        UNION ALL
+                        SELECT i.name FROM pragma_index_list(?) i
+                        JOIN pragma_index_info(i.name) c
+                        WHERE i."unique" = 1 AND i.partial = 0
+                        GROUP BY i.name HAVING COUNT(*) = 1 AND MAX(c.name) = ?""",
+                        (join.table, join.right, join.table, join.table, join.right),
+                    )
+                if not cursor.fetchall():
+                    raise ConfigurationError(
+                        f"join target {join.table}.{join.right} must have a single-column "
+                        "primary or unique key; one-to-many joins would duplicate resource rows"
+                    )
 
     def fetch_matching(
         self,
@@ -394,33 +683,13 @@ class SourceDatabase:
         filters: Mapping[str, object] | None = None,
         order_by: str | None = None,
     ) -> list[dict[str, Any]]:
-        mapping = self._mapping.resources[resource_type]
-        selected_columns = ", ".join(
-            f"{self._quote(column, 'mapping column')} AS {self._quote(logical, 'mapping field')}"
-            for logical, column in mapping.columns.items()
-        )
-        table = self._quote(mapping.table, "mapping table")
-        placeholder = "?" if self._settings.driver == "sqlite" else "%s"
-        where_clause = ""
-        parameters: tuple[object, ...] = ()
-        if filters:
-            where_clause = " WHERE " + " AND ".join(
-                f"{self._quote(mapping.columns[field], 'mapping column')} = {placeholder}"
-                for field in filters
-            )
-            parameters = tuple(filters.values())
-        order_clause = (
-            ""
-            if order_by is None
-            else f" ORDER BY {self._quote(mapping.columns[order_by], 'mapping column')}"
-        )
         try:
+            self._validate_join_targets(self._mapping.resources[resource_type])
+            query, parameters = self._compile_select(
+                resource_type, limit, filters=filters, order_by=order_by
+            )
             with self._cursor() as cursor:
-                cursor.execute(
-                    f"SELECT {selected_columns} FROM {table}{where_clause}"
-                    f"{order_clause} LIMIT {placeholder}",
-                    (*parameters, limit + 1 if filters else limit),
-                )
+                cursor.execute(query, parameters)
                 rows = cursor.fetchall()
         except SourceDatabaseUnavailableError:
             raise
@@ -433,6 +702,56 @@ class SourceDatabase:
                 f"The configured query for {resource_type} exceeded its row limit"
             )
         return [dict(row) for row in rows]
+
+    def preview_sql(self, resource_type: str) -> str:
+        return self._compile_select(resource_type, 5)[0]
+
+    def _compile_select(
+        self,
+        resource_type: str,
+        limit: int,
+        *,
+        filters: Mapping[str, object] | None = None,
+        order_by: str | None = None,
+    ) -> tuple[str, tuple[object, ...]]:
+        mapping = self._mapping.resources[resource_type]
+
+        def column_sql(column: str) -> str:
+            parts = column.split(".")
+            if mapping.joins or len(parts) == 2:
+                alias, name = parts if len(parts) == 2 else ("base", column)
+                return self._quote(alias, "table alias") + "." + self._quote(name, "column")
+            return self._quote(column, "mapping column")
+
+        selected_columns = ", ".join(
+            f"{column_sql(column)} AS {self._quote(logical, 'mapping field')}"
+            for logical, column in mapping.columns.items()
+        )
+        table = self._quote(mapping.table, "mapping table")
+        if mapping.joins or any("." in column for column in mapping.columns.values()):
+            table += " AS " + self._quote("base", "table alias")
+        for join in mapping.joins:
+            table += (
+                f" {join.kind.upper()} JOIN {self._quote(join.table, 'join table')} AS "
+                f"{self._quote(join.alias, 'join alias')} ON {column_sql(join.left)} = "
+                f"{column_sql(join.alias + '.' + join.right)}"
+            )
+        placeholder = "?" if self._settings.driver == "sqlite" else "%s"
+        where_clause = ""
+        parameters: tuple[object, ...] = ()
+        if filters:
+            where_clause = " WHERE " + " AND ".join(
+                f"{column_sql(mapping.columns[field])} = {placeholder}" for field in filters
+            )
+            parameters = tuple(filters.values())
+        order_clause = (
+            "" if order_by is None else f" ORDER BY {column_sql(mapping.columns[order_by])}"
+        )
+        return (
+            f"SELECT {selected_columns} FROM {table}{where_clause}{order_clause} "
+            f"LIMIT {placeholder}",
+            (*parameters, limit + 1 if filters else limit),
+        )
 
     def _quote(self, value: str, field_name: str) -> str:
         identifier = _identifier(value, field_name)
@@ -454,6 +773,7 @@ def configured_source_database(
     tls_ca_path: str | None = None,
     allow_insecure: bool = False,
     timeout_seconds: int = 10,
+    metadata_path: Path | None = None,
 ) -> SourceDatabase:
     mapping = SourceMapping.from_json(mapping_json)
     if driver == "sqlite":
@@ -473,9 +793,14 @@ def configured_source_database(
     if not _ENVIRONMENT_VARIABLE.fullmatch(password_env_var):
         raise ConfigurationError("source database password environment name is invalid")
     password = environment.get(password_env_var)
+    if not password and metadata_path is not None:
+        from open_carrier_portal.source_credentials import read_password
+
+        password = read_password(metadata_path, password_env_var)
     if not password:
         raise ConfigurationError(
-            f"source database password environment variable {password_env_var} is required"
+            f"source database password is required: configure {password_env_var}"
+            + (" or save a password through Connections" if metadata_path is not None else "")
         )
     return SourceDatabase(
         MySQLSourceDatabaseSettings(

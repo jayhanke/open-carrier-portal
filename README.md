@@ -65,6 +65,7 @@ Implemented partner routes:
 - `GET /v1/interfaces` and `GET /v1/interfaces/{interface_id}`
 - `GET /v1/alarms`
 - `GET /v1/metrics`
+- `GET /v1/circuits/{circuit_id}`
 - `GET /v1/circuits/{circuit_id}/path`
 - `GET /health/live` and `GET /health/ready`
 
@@ -74,6 +75,131 @@ SQLite metadata database. Operational network data remains in Observium and NetT
 Circuit path access additionally requires an active `circuits:read` grant and an
 explicit active share for that partner; a circuit share alone never exposes other
 circuit records or independent path-component routes.
+
+### Read-only circuit-sharing v1
+
+The connector keeps identity, partners, relationships, OAuth clients, grants, circuit
+shares, opaque resource-ID mappings, source configuration and audit records locally.
+Local administration also needs its own accounts, sessions and settings. It does not
+copy operational companies, sites, devices, ports, circuits or telemetry into that
+database. Source records and monitoring results are read on demand; enrichment caches
+exist only within a single request.
+
+`GET /v1/circuits/{circuit_id}` returns the opaque circuit ID, name, description,
+service name/type, bandwidth, legacy active state, A/Z rack/location context and the
+visible ordered path. Bandwidth preserves `Service.ServiceBW` as text; no units are assumed.
+The mapper exposes the full supported OCP target catalog, not just three broad groups.
+The source `CompanyLocation` represents an OCP **Rack**; `Location` represents its
+physical address, and `RackUnit` represents optional device positions such as U20/U21.
+The relationship is port → device → rack → location. Multiple racks can share one
+physical address. Rack names use `CompanyLocation.RackName` in the example mapping.
+If rack positions are mapped, devices expose all matching positions, not an arbitrary
+first matching row. Existing API response names (`site`, `rack_units`, `a_location`,
+`z_location`) and opaque ID namespaces are retained for compatibility.
+
+Path ports include device, company, rack, physical address and rack-position details, plus
+current monitoring linked by source `Device.ObserviumID` and `Port.ObserviumID`.
+Sharing a circuit includes monitoring for its visible components; separate grants
+for arbitrary Observium resources are not required for this parent-authorized read.
+Independent device/interface routes still require their own scopes and grants.
+Existing visibility restrictions remain: `summary` returns no path; `endpoints`
+returns endpoint ports; path modes return ordered components and their endpoint ports.
+Legacy `metrics` shares return summary only; this does not enable historical telemetry.
+Revoked, unshared and unauthorized circuit IDs are not disclosed.
+
+Monitoring states distinguish `available`, `not_linked` and `not_configured`.
+Configured-upstream errors are explicit failed responses and audited, not empty
+successes. Port status includes interface name/description, speed, administrative
+and operational status and last poll time. Optical fields are nullable, with
+`optical_state=not_reported` when the adapter supplies neither value. The current
+Observium adapter does not yet resolve optical sensors: their payload, port association
+and direction must be verified rather than guessed from sensor descriptions.
+
+Public circuit responses whitelist fields; they never return source management IPs,
+port IP addresses, MACs, asset IDs, service-order references, credentials or raw source
+records. Private mapping fields may be inspected by authenticated local administrators,
+but v1 has no policy switch to publish them. No new child-resource enumeration routes
+are introduced by circuit sharing.
+
+Mapping targets come from a separate OCP field catalog, not a copy of the source
+schema. The mapping board shows connected database tables on the left and twelve
+OCP target tables on the right: **Circuits, Devices, Ports/interfaces, Locations,
+Companies, Racks, Rack positions, Services, Circuit paths, Circuit path steps, Patches
+and Pseudowires**. Search the right-hand catalog by table or field.
+Locations contain only address, floor, suite and coordinate fields; rack identity
+and company/location links belong to Racks. New connections start with empty mapping
+slots, not example source assignments. Each database-mapped OCP row has a customer
+drop box on the left and its fixed logical OCP field name on the right, for example
+**[Drop customer field here] → devices.name**. After assigning a source, the left box
+shows that source's table and column; the OCP target never changes. Drag a source
+column into that box, or select a column and choose **Assign** beside the target.
+Dropping into an unconfigured section selects that column's table as its primary
+source; an additional table still needs a confirmed join. Select an OCP section
+heading to choose which section to preview or configure.
+Device/port hardware and monitoring fields appear on their respective cards, clearly
+marked **API supplied** and without database drop boxes. Alarms and Metrics are not
+shown in this inventory mapper; their separate APIs and authorization are unchanged.
+These fields do not add permissions, adapter capabilities or historical telemetry to
+circuit shares. Database mappings supply circuit inventory/path enrichment; independent
+device/interface endpoints remain monitoring-backed.
+Essential relationships are visible beside the display fields, not hidden under
+advanced settings: port-to-device, device-to-rack, rack-to-location, circuit-to-path
+and endpoint ports. Device and port Observium IDs are visible database
+mapping targets; current status and hardware remain API supplied. Additional
+compatibility/private fields and source joins are advanced. Joins must be confirmed,
+never inferred from similar column names.
+
+Only map the sections needed for the chosen sharing detail. A summary needs circuit
+ID/name. Endpoint sharing needs the complete circuit-to-path-to-port-to-device-to-rack-
+to-location graph. The six core mapping sections are circuits, circuit paths, ports,
+devices, racks and locations. These are logical targets: a customer can map several
+sections to the same source table rather than duplicate their database. Ordered-path sharing also
+needs ordered route steps, plus patch/pseudowire mappings when those step types occur.
+Primary endpoint references cannot be NULL; an empty ordered path or missing device,
+rack or location record fails explicitly instead of returning a successful partial path.
+Companies, rack positions and service enrichment remain optional. If a service is
+mapped, map its type and bandwidth as well as its ID. Unconfigured optional enrichment referenced
+by a circuit is listed in `omitted_enrichment`; incomplete configured mappings,
+broken references and upstream failures fail explicitly. Optional source values can
+be NULL.
+
+Circuits no longer offer separate A/Z location or Active mapping rows. Path-bearing
+responses derive A/Z context from `circuit_layouts.port_a_id` / `port_z_id`, following
+each port's device and rack; they do not guess endpoints from ordered-step position.
+The API retains nullable `active`, `a_location` and `z_location` fields. Previously
+configured Active mappings still supply that value; new mappings return `active=null`.
+Summary-only mappings need no path graph and can leave location fields NULL; existing
+summary location assignments remain readable for compatibility.
+
+Monitoring is optional. When configured, both `devices.observium_id` and
+`ports.observium_id` mapping keys are required for path-bearing views. NULL values
+in those mapped columns mean genuinely unmonitored inventory and are allowed.
+A monitored port must have a monitored parent device, and the monitoring API's
+port/device relationship must agree with the mapped inventory. Monitoring IDs remain
+internal; partners receive opaque public IDs.
+
+The page and `ocp test-source` check the six core relationship sections plus enabled
+sections, reporting missing fields. Each API response also enforces the mappings
+needed by its share's visibility. `mapping_state` describes that mapping check, not
+whether every optional enrichment section has been enabled.
+Existing mappings are preserved. Older profiles missing these relationships must
+be completed before sharing endpoint or ordered-path details; summary-only shares
+can still use just the circuit ID/name mapping.
+Legacy mapping resource names `company_locations` and `rack_units` load as `racks`
+and `rack_positions`; device/position `company_location_id` loads as `rack_id`.
+Loading a profile does not rewrite its stored JSON. An explicit save uses the current
+names, preserves joins and retained legacy circuit fields, and rejects conflicting
+legacy/current definitions rather than choosing one silently.
+Use **Load example mappings as draft** under **Source configuration (advanced)** only
+if you intentionally want the supplied example assignments. Review every table/column
+assignment, then validate and save. The focused example template excludes
+private fields, billing/order references and unused source metadata; the advanced
+catalog remains available for existing mappings. Saved mappings and public ID
+namespaces are preserved, not automatically replaced.
+
+Service orders, billing workflows, tickets, LOAs, historical metrics and partner-submitted
+changes remain outside this read-only v1. Hosted-portal pairing still provides only
+registration and heartbeats; it does not automatically retrieve this circuit response.
 
 ### Outbound hosted-portal connection
 
@@ -197,33 +323,81 @@ session hashes, partner grants, configuration and audit events.
 
 ### Administration sections
 
-- **Setup:** readiness checklist and explicit source connectivity/mapping check.
+- **Setup:** one numbered checklist for company identity, connections, database
+  mapping and optional Carrier Portal pairing, followed by verification and sharing last.
+  Connections links to database/monitoring setup and partner connections so the
+  checklist stays compact as more connections are added. Database badges
+  distinguish selected, missing and disabled profiles; selecting a source does not
+  mark it healthy. Run the explicit source connectivity/mapping check before sharing.
   Portal pairing is optional; a heartbeat does not mean source data is ready.
 - **Identity:** initialize or rename your company without rotating identity IDs.
-- **Portal:** enter the HTTPS portal URL and one-time company-admin pairing code.
-  An optional PEM CA path supports an internal certificate authority. The pairing
+- **Carrier Portal:** a guided page opens the portal's **Connector** page in a new
+  tab, explains how a company administrator generates a one-time code (valid for
+  15 minutes), and accepts only that code. It warns that generating a replacement
+  code disconnects the previous connector. The installer sets `OCP_PORTAL_URL`
+  to the hosted portal's HTTPS origin and optionally `OCP_PORTAL_CA_BUNDLE` to a
+  trusted PEM CA file, then restarts the connector. These are not editable form
+  fields; submitted URL/CA fields cannot override installer settings. Without a
+  configured portal address or an enabled company identity, the page explains what
+  is missing instead of accepting a code. Existing pairings continue to use their
+  saved portal address; existing saved CA settings remain a fallback if no CA is
+  configured in the environment. Certificate verification remains mandatory.
+  The pairing
   credential is saved locally using the existing protected connection file, never
   rendered back into a page. While the connector runs it sends heartbeats every
-  30 seconds. Use **Test heartbeat now** to verify immediately. Do not run another
+  30 seconds. The page distinguishes pairing from a confirmed connection and shows
+  connection errors. Use **Check connection** to verify immediately. Do not run another
   `run-portal-agent` against the same connection file simultaneously.
   **Disconnect locally** deletes the saved credential; also revoke the connection
   in the hosted portal to invalidate the server-side credential. Disconnect before
   replacing a pairing. `serve --connection-file PATH` selects an existing
   CLI pairing file or a service-account-specific private location.
-- **Sources:** configure/reuse named MySQL or read-only SQLite profiles. Password
-  fields accept an **environment variable name**, never the password itself.
+- **Connections:** a compact database card contains database name, host, port,
+  username and password. Driver, connection name, password environment variable,
+  TLS CA and profile status are under collapsed **Advanced settings**. Mapping,
+  activation and optional monitoring have their own collapsed sections.
+  **Test connection** tests the submitted details without saving them or checking
+  mappings; re-enter an unsaved password when returning to the form. **Save connection**
+  validates configuration and saves it without claiming connectivity or read-only
+  permissions. Blank passwords retain the existing saved credential.
+  If the configured password environment variable has a value, the page says
+  **Password managed by server configuration**, hides the password input, and
+  rejects UI attempts to override it. Otherwise UI passwords are saved in private
+  files alongside the metadata database, in `<metadata-filename>.credentials/`,
+  not inside SQLite, the environment file, logs or rendered pages. Environment
+  credentials take precedence. API startup, CLI source testing and UI mapping/
+  connection checks all load the same credentials. Keep these files with protected
+  database backups. Unix directories/files use modes 700/600; on Windows restrict
+  the directory ACL to the connector service account. These files contain plaintext
+  secrets protected by filesystem permissions, not an encrypted vault.
   Use absolute paths for SQLite. Remote MySQL requires a trusted TLS CA; existing
   CLI plaintext opt-ins are preserved but cannot be newly enabled through the UI.
   Connectivity/mapping tests are SELECT-only and **cannot prove** a MySQL account
   has no write privileges; provision a dedicated read-only account yourself.
   Save optional Observium URL, token environment-variable name and CA path, then
   test it separately. Secrets remain on this connector, never in the hosted portal.
-- **Mapping:** use guided table/column fields, or advanced JSON. Discover up to
-  1,000 column identifiers and preview at most five rows of explicitly mapped
-  columns. No arbitrary SQL editor is provided. Every enabled mapped resource must
-  have a `source_id`. Blank table names remove a mapped resource; blank column
-  fields remove logical fields. Invalid mappings are not saved. Validation checks
-  tables and columns, not complete source-data referential integrity.
+- **Mapping:** browse/filter your database schema, choose a connector resource and
+  source table, then drag columns onto connector fields. Keyboard users can select
+  a column and choose **Assign** instead. Schema discovery returns identifiers, not
+  records, up to 1,000 columns (larger schemas require advanced JSON or a smaller
+  source schema). Declared single-column foreign keys suggest joins; explicitly confirm
+  each suggestion or select a relationship manually. Similar column names are
+  never treated as a relationship automatically.
+  Up to eight joins per resource are supported. Each target must have a
+  single-column primary or full, non-partial unique key; one-to-many and composite
+  joins are not supported because they could multiply resource rows. Map child
+  collections as separate resources instead. **LEFT JOIN** preserves unmatched
+  source rows with NULL fields; **INNER JOIN** excludes them. The required
+  `source_id` must stay on the primary source table.
+  Preview reads at most five rows of explicitly mapped columns and shows the
+  generated, parameterized SQL. Preview does not save the draft. **Validate and
+  save mappings** checks every enabled resource and join before persisting;
+  invalid mappings are not saved. Clear individual fields or remove a resource
+  explicitly. Advanced JSON remains available; legacy single-table mappings are
+  compatible. There is no arbitrary SQL editor and no writes to the source
+  database. Validation checks schema and join keys, not complete source-data
+  referential integrity or read-only permissions. Restart the connector after
+  saving to apply mappings to the running API.
 - **Partners:** provision direct inbound partners after confirming bilateral
   approval out of band. Select scopes and specific opaque resource IDs, or
   explicitly opt in to all resources for those scopes. Client secrets appear
@@ -232,7 +406,7 @@ session hashes, partner grants, configuration and audit events.
   Circuit shares additionally require a matching `circuits:read` grant. Revoking
   a partner disables its relationship, OAuth clients and circuit shares; already
   issued tokens then fail the API's existing live authorization checks.
-- **Remote:** configure named outbound connections to other companies' connectors,
+- **Partner connections:** configure named outbound connections to other companies' connectors,
   using OAuth credentials they issue to you. Each secret stays in a named local
   environment variable. Test token acquisition and capabilities, or retrieve an
   explicitly authorized opaque circuit path. The connector's capabilities endpoint
@@ -356,8 +530,20 @@ ocp test-source --name nettool
 $env:OCP_SOURCE_DB_PROFILE = "nettool"
 ```
 
-The default mapping covers NetTool locations, devices, ports, circuits, circuit layouts,
-ordered layout items, patches, and pseudowires. `CircuitLayoutItem.TableName` is the
+New `configure-source` profiles also start unmapped. Use the administration mapper or
+pass `--mapping-file` explicitly; updating a connection without that option preserves
+its existing mapping. `ocp test-source` reports `ocp_contract_ready=false` and missing
+fields until the core mapping is configured. Map the fields before using the profile
+for partner data.
+
+The optional source example template follows the supplied NPDB schema: `company`, `Location`,
+`CompanyLocation`, `RackUnit`, `Device`, `Port`, `LitCircuit`, `Service`, `CircuitLayout`,
+`CircuitLayoutItem`, `Patch` and `PseudoWire`. It maps `DeviceName`, `PortName`,
+the separate physical-address columns, and `CompanyLocationA`/`CompanyLocationZ`;
+it does not invent `Location.Name`, `Location.Address`, or `ALocationID`/`ZLocationID`.
+It is verified against an independently declared SQLite fixture shaped like the
+supplied schema, not against a live customer MySQL deployment.
+`CircuitLayoutItem.TableName` is the
 polymorphic item discriminator used by NetTool (`Port`, `Patch`, or `PW`), and `TablePK`
 identifies the corresponding source row. Check the mapping against the actual database
 with `ocp test-source`; if table or column names differ, provide a JSON mapping file with

@@ -302,11 +302,13 @@ def main() -> None:
             parser.error("remote MySQL requires --tls-ca or explicit --allow-insecure opt-in")
         if args.driver != "mysql" and args.allow_insecure:
             parser.error("--allow-insecure applies only to remote MySQL profiles")
-        mapping = (
-            SourceMapping.nettool_defaults()
-            if args.mapping_file is None
-            else SourceMapping.from_json(args.mapping_file.read_text(encoding="utf-8"))
-        )
+        existing = repository.get_source_database_profile(args.name)
+        if args.mapping_file is not None:
+            mapping = SourceMapping.from_json(args.mapping_file.read_text(encoding="utf-8"))
+        elif existing is not None:
+            mapping = SourceMapping.from_json(existing.mapping_json)
+        else:
+            mapping = SourceMapping({})
         profile_id = repository.put_source_database_profile(
             name=args.name,
             driver=args.driver,
@@ -331,6 +333,7 @@ def main() -> None:
                     "password_env": (args.password_env if args.driver == "mysql" else None),
                     "allow_insecure": args.allow_insecure,
                     "enabled": not args.disabled,
+                    "mapped_resources": sorted(mapping.resources),
                 },
                 indent=2,
             )
@@ -354,15 +357,25 @@ def main() -> None:
         timeout_seconds=profile.timeout_seconds,
         mapping_json=profile.mapping_json,
         environment=os.environ,
+        metadata_path=settings.database_path,
     )
     source.health_check()
     source.validate_mapping()
+    from open_carrier_portal.admin_store import AdminStore
+
+    store = AdminStore(settings.database_path)
+    store.initialize()
+    missing = source.missing_fields_for(
+        monitoring=bool(settings.observium_base_url or store.get("observium").get("url"))
+    )
     print(
         json.dumps(
             {
                 "name": profile.name,
                 "driver": profile.driver,
                 "status": "ok",
+                "ocp_contract_ready": not missing,
+                "missing_fields": missing,
                 "mapped_resources": sorted(SourceMapping.from_json(profile.mapping_json).resources),
             },
             indent=2,

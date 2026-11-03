@@ -11,3 +11,4 @@ build/
 *.db
 .env
 app.env
+*.credentials/

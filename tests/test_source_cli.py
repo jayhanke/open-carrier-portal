@@ -1,61 +1,19 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import sys
 from pathlib import Path
 
 import pytest
+from npdb_fixture import create_npdb
 
 from open_carrier_portal.cli import main
 from open_carrier_portal.repository import Repository
+from open_carrier_portal.source_database import SourceMapping
 
 
 def _create_nettool_database(path: Path) -> None:
-    with sqlite3.connect(path) as connection:
-        connection.execute("CREATE TABLE Location (LocationID INTEGER, Name TEXT, Address TEXT)")
-        connection.execute("CREATE TABLE Device (DeviceID INTEGER, Name TEXT, ObserviumID INTEGER)")
-        connection.execute(
-            """
-            CREATE TABLE Port (
-                PortID INTEGER, DeviceID INTEGER, Name TEXT, ObserviumID INTEGER
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE LitCircuit (
-                LitCircuitID INTEGER, BillingCompanyID INTEGER, Description TEXT,
-                CircuitLayoutID INTEGER, ALocationID INTEGER, ZLocationID INTEGER
-            )
-            """
-        )
-        connection.execute(
-            "CREATE TABLE CircuitLayout "
-            "(CircuitLayoutID INTEGER, CircuitName TEXT, PortA INTEGER, PortZ INTEGER)"
-        )
-        connection.execute(
-            """
-            CREATE TABLE CircuitLayoutItem (
-                CircuitLayoutItemID INTEGER, CircuitLayoutID INTEGER, ItemIndex INTEGER,
-                TableName TEXT, TablePK INTEGER
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE Patch (
-                PatchID INTEGER, PatchType INTEGER, PortID_A INTEGER, PortID_B INTEGER,
-                PortID_A_sec INTEGER, PortID_B_sec INTEGER, DarkFiberCircuitID INTEGER,
-                OrderDate TEXT, InstallDate TEXT, CancelDate TEXT, RemovalDate TEXT,
-                needsRemoval INTEGER, Length INTEGER
-            )
-            """
-        )
-        connection.execute(
-            "CREATE TABLE PseudoWire "
-            "(PseudoWireID INTEGER, PWID INTEGER, PortAID INTEGER, PortBID INTEGER)"
-        )
+    create_npdb(path)
 
 
 def test_configure_and_test_sqlite_source_profile(
@@ -66,6 +24,8 @@ def test_configure_and_test_sqlite_source_profile(
     metadata_database = tmp_path / "ocp.db"
     source_database = tmp_path / "nettool.db"
     _create_nettool_database(source_database)
+    mapping_file = tmp_path / "mapping.json"
+    mapping_file.write_text(SourceMapping.sharing_defaults().to_json(), encoding="utf-8")
     monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "k" * 32)
     monkeypatch.setenv("OCP_DATABASE_PATH", str(metadata_database))
     monkeypatch.setattr(
@@ -78,6 +38,8 @@ def test_configure_and_test_sqlite_source_profile(
             "sqlite",
             "--database",
             str(source_database),
+            "--mapping-file",
+            str(mapping_file),
         ],
     )
 
@@ -96,12 +58,106 @@ def test_configure_and_test_sqlite_source_profile(
         "circuit_layout_items",
         "circuit_layouts",
         "circuits",
+        "companies",
         "devices",
         "locations",
         "patches",
         "ports",
         "pseudowires",
+        "racks",
+        "services",
     ]
+
+
+def test_new_source_is_unmapped_and_connection_updates_preserve_mappings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    metadata = tmp_path / "metadata.db"
+    source = tmp_path / "customer.db"
+    _create_nettool_database(source)
+    monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("OCP_DATABASE_PATH", str(metadata))
+    command = ["ocp", "configure-source", "--driver", "sqlite", "--database", str(source)]
+    monkeypatch.setattr(sys, "argv", command)
+    main()
+    configured = json.loads(capsys.readouterr().out)
+    assert configured["mapped_resources"] == []
+    repository = Repository(metadata, "k" * 32)
+    assert json.loads(repository.get_source_database_profile("nettool").mapping_json) == {
+        "resources": {}
+    }
+    monkeypatch.setattr(sys, "argv", ["ocp", "test-source"])
+    main()
+    tested = json.loads(capsys.readouterr().out)
+    assert tested["ocp_contract_ready"] is False
+    assert tested["mapped_resources"] == []
+    assert set(tested["missing_fields"]) == {
+        "circuits",
+        "circuit_layouts",
+        "ports",
+        "devices",
+        "racks",
+        "locations",
+    }
+    mapping_file = tmp_path / "explicit.json"
+    mapping_file.write_text(SourceMapping.sharing_defaults().to_json(), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [*command, "--mapping-file", str(mapping_file)])
+    main()
+    capsys.readouterr()
+    explicit = repository.get_source_database_profile("nettool").mapping_json
+    monkeypatch.setattr(sys, "argv", command)
+    main()
+    capsys.readouterr()
+    assert repository.get_source_database_profile("nettool").mapping_json == explicit
+
+
+@pytest.mark.parametrize("monitoring", [False, True])
+def test_source_readiness_requires_monitoring_mappings_only_when_configured(
+    tmp_path, monkeypatch, capsys, monitoring
+):
+    from open_carrier_portal.admin_store import AdminStore
+
+    metadata = tmp_path / "metadata.db"
+    database = tmp_path / "source.db"
+    create_npdb(database)
+    mapping = json.loads(SourceMapping.sharing_defaults().to_json())
+    for resource in ("devices", "ports"):
+        del mapping["resources"][resource]["columns"]["observium_id"]
+    mapping_file = tmp_path / "mapping.json"
+    mapping_file.write_text(json.dumps(mapping), encoding="utf-8")
+    monkeypatch.setenv("OCP_DATABASE_PATH", str(metadata))
+    monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "k" * 32)
+    monkeypatch.delenv("OCP_OBSERVIUM_BASE_URL", raising=False)
+    monkeypatch.delenv("OCP_OBSERVIUM_API_TOKEN", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ocp",
+            "configure-source",
+            "--driver",
+            "sqlite",
+            "--database",
+            str(database),
+            "--mapping-file",
+            str(mapping_file),
+        ],
+    )
+    main()
+    capsys.readouterr()
+    if monitoring:
+        store = AdminStore(metadata)
+        store.initialize()
+        store.save(
+            "observium", {"url": "https://monitoring.example", "token_env": "MISSING_TEST_TOKEN"}
+        )
+    monkeypatch.setattr(sys, "argv", ["ocp", "test-source"])
+    main()
+    tested = json.loads(capsys.readouterr().out)
+    assert tested["ocp_contract_ready"] is not monitoring
+    assert tested["missing_fields"] == (
+        {"devices": ["observium_id"], "ports": ["observium_id"]} if monitoring else {}
+    )
 
 
 def test_configure_source_requires_explicit_insecure_opt_in(
