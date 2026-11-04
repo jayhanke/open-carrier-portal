@@ -467,6 +467,10 @@ session hashes, partner grants, configuration and audit events.
   configuration/secret bundle is exported.
   Observium redirects do not pass a health check, even if they contain success-shaped
   JSON; configure the final HTTPS installation base URL instead.
+  The read-only Observium health check requests `api/v0/devices/` with `pageno=1`
+  and `pagesize=1`, and validates the device collection (an empty collection is valid).
+  It does not depend on the installation serving an OpenAPI specification. Returned
+  device records are not logged or persisted by this check.
 - **Account:** change your password and invalidate that account's admin sessions.
   Additional local admins and forgotten-password recovery require CLI operator
   access:

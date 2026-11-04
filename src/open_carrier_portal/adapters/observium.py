@@ -59,7 +59,12 @@ class ObserviumAdapter(MonitoringAdapter):
         await self._client.aclose()
 
     async def health_check(self) -> None:
-        await self._request_json("api/v0/openapi.json")
+        payload = await self._request_json(
+            "api/v0/devices/",
+            params={"pageno": 1, "pagesize": 1},
+            health_check=True,
+        )
+        self._records(payload, "devices")
 
     async def capabilities(self) -> CapabilitySet:
         await self.health_check()
@@ -135,10 +140,11 @@ class ObserviumAdapter(MonitoringAdapter):
         path: str,
         *,
         params: Mapping[str, str | int] | None = None,
+        health_check: bool = False,
     ) -> dict[str, Any]:
         operation = (
             "health"
-            if path == "api/v0/openapi.json"
+            if health_check
             else "devices"
             if path.startswith("api/v0/devices/")
             else "ports"
@@ -151,7 +157,7 @@ class ObserviumAdapter(MonitoringAdapter):
         log_event(
             "observium",
             "request.started",
-            "Starting Observium health check (GET api/v0/openapi.json)."
+            "Starting Observium health check (GET api/v0/devices/, page 1, page size 1)."
             if operation == "health"
             else "Starting Observium API request.",
             operation=operation,

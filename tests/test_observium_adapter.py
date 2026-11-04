@@ -197,3 +197,52 @@ async def test_redirect_cannot_pass_health_check_even_with_success_json(reposito
         finally:
             await adapter.close()
     assert store.recent_events("observium")[0]["event"] == "request.redirected"
+
+
+@pytest.mark.parametrize("devices", [{}, [], {"277": {"device_id": "277"}}])
+async def test_health_checks_device_api_without_requiring_openapi(repository, tmp_path, devices):
+    store = AdminStore(tmp_path / "logs.db")
+    store.initialize()
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path == "/monitoring/api/v0/devices/":
+            return httpx.Response(200, json={"status": "ok", "devices": devices})
+        return httpx.Response(404)
+
+    adapter = ObserviumAdapter(
+        base_url="https://observium.example/monitoring",
+        api_token="private-api-token",
+        repository=repository,
+        transport=httpx.MockTransport(handler),
+    )
+    with log_context(store):
+        try:
+            await adapter.health_check()
+        finally:
+            await adapter.close()
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert dict(requests[0].url.params) == {"pageno": "1", "pagesize": "1"}
+    events = store.recent_events("observium")
+    assert events[0]["event"] == "request.completed"
+    assert json.loads(events[0]["details"])["operation"] == "health"
+    assert any("GET api/v0/devices/" in event["message"] for event in events)
+
+
+@pytest.mark.parametrize(
+    "payload", [{}, {"status": "ok"}, {"devices": "invalid"}, {"devices": [1]}]
+)
+async def test_health_rejects_responses_without_valid_device_collection(repository, payload):
+    adapter = ObserviumAdapter(
+        base_url="https://observium.example",
+        api_token="private-api-token",
+        repository=repository,
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload)),
+    )
+    try:
+        with pytest.raises(UpstreamResponseError):
+            await adapter.health_check()
+    finally:
+        await adapter.close()
