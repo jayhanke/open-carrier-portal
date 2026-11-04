@@ -164,6 +164,9 @@ sections to the same source table rather than duplicate their database. Ordered-
 needs ordered route steps, plus patch/pseudowire mappings when those step types occur.
 Primary endpoint references cannot be NULL; an empty ordered path or missing device,
 rack or location record fails explicitly instead of returning a successful partial path.
+Optional secondary patch port references may be NULL or zero (including `"0"`); these
+mean no secondary port, not a reference to port 0. Nonzero secondary references must
+resolve to existing ports; primary port references remain required.
 Companies, rack positions and service enrichment remain optional. If a service is
 mapped, map its type and bandwidth as well as its ID. Unconfigured optional enrichment referenced
 by a circuit is listed in `omitted_enrichment`; incomplete configured mappings,

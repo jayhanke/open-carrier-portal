@@ -506,6 +506,40 @@ def test_secondary_patch_ports_are_parent_authorized_and_opaque(circuit_app):
     assert patch["port_a_secondary"]["device"]["name"] == "edge-z"
 
 
+@pytest.mark.parametrize("suffix", ["", "/path"])
+@pytest.mark.parametrize("as_text", [False, True])
+def test_zero_secondary_patch_ports_do_not_break_direct_circuit_reads(
+    circuit_app, suffix, as_text, monkeypatch
+):
+    app, client_id, _, circuit_id, source_path, _, _ = circuit_app
+    with sqlite3.connect(source_path) as db:
+        db.execute("UPDATE Patch SET PortID_A_sec=0, PortID_B_sec=0 WHERE PatchID=501")
+    if as_text:
+        source = app.state.source_database
+        fetch_matching = source.fetch_matching
+
+        def text_secondary_ids(resource, *args, **kwargs):
+            rows = fetch_matching(resource, *args, **kwargs)
+            if resource == "patches":
+                for row in rows:
+                    row["port_a_secondary_id"] = "0"
+                    row["port_b_secondary_id"] = "0"
+            return rows
+
+        monkeypatch.setattr(source, "fetch_matching", text_secondary_ids)
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/circuits/" + circuit_id + suffix, headers=token(client, client_id)
+        )
+    assert response.status_code == 200, response.text
+    path = response.json()["path"] if not suffix else response.json()
+    patch = path["items"][1]
+    assert patch["port_a_secondary"] is None
+    assert patch["port_b_secondary"] is None
+    assert patch["port_a_secondary_id"] is None
+    assert patch["port_b_secondary_id"] is None
+
+
 def test_mapper_catalog_and_legacy_mapping_preservation(circuit_app):
     from test_admin import login
 

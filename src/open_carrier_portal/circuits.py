@@ -467,8 +467,8 @@ class CircuitReader:
                 z = await self.port(z_id)
                 a2_id = component.get("port_a_secondary_id")
                 z2_id = component.get("port_b_secondary_id")
-                a2 = await self.port(a2_id) if a2_id is not None else None
-                z2 = await self.port(z2_id) if z2_id is not None else None
+                a2 = await self.port(a2_id) if a2_id not in (None, 0, "0") else None
+                z2 = await self.port(z2_id) if z2_id not in (None, 0, "0") else None
                 items.append(
                     CircuitPathItem(
                         position=position,

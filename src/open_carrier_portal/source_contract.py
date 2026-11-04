@@ -302,7 +302,8 @@ OCP_TABLES = {
         "resources": ("patches",),
         "help": (
             "A physical connection used by a path step. Both primary endpoint IDs "
-            "reference ports.source_id. Secondary endpoint ports are optional. Map this "
+            "reference ports.source_id. Secondary endpoint ports are optional; NULL or 0 "
+            "means no secondary port. Other IDs must resolve to existing ports. Map this "
             "section when shared paths contain Patch steps."
         ),
         "examples": (

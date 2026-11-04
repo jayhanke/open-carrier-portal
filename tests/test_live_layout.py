@@ -177,6 +177,36 @@ def test_full_layout_has_ordered_components_and_linked_observium_status(live_sou
     assert b"Example circuit" not in settings.database_path.read_bytes()
 
 
+@pytest.mark.parametrize("audience", ["owner", "partner"])
+@pytest.mark.parametrize(
+    "secondary_a,secondary_z,roles",
+    [
+        (0, 0, ["a", "z"]),
+        (0, 101, ["a", "z", "z_secondary"]),
+        (202, 0, ["a", "z", "a_secondary"]),
+    ],
+)
+def test_zero_secondary_patch_ports_are_absent(
+    live_source, audience, secondary_a, secondary_z, roles
+):
+    request = owner_layout(live_source) if audience == "owner" else partner_layout(live_source)
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(
+            "UPDATE Patch SET PortID_A_sec=?, PortID_B_sec=? WHERE PatchID=501",
+            (secondary_a, secondary_z),
+        )
+    result = execute(live_source, request)
+    assert result.error is None
+    assert [item.kind for item in result.circuit.layout.items] == [
+        "port",
+        "patch",
+        "pseudowire",
+        "port",
+    ]
+    assert [port.role for port in result.circuit.layout.items[1].ports] == roles
+    assert [endpoint.position for endpoint in result.circuit.endpoints] == ["a", "z"]
+
+
 def test_existing_grants_do_not_gain_layouts_and_new_scope_cannot_be_requested(live_source):
     source = enable(live_source)
     listed = execute(live_source, owner_job(live_source, source)).page
@@ -208,6 +238,9 @@ def test_existing_grants_do_not_gain_layouts_and_new_scope_cannot_be_requested(l
         "UPDATE CircuitLayoutItem SET ItemIndex=10",
         "UPDATE CircuitLayoutItem SET TableName='Vault' WHERE CircuitLayoutItemID=2",
         "UPDATE Patch SET PortID_A=NULL",
+        "UPDATE Patch SET PortID_A=0",
+        "UPDATE Patch SET PortID_A_sec=99999",
+        "UPDATE Patch SET PortID_B_sec=99999",
     ],
 )
 def test_invalid_or_unsupported_layout_is_explicitly_unavailable(live_source, statement):
