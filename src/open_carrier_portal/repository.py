@@ -5,16 +5,30 @@ import hmac
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from open_carrier_portal.company_policies import (
+    POLICY_LEASE_SECONDS,
+    CompanyPolicy,
+    LocalCompanyPolicy,
+    PolicyReceipt,
+    PolicySnapshot,
+    source_fingerprint,
+)
 from open_carrier_portal.errors import AuthenticationError, AuthorizationError
+from open_carrier_portal.live_contract import OwnerSource
 from open_carrier_portal.models import ConnectorIdentity, RelationshipState
 from open_carrier_portal.security import ALLOWED_SCOPES
+
+if TYPE_CHECKING:
+    from open_carrier_portal.portal_agent import PortalConnection
 
 _CIRCUIT_VISIBILITIES = {
     "summary",
@@ -162,9 +176,42 @@ class Repository:
                 );
                 CREATE INDEX IF NOT EXISTS circuit_shares_partner_status
                     ON circuit_shares(partner_id, status, circuit_source_id);
+                CREATE TABLE IF NOT EXISTS portal_company_policies (
+                    policy_id TEXT PRIMARY KEY,
+                    binding_id TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    approval_json TEXT,
+                    source_profile_id TEXT,
+                    approved_by TEXT,
+                    synced_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS portal_owner_sources (
+                    source_profile_id TEXT PRIMARY KEY
+                        REFERENCES source_database_profiles(profile_id),
+                    binding_id TEXT NOT NULL,
+                    grant_id TEXT NOT NULL,
+                    mapping_fingerprint TEXT NOT NULL,
+                    approved_by TEXT NOT NULL,
+                    explorer_enabled INTEGER NOT NULL DEFAULT 0,
+                    layout_enabled INTEGER NOT NULL DEFAULT 0
+                );
                 """
             )
             self._migrate_source_database_profiles(connection)
+            if "layout_enabled" not in {
+                row["name"] for row in connection.execute("PRAGMA table_info(portal_owner_sources)")
+            }:
+                connection.execute(
+                    "ALTER TABLE portal_owner_sources "
+                    "ADD COLUMN layout_enabled INTEGER NOT NULL DEFAULT 0"
+                )
+            if "explorer_enabled" not in {
+                row["name"] for row in connection.execute("PRAGMA table_info(portal_owner_sources)")
+            }:
+                connection.execute(
+                    "ALTER TABLE portal_owner_sources "
+                    "ADD COLUMN explorer_enabled INTEGER NOT NULL DEFAULT 0"
+                )
 
     @staticmethod
     def _migrate_source_database_profiles(connection: sqlite3.Connection) -> None:
@@ -257,8 +304,9 @@ class Repository:
         profile_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
-                "SELECT profile_id FROM source_database_profiles WHERE name = ?", (name,)
+                "SELECT * FROM source_database_profiles WHERE name = ?", (name,)
             ).fetchone()
             if existing is not None:
                 profile_id = str(existing["profile_id"])
@@ -314,6 +362,22 @@ class Repository:
                         now,
                     ),
                 )
+            if existing is not None:
+                updated = connection.execute(
+                    "SELECT * FROM source_database_profiles WHERE profile_id = ?", (profile_id,)
+                ).fetchone()
+                if not enabled or source_fingerprint(
+                    self._source_profile(existing)
+                ) != source_fingerprint(self._source_profile(updated)):
+                    connection.execute(
+                        "UPDATE portal_company_policies SET approval_json = NULL "
+                        "WHERE source_profile_id = ?",
+                        (profile_id,),
+                    )
+                    connection.execute(
+                        "DELETE FROM portal_owner_sources WHERE source_profile_id = ?",
+                        (profile_id,),
+                    )
         return profile_id
 
     def get_source_database_profile(self, name: str) -> SourceDatabaseProfile | None:
@@ -329,6 +393,17 @@ class Repository:
             ).fetchone()
         if row is None:
             return None
+        return self._source_profile(row)
+
+    def get_source_database_profile_by_id(self, profile_id: str) -> SourceDatabaseProfile | None:
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT * FROM source_database_profiles WHERE profile_id = ?", (profile_id,)
+            ).fetchone()
+        return None if row is None else self._source_profile(row)
+
+    @staticmethod
+    def _source_profile(row: sqlite3.Row) -> SourceDatabaseProfile:
         return SourceDatabaseProfile(
             profile_id=str(row["profile_id"]),
             name=str(row["name"]),
@@ -348,6 +423,330 @@ class Repository:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )
+
+    def _require_owner_identity(self, portal: PortalConnection) -> None:
+        identity = self.get_connector_identity()
+        if identity is None or not identity.enabled or identity.connector_id != portal.connector_id:
+            raise AuthorizationError("an enabled paired connector identity is required")
+
+    def approve_portal_owner_source(
+        self,
+        portal: PortalConnection,
+        *,
+        profile_name: str,
+        fingerprint: str,
+        approved_by: str,
+        explorer_enabled: bool = False,
+        layout_enabled: bool = False,
+    ) -> None:
+        with self._lock, self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._require_owner_identity(portal)
+            row = db.execute(
+                "SELECT * FROM source_database_profiles WHERE name = ?", (profile_name,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("enabled source profile was not found")
+            profile = self._source_profile(row)
+            if not profile.enabled or source_fingerprint(profile) != fingerprint:
+                raise ValueError("source changed during approval; review and approve again")
+            if len(profile.name) > 512:
+                raise ValueError("owner source labels must not exceed 512 characters")
+            count = db.execute(
+                "SELECT COUNT(*) FROM portal_owner_sources "
+                "WHERE binding_id = ? AND source_profile_id != ?",
+                (portal.binding_id, profile.profile_id),
+            ).fetchone()[0]
+            if count >= 100:
+                raise ValueError("at most 100 databases can be enabled for owner browsing")
+            db.execute(
+                "INSERT INTO portal_owner_sources "
+                "(source_profile_id, binding_id, grant_id, mapping_fingerprint, approved_by, "
+                "explorer_enabled, layout_enabled) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(source_profile_id) DO UPDATE SET "
+                "binding_id=excluded.binding_id, grant_id=excluded.grant_id, "
+                "mapping_fingerprint=excluded.mapping_fingerprint, "
+                "approved_by=excluded.approved_by, explorer_enabled=excluded.explorer_enabled, "
+                "layout_enabled=excluded.layout_enabled",
+                (
+                    profile.profile_id,
+                    portal.binding_id,
+                    str(uuid.uuid4()),
+                    fingerprint,
+                    approved_by,
+                    int(explorer_enabled),
+                    int(layout_enabled),
+                ),
+            )
+
+    def stop_portal_owner_source(self, portal: PortalConnection, *, source_profile_id: str) -> None:
+        with self._lock, self._connection() as db:
+            cursor = db.execute(
+                "DELETE FROM portal_owner_sources WHERE source_profile_id = ? AND binding_id = ?",
+                (source_profile_id, portal.binding_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("enabled owner source was not found for this pairing")
+
+    def list_portal_owner_sources(self, portal: PortalConnection) -> list[OwnerSource]:
+        self._require_owner_identity(portal)
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT p.*, g.grant_id, g.mapping_fingerprint, "
+                "g.explorer_enabled, g.layout_enabled "
+                "FROM portal_owner_sources g "
+                "JOIN source_database_profiles p ON p.profile_id = g.source_profile_id "
+                "WHERE g.binding_id = ? AND p.enabled = 1 ORDER BY p.name",
+                (portal.binding_id,),
+            ).fetchall()
+        return [
+            OwnerSource(
+                source_profile_id=row["profile_id"],
+                grant_id=row["grant_id"],
+                name=row["name"],
+                explorer_enabled=bool(row["explorer_enabled"]),
+                layout_enabled=bool(row["layout_enabled"]),
+            )
+            for row in rows
+            if source_fingerprint(self._source_profile(row)) == row["mapping_fingerprint"]
+        ]
+
+    def require_portal_owner_source(
+        self,
+        portal: PortalConnection,
+        *,
+        source_profile_id: str,
+        grant_id: str,
+        explorer: bool = False,
+        layout: bool = False,
+    ) -> SourceDatabaseProfile:
+        self._require_owner_identity(portal)
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT p.*, g.mapping_fingerprint, g.explorer_enabled, g.layout_enabled "
+                "FROM portal_owner_sources g "
+                "JOIN source_database_profiles p ON p.profile_id = g.source_profile_id "
+                "WHERE g.binding_id = ? AND g.source_profile_id = ? AND g.grant_id = ? "
+                "AND p.enabled = 1",
+                (portal.binding_id, source_profile_id, grant_id),
+            ).fetchone()
+        if (
+            row is None
+            or source_fingerprint(self._source_profile(row)) != row["mapping_fingerprint"]
+        ):
+            raise AuthorizationError("owner inventory access is not enabled for this source")
+        if explorer and not row["explorer_enabled"]:
+            raise AuthorizationError("the hierarchy explorer requires fresh connector consent")
+        if layout and not row["layout_enabled"]:
+            raise AuthorizationError("circuit layouts require fresh connector consent")
+        return self._source_profile(row)
+
+    def synchronize_portal_policies(
+        self, portal: PortalConnection, snapshot: PolicySnapshot
+    ) -> None:
+        identifiers = [policy.policy_id for policy in snapshot.policies]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("portal policy snapshot contains duplicate policy IDs")
+        for policy in snapshot.policies:
+            if (
+                str(policy.owner_organization_id) != portal.organization_id
+                or str(policy.connector_id) != portal.connector_id
+                or policy.recipient_organization_id == policy.owner_organization_id
+            ):
+                raise ValueError("portal policy does not match the paired owner and connector")
+        with self._lock, self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for policy in snapshot.policies:
+                row = db.execute(
+                    "SELECT * FROM portal_company_policies WHERE policy_id = ?",
+                    (str(policy.policy_id),),
+                ).fetchone()
+                keep_approval = False
+                if row is not None and row["binding_id"] == portal.binding_id:
+                    old = CompanyPolicy.model_validate_json(row["proposal_json"])
+                    if policy.revision < old.revision:
+                        raise ValueError("portal returned an obsolete policy revision")
+                    if policy.revision == old.revision:
+                        if old.model_dump(exclude={"state", "recipient_name"}) != policy.model_dump(
+                            exclude={"state", "recipient_name"}
+                        ):
+                            raise ValueError("changed policy identity requires a new revision")
+                        if old.state == "revoked" and policy.state != "revoked":
+                            raise ValueError("revoked policy requires a new revision")
+                        keep_approval = policy.state != "revoked"
+                db.execute(
+                    """
+                    INSERT INTO portal_company_policies
+                        (policy_id, binding_id, proposal_json, synced_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(policy_id) DO UPDATE SET binding_id = excluded.binding_id,
+                        proposal_json = excluded.proposal_json, synced_at = excluded.synced_at,
+                        approval_json = CASE WHEN ? THEN approval_json ELSE NULL END,
+                        source_profile_id = CASE WHEN ? THEN source_profile_id ELSE NULL END,
+                        approved_by = CASE WHEN ? THEN approved_by ELSE NULL END
+                    """,
+                    (
+                        str(policy.policy_id),
+                        portal.binding_id,
+                        policy.model_dump_json(),
+                        time.time(),
+                        keep_approval,
+                        keep_approval,
+                        keep_approval,
+                    ),
+                )
+            for row in db.execute(
+                "SELECT policy_id, proposal_json FROM portal_company_policies WHERE binding_id = ?",
+                (portal.binding_id,),
+            ).fetchall():
+                if row["policy_id"] not in {str(identifier) for identifier in identifiers}:
+                    old = CompanyPolicy.model_validate_json(row["proposal_json"])
+                    db.execute(
+                        "UPDATE portal_company_policies SET proposal_json = ?, "
+                        "approval_json = NULL WHERE policy_id = ?",
+                        (
+                            old.model_copy(update={"state": "revoked"}).model_dump_json(),
+                            row["policy_id"],
+                        ),
+                    )
+
+    def _portal_approval(self, db: sqlite3.Connection, row: sqlite3.Row) -> PolicyReceipt | None:
+        if row["approval_json"] is None:
+            return None
+        receipt = PolicyReceipt.model_validate_json(row["approval_json"])
+        profile = db.execute(
+            "SELECT * FROM source_database_profiles WHERE profile_id = ? AND enabled = 1",
+            (str(receipt.source_profile_id),),
+        ).fetchone()
+        if profile is None or receipt.mapping_fingerprint != source_fingerprint(
+            self._source_profile(profile)
+        ):
+            db.execute(
+                "UPDATE portal_company_policies SET approval_json = NULL WHERE policy_id = ?",
+                (row["policy_id"],),
+            )
+            return None
+        return receipt
+
+    def list_portal_policies(self, portal: PortalConnection) -> list[LocalCompanyPolicy]:
+        with self._lock, self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT * FROM portal_company_policies WHERE binding_id = ? ORDER BY policy_id",
+                (portal.binding_id,),
+            ).fetchall()
+            return [
+                LocalCompanyPolicy(
+                    CompanyPolicy.model_validate_json(row["proposal_json"]),
+                    self._portal_approval(db, row),
+                    float(row["synced_at"]),
+                    row["approved_by"],
+                    row["source_profile_id"] is not None,
+                )
+                for row in rows
+            ]
+
+    def portal_policy_receipts(self, portal: PortalConnection) -> list[PolicyReceipt]:
+        receipts = []
+        for local in self.list_portal_policies(portal):
+            if local.policy.state == "revoked":
+                continue
+            if local.receipt is not None:
+                receipts.append(local.receipt)
+            elif local.was_approved or local.policy.state in {"active", "needs_approval"}:
+                receipts.append(
+                    PolicyReceipt(
+                        policy_id=local.policy.policy_id,
+                        revision=local.policy.revision,
+                        state="needs_approval",
+                    )
+                )
+        return receipts
+
+    def approve_portal_policy(
+        self,
+        portal: PortalConnection,
+        *,
+        policy_id: str,
+        revision: int,
+        profile_name: str,
+        company_id: str,
+        fingerprint: str,
+        approved_by: str,
+        layout_consent: bool = False,
+    ) -> None:
+        with self._lock, self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM portal_company_policies WHERE policy_id = ? AND binding_id = ?",
+                (policy_id, portal.binding_id),
+            ).fetchone()
+            profile = db.execute(
+                "SELECT * FROM source_database_profiles WHERE name = ? AND enabled = 1",
+                (profile_name,),
+            ).fetchone()
+            if row is None or profile is None:
+                raise ValueError("policy or enabled database profile was not found")
+            policy = CompanyPolicy.model_validate_json(row["proposal_json"])
+            if policy.visibility == "full_shared_path" and not layout_consent:
+                raise ValueError("explicit full layout approval is required")
+            if (
+                policy.revision != revision
+                or policy.state not in {"pending", "needs_approval"}
+                or row["source_profile_id"] is not None
+                or not 0 <= time.time() - row["synced_at"] <= POLICY_LEASE_SECONDS
+            ):
+                raise ValueError("refresh the portal connection and request a new policy revision")
+            if source_fingerprint(self._source_profile(profile)) != fingerprint:
+                raise ValueError("source mapping changed during approval; load companies again")
+            receipt = PolicyReceipt(
+                policy_id=policy.policy_id,
+                revision=revision,
+                state="accepted",
+                source_profile_id=profile["profile_id"],
+                source_company_id=company_id,
+                mapping_fingerprint=fingerprint,
+                visibility=policy.visibility,
+            )
+            db.execute(
+                "UPDATE portal_company_policies SET approval_json = ?, source_profile_id = ?, "
+                "approved_by = ? WHERE policy_id = ?",
+                (receipt.model_dump_json(), profile["profile_id"], approved_by, policy_id),
+            )
+
+    def stop_portal_policy(self, portal: PortalConnection, *, policy_id: str) -> None:
+        with self._lock, self._connection() as db:
+            cursor = db.execute(
+                "UPDATE portal_company_policies SET approval_json = NULL "
+                "WHERE policy_id = ? AND binding_id = ? AND approval_json IS NOT NULL",
+                (policy_id, portal.binding_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("an approved policy for this portal connection was not found")
+
+    def require_portal_company_policy(
+        self,
+        portal: PortalConnection,
+        *,
+        policy_id: str,
+        revision: int,
+        recipient_organization_id: str,
+    ) -> PolicyReceipt:
+        identity = self.get_connector_identity()
+        if identity is None or not identity.enabled or identity.connector_id != portal.connector_id:
+            raise AuthorizationError("enabled paired connector identity is required")
+        for local in self.list_portal_policies(portal):
+            if (
+                str(local.policy.policy_id) == policy_id
+                and local.policy.revision == revision
+                and str(local.policy.recipient_organization_id) == recipient_organization_id
+                and local.policy.state == "active"
+                and local.receipt is not None
+                and local.receipt.revision == local.policy.revision
+                and 0 <= time.time() - local.synced_at <= POLICY_LEASE_SECONDS
+            ):
+                return local.receipt
+        raise AuthorizationError("a current connector-approved company policy is required")
 
     def put_connector_identity(self, identity: ConnectorIdentity) -> None:
         with self._lock, self._connection() as connection:

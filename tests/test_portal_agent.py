@@ -233,7 +233,10 @@ def test_cli_private_http_pairing_and_agent_honor_environment(tmp_path, monkeypa
         requests.append(request.url.path)
         if request.url.path.endswith("/pair"):
             return httpx.Response(200, json={"organization_id": str(uuid4()), "token": "t" * 64})
-        return httpx.Response(200, json={"status": "connected"})
+        assert json.loads(request.content)["policy_version"] == 1
+        return httpx.Response(
+            200, json={"status": "connected", "company_policies": {"version": 1, "policies": []}}
+        )
 
     client_factory = httpx.Client
     monkeypatch.setattr(

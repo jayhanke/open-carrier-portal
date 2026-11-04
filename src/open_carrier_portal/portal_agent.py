@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import httpx
+from pydantic import TypeAdapter
 
+from open_carrier_portal.company_policies import PolicySnapshot
 from open_carrier_portal.config import validate_portal_url
 from open_carrier_portal.diagnostics import log_event, log_failure, target_origin
+from open_carrier_portal.live_contract import MAX_RESULT_BYTES, LiveJob, LiveResult
+
+if TYPE_CHECKING:
+    from open_carrier_portal.config import Settings
+    from open_carrier_portal.repository import Repository
 
 DEFAULT_CONNECTION_FILE = Path.home() / ".open-carrier-portal" / "portal-connection.json"
 
@@ -22,6 +33,19 @@ class PortalConnection:
     connector_id: str
     organization_id: str
     token: str
+
+    @property
+    def binding_id(self) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                [
+                    self.portal_url,
+                    self.organization_id,
+                    self.connector_id,
+                    self.token,
+                ]
+            ).encode()
+        ).hexdigest()
 
     @classmethod
     def load(cls, path: Path, *, allow_insecure_http: bool = False) -> PortalConnection:
@@ -114,13 +138,23 @@ def send_heartbeat(
     connection: PortalConnection,
     *,
     allow_insecure_http: bool = False,
+    repository: Repository | None = None,
 ) -> None:
     portal_url = validate_portal_url(connection.portal_url, allow_insecure_http=allow_insecure_http)
     log_event("portal", "heartbeat.started", "Sending portal heartbeat.")
+    payload: dict[str, object] = {"connector_id": connection.connector_id}
+    if repository is not None:
+        payload.update(
+            policy_version=1,
+            policy_receipts=[
+                receipt.model_dump(mode="json")
+                for receipt in repository.portal_policy_receipts(connection)
+            ],
+        )
     response = client.post(
         f"{portal_url}/api/connectors/heartbeat",
         headers={"Authorization": f"Bearer {connection.token}"},
-        json={"connector_id": connection.connector_id},
+        json=payload,
     )
     response.raise_for_status()
     try:
@@ -141,7 +175,112 @@ def send_heartbeat(
             level=logging.ERROR,
         )
         raise ValueError("portal returned an invalid heartbeat response")
+    if repository is not None:
+        try:
+            snapshot = PolicySnapshot.model_validate(data.get("company_policies"))
+            repository.synchronize_portal_policies(connection, snapshot)
+        except ValueError:
+            log_event(
+                "portal",
+                "policies.invalid_response",
+                "Company policy synchronization failed. Update both apps and check pairing; "
+                "response contents were not logged.",
+                level=logging.ERROR,
+            )
+            raise ValueError("portal returned an invalid company policy snapshot") from None
     log_event("portal", "heartbeat.accepted", "Portal heartbeat accepted.")
+
+
+def serve_live_request(
+    client: httpx.Client,
+    connection: PortalConnection,
+    *,
+    repository: Repository,
+    settings: Settings,
+    settings_loader: Callable[[], Settings] | None = None,
+) -> bool:
+    from open_carrier_portal.live_reader import execute_live_request, monitoring_for_live
+
+    portal_url = validate_portal_url(
+        connection.portal_url, allow_insecure_http=settings.allow_insecure_http
+    )
+    headers = {"Authorization": f"Bearer {connection.token}"}
+    with client.stream(
+        "POST",
+        f"{portal_url}/api/connectors/live/poll",
+        headers=headers,
+        json={"connector_id": connection.connector_id, "wait_seconds": 5},
+    ) as response:
+        response.raise_for_status()
+        body = bytearray()
+        for chunk in response.iter_bytes():
+            body.extend(chunk)
+            if len(body) > 16_384:
+                raise ValueError("portal live request exceeds its metadata size limit")
+    try:
+        payload = json.loads(body)
+        if not isinstance(payload, dict) or set(payload) != {"request"}:
+            raise ValueError("invalid live poll envelope")
+        if payload["request"] is None:
+            return False
+        job = TypeAdapter(LiveJob).validate_python(payload["request"])
+    except ValueError:
+        raise ValueError("portal returned an invalid live request contract") from None
+
+    async def execute() -> LiveResult:
+        effective = settings
+        if job.operation == "circuits.read" and settings_loader is not None:
+            try:
+                effective = settings_loader()
+            except ValueError:
+                log_event(
+                    "portal",
+                    "live.configuration_invalid",
+                    "Live monitoring configuration is invalid; check Connections.",
+                    level=logging.ERROR,
+                )
+                return LiveResult(request_id=job.request_id, error="unavailable")
+        async with monitoring_for_live(
+            effective, repository, enabled=job.operation == "circuits.read"
+        ) as monitoring:
+            return await execute_live_request(
+                repository,
+                connection,
+                job,
+                metadata_path=settings.database_path,
+                monitoring=monitoring,
+            )
+
+    result = asyncio.run(execute())
+    encoded = result.model_dump_json().encode()
+    if len(encoded) > MAX_RESULT_BYTES:
+        log_event(
+            "portal",
+            "live.result_too_large",
+            "Live result exceeded the response size limit.",
+            level=logging.ERROR,
+        )
+        encoded = (
+            LiveResult(request_id=job.request_id, error="unavailable").model_dump_json().encode()
+        )
+    response = client.post(
+        f"{portal_url}/api/connectors/live/results",
+        params={"connector_id": connection.connector_id},
+        headers={**headers, "Content-Type": "application/json"},
+        content=encoded,
+    )
+    if response.status_code in {403, 409}:
+        log_event(
+            "portal",
+            "live.result_obsolete",
+            "Live request expired or was revoked; result discarded.",
+            level=logging.WARNING,
+        )
+        return True
+    response.raise_for_status()
+    if response.json() != {"status": "accepted"}:
+        raise ValueError("portal returned an invalid live result acknowledgement")
+    return True
 
 
 def run_agent(
@@ -150,18 +289,44 @@ def run_agent(
     *,
     once: bool = False,
     allow_insecure_http: bool = False,
+    repository: Repository | None = None,
+    settings: Settings | None = None,
+    settings_loader: Callable[[], Settings] | None = None,
 ) -> None:
+    next_heartbeat = 0.0
     while True:
+        operation = "heartbeat"
         try:
-            send_heartbeat(client, connection, allow_insecure_http=allow_insecure_http)
+            if time.monotonic() >= next_heartbeat:
+                send_heartbeat(
+                    client,
+                    connection,
+                    allow_insecure_http=allow_insecure_http,
+                    repository=repository,
+                )
+                next_heartbeat = time.monotonic() + 30
+            if once:
+                return
+            if repository is not None:
+                operation = "live.transport"
+                if settings is None:
+                    raise ValueError("connector settings are required to serve live requests")
+                serve_live_request(
+                    client,
+                    connection,
+                    repository=repository,
+                    settings=settings,
+                    settings_loader=settings_loader,
+                )
+            else:
+                time.sleep(30)
         except httpx.HTTPStatusError as exc:
-            log_failure("portal", "heartbeat.failed", exc)
+            log_failure("portal", f"{operation}.failed", exc)
             if once or exc.response.status_code < 500:
                 raise
+            time.sleep(5)
         except httpx.RequestError as exc:
-            log_failure("portal", "heartbeat.failed", exc)
+            log_failure("portal", f"{operation}.failed", exc)
             if once:
                 raise
-        if once:
-            return
-        time.sleep(30)
+            time.sleep(5)

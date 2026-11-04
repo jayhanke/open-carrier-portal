@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import ssl
 import sys
 import uuid
 from getpass import getpass
@@ -201,6 +202,10 @@ def _main(context: LogContext) -> None:
         return
 
     if args.command in {"pair-portal", "run-portal-agent"}:
+        from open_carrier_portal.admin import configured_settings
+
+        assert context.store is not None
+        agent_store = context.store
         if settings.allow_insecure_http:
             log_event(
                 "portal",
@@ -213,7 +218,14 @@ def _main(context: LogContext) -> None:
         if identity is None or not identity.enabled:
             parser.error("initialize an enabled connector first with ocp init")
         try:
-            with httpx.Client(timeout=15, follow_redirects=False, trust_env=False) as client:
+            with httpx.Client(
+                timeout=15,
+                follow_redirects=False,
+                trust_env=False,
+                verify=ssl.create_default_context(
+                    cafile=settings.portal_ca_bundle or agent_store.get("portal").get("ca") or None
+                ),
+            ) as client:
                 if args.command == "pair-portal":
                     pair_portal(
                         client=client,
@@ -239,6 +251,9 @@ def _main(context: LogContext) -> None:
                         connection,
                         once=args.once,
                         allow_insecure_http=settings.allow_insecure_http,
+                        repository=repository,
+                        settings=settings,
+                        settings_loader=lambda: configured_settings(settings, agent_store),
                     )
         except FileExistsError:
             parser.error(

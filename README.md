@@ -205,16 +205,163 @@ catalog remains available for existing mappings. Saved mappings and public ID
 namespaces are preserved, not automatically replaced.
 
 Service orders, billing workflows, tickets, LOAs, historical metrics and partner-submitted
-changes remain outside this read-only v1. Hosted-portal pairing still provides only
-registration and heartbeats; it does not automatically retrieve this circuit response.
+changes remain outside this read-only v1. Hosted-portal pairing provides registration,
+heartbeats, company-policy synchronization and an outbound live reader. The portal
+can now request approved partner circuit lists and endpoint/status data without
+accessing this connector's inbound API.
 
 ### Outbound hosted-portal connection
 
 The separate hosted OpenPortal application supports organization-admin pairing
 and outbound connection status. No inbound connector port is required for this
-connection. It currently carries **registration and heartbeats only**, not resource
-retrieval, remote commands, or synchronization of relationship/share grants.
+connection. It carries **registration, heartbeats, company-policy metadata and
+authorized live circuit requests/results**, not remote management commands.
+Legacy explicit portal circuit shares
+are not synchronized as direct OAuth grants.
 Partner API authorization remains unchanged.
+
+#### Owner-approved company policies
+
+Update the portal and connector together. In the portal, establish an active
+relationship, then open **Permissions** and propose sharing with that partner.
+On the paired connector's **Partners** page, load the appropriate mapped database,
+select the proposal, enter the company's source ID and explicitly approve.
+Company names are display-only, never an identity match.
+
+The connector verifies the company through `companies.source_id`/`companies.name`
+and requires mapped `circuits.source_id`/`circuits.billing_company_id`. Its local
+organization ID is not assumed to equal the portal organization ID: the private
+pairing file binds the policy's owner tenant and specific connector.
+Approval is bound to the exact proposal revision, paired credential, source profile,
+company ID and database/mapping fingerprint. The portal shows Active only after
+receiving that receipt through a heartbeat.
+
+The fixed policy covers all current/future circuits billed to that company,
+endpoints and linked monitoring status only. The reusable `require_company_circuit`
+guard queries the approved database on every call and filters by both circuit ID
+and live billing-company ID. Ownership transfer/deletion removes access, and an
+incoming partner cannot choose an owner-view bypass. It grants no standalone
+device/port API access, writes or extra direct OAuth scopes. Missing monitoring
+must remain Unavailable/Not linked, never healthy.
+
+Changing the mapped database identity or mapping invalidates approval immediately,
+even before a restart. **Stop sharing immediately** also invalidates it locally.
+The next heartbeat reports Needs approval and advances the portal revision.
+Re-proposing, relationship revocation, or connector replacement cannot reuse an old
+acknowledgement. A changed pairing credential also cannot reuse local approval.
+Authorization requires an enabled connector/source and a policy snapshot received
+within 90 seconds; offline or stale policy metadata is denied.
+
+V1 has one company/source-profile link per partner relationship direction and a
+bounded snapshot of at most 100 policy records per owner, including revoked records.
+The portal rejects additional policies rather than silently dropping metadata.
+Company/circuit/monitoring records are not persisted by this workflow; only policy,
+local company/profile IDs, source fingerprints, approval decisions and audits are.
+Existing direct OAuth sharing remains independent and unchanged.
+
+The outbound live-data channel supports circuit lists, endpoint/status reads and explicitly
+approved full-layout reads
+in the portal's **Browse Data** interface. Partner access remains billing-company
+filtered; own-company access is explicitly enabled on the connector. Dashboard
+redesign remains later work.
+
+#### Own-company inventory approval
+
+On this connector, open **Carrier Portal → My company inventory**, choose a saved,
+enabled database, explicitly consent to exposing its **full circuit inventory**
+to your own portal company's administrators and members, then choose
+**Enable own-company browsing**. Pairing alone exposes no inventory.
+The mapping is validated before approval. In the portal, open
+**Browse Data → My company data** to choose an enabled database, page through
+circuits, and open A/Z endpoint/status details. This includes circuits billed to
+other companies; it is not the partner billing filter.
+
+To enable contextual browsing, also select the separate **hierarchy explorer** checkbox.
+Existing circuit-only approvals do not gain broader access automatically. This grants your
+own company's portal members read-only **Sites → racks → devices → ports → related circuits**
+and company racks/devices/billed circuits, using the existing mappings. Circuit endpoint
+links lead back into this hierarchy. Related circuits follow endpoint ports and configured
+Port entries in circuit paths. Missing required mappings report errors, not invented data.
+Private management addresses, credentials and raw source rows are not exposed.
+No operational records are stored in the portal. Existing partner permissions remain
+endpoint-only unless a new full-layout policy revision is explicitly approved.
+Use the portal's teal/gold **Home** dashboard for navigation and bounded quick search;
+one eligible approved database opens directly, while multiple databases require selection.
+Explorer lists include safe mapped circuit company/service/status, site address and rack
+context; company pages organize racks, devices and billed circuits. Circuit endpoint
+cards keep physical context separate from expandable monitoring readings. Unknown inventory
+state is not presented as active, and inventory state is not a health check.
+Administration is grouped under **Setup**.
+
+Full circuit layouts require separate, explicit connector-local consent. Under
+**Carrier Portal → My company inventory**, enable **full circuit layouts** for your
+own company. Existing circuit-only and hierarchy grants do not expand automatically.
+For partner clients, propose **Full circuit layout and port monitoring** in portal
+**Setup → Permissions**, then approve the new revision under connector **Partners**
+with the **FULL LAYOUT** checkbox. The company-billing filter and final live authorization
+still apply; this exposes infrastructure within the circuit, not independent browsing.
+The ordered layout projects mapped ports, patches, pseudowires and secondary patch ports
+(up to 200 nodes), with device/rack/site context and live Observium port status.
+Unsupported types or broken/ambiguous path references are reported, not omitted.
+`ports.observium_id` selects the exact Observium interface; `devices.observium_id`
+verifies that it belongs to the mapped device. Keep the existing Observium connection
+enabled and configured on the connector. No credentials or raw monitoring rows reach
+the portal. Status is fetched once per unique port/device per read and shows operational
+status, administrative status, speed and last-polled time. Full-layout monitoring outages
+are explicit **Unavailable** readings, not a healthy fallback; missing links are **Not linked**.
+Interface/device mismatches still fail the read. Reload or **Refresh layout and status**
+fetches again; no background portal polling or operational persistence is added.
+
+Approval is bound to the exact pairing credential, source profile and database/mapping
+fingerprint. Re-pairing, changing the database/mapping, or disabling the profile requires
+fresh consent. **Stop own-company browsing** immediately denies further reads; stopped
+reads cannot finish enrichment with a successful response. Re-approval rotates the grant
+and owner resource-ID namespace, so old links cannot be silently rebound. A pairing
+supports up to 100 explicitly enabled databases.
+
+Owner and partner requests have separate strict contracts and namespaces. The portal
+derives an owner's tenant/connector from authenticated company membership; an incoming
+partner cannot select an owner bypass. A live, owner-only source catalog advertises only
+approved profile IDs, grant IDs and labels; it never includes database credentials or
+connection details. Catalogs and operational responses are not persisted by the portal.
+
+#### Live reader operation
+
+`ocp serve` starts a live-reader task alongside its existing heartbeat. The standalone
+`ocp run-portal-agent` also serves requests, while `--once` still sends only a heartbeat.
+Do not run two agents for one pairing file. No public inbound listener is required.
+Update both apps; no new environment variables are needed. The reader uses the
+existing private pairing credential and portal CA configuration, never the source
+database/Observium credentials as portal credentials.
+
+V1 requires **one portal worker/replica** because pending requests/results live only
+in the portal process's memory. A shared PostgreSQL database does not share this
+broker. Run one Uvicorn worker (no `WEB_CONCURRENCY>1`) and keep machine clocks
+synchronized. Portal restart/disconnection makes in-flight requests fail; no old
+record cache is substituted.
+
+Recipients can use **Browse Data → Shared with my company**, or **Permissions →
+Browse circuits**; the JSON links/APIs remain available.
+Partner reads support only `circuits.list` and `circuits.read`, scoped to the exact
+owner, recipient, connector, approved policy revision and source fingerprint.
+Listings use parameterized billing-company filters, stable source-ID ordering,
+1–100-row pages and a next offset (maximum request offset 999900). Detail IDs come
+from those lists and use a source-profile/mapping namespace, independent of legacy
+direct-OAuth IDs. The source database remains read-only.
+
+The endpoint renderer is reused, then projected onto a strict live response:
+circuit metadata, A/Z port/device identities and linked monitoring only. No raw
+rows, credentials, management addresses, unrelated devices, arbitrary SQL or writes
+can be requested. Monitoring failure is Unavailable, never a healthy fallback.
+Ownership and approval are rechecked after enrichment so a transfer or local stop
+during a read cannot release the old circuit response.
+
+The portal holds a waiting HTTP request for at most 20 seconds. The connector
+long-polls outbound for at most 5 seconds at a time; requests expire, results are
+single-use and bounded to 1 MiB, and revoked/obsolete results are discarded.
+Operational payloads are not stored in either metadata database or application
+logs. Only opaque/source-ID mappings and request/outcome audit metadata persist.
+Private-network HTTP test mode also exposes these responses without encryption.
 
 In the hosted portal, sign in as your **organization admin**, open **Connector**,
 and generate a pairing code. Platform owners create client organizations but do
@@ -454,6 +601,9 @@ session hashes, partner grants, configuration and audit events.
   indicates when more exist; it does not persist company records, create partners,
   or grant access. Missing mappings and database failures are shown explicitly,
   with failures recorded in Diagnostics without company records.
+  **Portal company-sharing approvals** lists the exact received revisions. Propose
+  sharing in the portal; select and approve a mapped local company here, or stop
+  an existing approval immediately. The next heartbeat reports the decision.
   Provision direct inbound partners after confirming bilateral
   approval out of band. Select scopes and specific opaque resource IDs, or
   explicitly opt in to all resources for those scopes. Client secrets appear
@@ -554,9 +704,10 @@ file. `ocp serve` defaults its UI origin to `http://127.0.0.1:8000`, or the chos
 port; `--base-url`/`OCP_ADMIN_BASE_URL` override it. The issuer remains the OAuth
 token issuer and does not need changing just to use an SSH tunnel for the UI.
 
-The hosted portal connection still supports **pairing and heartbeats only**.
-Live portal resource retrieval, remote commands, and portal/connector grant
-synchronization are not implemented. Remote portal pairing requires HTTPS and
+The hosted portal connection supports **pairing, heartbeats, company-policy
+approval synchronization and live own-company/partner circuit list/endpoint/status requests**.
+Remote management commands are not implemented; legacy explicit share metadata is not converted into direct
+OAuth grants. Remote portal pairing requires HTTPS and
 certificate trust, except for the explicit private-IP HTTP testing opt-in above. Direct partner
 sharing and outbound partner browsing are independent of the hosted portal.
 

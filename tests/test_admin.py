@@ -24,7 +24,10 @@ BASE = "http://127.0.0.1:8000"
 
 
 @pytest.fixture
-def admin(tmp_path: Path):
+def admin(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "open_carrier_portal.admin.serve_live_request", lambda *args, **kwargs: False
+    )
     settings = Settings(
         database_path=tmp_path / "metadata.db",
         issuer_url="http://localhost:8000",
@@ -94,6 +97,101 @@ def company_source(admin, tmp_path):
         ),
     )
     return database
+
+
+def test_portal_company_approval_requires_live_mapped_company_consent_and_csrf(
+    admin, company_source
+):
+    from open_carrier_portal.company_policies import CompanyPolicy, PolicySnapshot
+
+    app, _, connection_file = admin
+    repo = app.state.repository
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        post(client, "identity", name="Owner")
+        portal = PortalConnection(
+            "https://portal.example",
+            repo.get_connector_identity().connector_id,
+            str(uuid4()),
+            "t" * 64,
+        )
+        connection_file.touch(mode=0o600)
+        connection_file.write_text(
+            json.dumps(
+                {
+                    "portal_url": portal.portal_url,
+                    "connector_id": portal.connector_id,
+                    "organization_id": portal.organization_id,
+                    "token": portal.token,
+                }
+            )
+        )
+        policy = CompanyPolicy(
+            policy_id=uuid4(),
+            revision=1,
+            owner_organization_id=portal.organization_id,
+            recipient_organization_id=uuid4(),
+            recipient_name="Recipient <Carrier>",
+            connector_id=portal.connector_id,
+            state="pending",
+        )
+        repo.synchronize_portal_policies(portal, PolicySnapshot(version=1, policies=[policy]))
+        page = client.get("/admin/partners?profile=customer-db")
+        assert "Recipient &lt;Carrier&gt;" in page.text
+        assert "Recipient <Carrier>" not in page.text
+        assert "Approve company link and circuit policy" in page.text
+        data = {
+            "policy": f"{policy.policy_id}@1",
+            "profile": "customer-db",
+            "company": "42",
+            "consent": "yes",
+        }
+        assert (
+            client.post(
+                "/admin/approve-company-policy",
+                data={
+                    **data,
+                    "csrf": "invalid",
+                },
+            ).status_code
+            == 403
+        )
+        assert post(client, "approve-company-policy", **(data | {"consent": ""})).status_code == 400
+        assert post(client, "approve-company-policy", **data).status_code == 400
+        profile = repo.get_source_database_profile("customer-db")
+        mapping = json.loads(profile.mapping_json)
+        mapping["resources"]["circuits"] = {
+            "table": "circuits",
+            "columns": {"source_id": "id", "billing_company_id": "customer"},
+        }
+        with sqlite3.connect(company_source) as db:
+            db.execute("CREATE TABLE circuits (id INTEGER PRIMARY KEY, customer INTEGER)")
+        repo.put_source_database_profile(
+            name=profile.name,
+            driver="sqlite",
+            host=None,
+            port=None,
+            database_name=str(company_source),
+            username=None,
+            password_env_var=None,
+            tls_ca_path=None,
+            timeout_seconds=10,
+            mapping_json=json.dumps(mapping),
+        )
+        assert (
+            post(client, "approve-company-policy", **(data | {"company": "missing"})).status_code
+            == 400
+        )
+        approved = post(client, "approve-company-policy", **data)
+        assert approved.status_code == 200
+        assert repo.portal_policy_receipts(portal)[0].source_company_id == "42"
+        assert "Approved locally; waiting" in client.get("/admin/partners?profile=customer-db").text
+        assert post(client, "stop-company-policy", policy=str(policy.policy_id)).status_code == 200
+        assert repo.portal_policy_receipts(portal)[0].state == "needs_approval"
+        assert repo.administration_snapshot()["partners"] == []
+        assert repo.administration_snapshot()["grants"] == []
+        audit = app.state.admin_store.recent_audit()
+        assert any(str(policy.policy_id) in event["operation"] for event in audit)
 
 
 def test_partners_displays_companies_from_selected_saved_mapping(admin, company_source):
@@ -786,6 +884,50 @@ def test_mapper_and_readiness_agree_on_required_relationships(admin, tmp_path, m
             assert "ports.observium_id" in readiness.text
 
 
+def test_background_live_reader_uses_service_pairing_and_stops_with_app(admin, monkeypatch):
+    import threading
+
+    from open_carrier_portal.models import ConnectorIdentity
+
+    app, _, connection_file = admin
+    identity = ConnectorIdentity(
+        organization_id=str(uuid4()),
+        organization_name="Local company",
+        connector_id=str(uuid4()),
+        issuer_url=BASE,
+    )
+    app.state.repository.put_connector_identity(identity)
+    connection_file.touch(mode=0o600)
+    connection_file.write_text(
+        json.dumps(
+            {
+                "portal_url": "https://portal.example",
+                "organization_id": str(uuid4()),
+                "connector_id": identity.connector_id,
+                "token": "t" * 64,
+            }
+        )
+    )
+    calls = []
+    seen = threading.Event()
+    monkeypatch.setattr("open_carrier_portal.admin.send_heartbeat", lambda *args, **kwargs: None)
+
+    def serve(client, connection, **kwargs):
+        assert connection.connector_id == identity.connector_id
+        assert kwargs["repository"] is app.state.repository
+        assert kwargs["settings_loader"]().database_path == app.state.repository._database_path
+        calls.append(connection.connector_id)
+        seen.set()
+        return False
+
+    monkeypatch.setattr("open_carrier_portal.admin.serve_live_request", serve)
+    with TestClient(app, base_url=BASE):
+        assert seen.wait(2)
+    count = len(calls)
+    time.sleep(0.3)
+    assert len(calls) == count
+
+
 def test_combined_connector_admin_api_and_lifespan(admin, monkeypatch):
     import threading
     from unittest.mock import AsyncMock, MagicMock
@@ -891,7 +1033,10 @@ def test_pairing_heartbeat_and_local_disconnect(admin, monkeypatch, portal_url, 
         requests.append(request.url.path)
         if request.url.path.endswith("/pair"):
             return httpx.Response(200, json={"organization_id": organization, "token": "t" * 64})
-        return httpx.Response(200, json={"status": "connected"})
+        assert json.loads(request.content)["policy_version"] == 1
+        return httpx.Response(
+            200, json={"status": "connected", "company_policies": {"version": 1, "policies": []}}
+        )
 
     def client_for(ca=""):
         cas.append(ca)

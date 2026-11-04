@@ -146,7 +146,9 @@ class CircuitDevice(BaseModel):
     company: CircuitCompany | None = None
     site: CircuitSite | None = None
     rack_units: list[CircuitRackUnit] = Field(default_factory=list)
-    monitoring_state: Literal["available", "not_linked", "not_configured"] = "not_linked"
+    monitoring_state: Literal["available", "not_linked", "not_configured", "unavailable"] = (
+        "not_linked"
+    )
     monitoring: CircuitDeviceStatus | None = None
 
 
@@ -170,7 +172,9 @@ class CircuitPort(BaseModel):
     device: CircuitDevice | None = None
     owner_company: CircuitCompany | None = None
     connector_type: str | None = None
-    monitoring_state: Literal["available", "not_linked", "not_configured"] = "not_linked"
+    monitoring_state: Literal["available", "not_linked", "not_configured", "unavailable"] = (
+        "not_linked"
+    )
     monitoring: CircuitPortStatus | None = None
 
 

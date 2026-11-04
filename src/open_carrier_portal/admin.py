@@ -25,6 +25,8 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from open_carrier_portal.admin_store import ADMIN_SESSION_IDLE_SECONDS, AdminStore
+from open_carrier_portal.company_access import approve_company_policy
+from open_carrier_portal.company_policies import POLICY_LEASE_SECONDS
 from open_carrier_portal.config import Settings, is_private_network_host, validate_connector_url
 from open_carrier_portal.diagnostics import (
     configure_logging,
@@ -37,11 +39,13 @@ from open_carrier_portal.diagnostics import (
 )
 from open_carrier_portal.errors import ConnectorError, SourceDatabaseError
 from open_carrier_portal.models import ConnectorIdentity
+from open_carrier_portal.owner_access import approve_owner_source
 from open_carrier_portal.portal_agent import (
     DEFAULT_CONNECTION_FILE,
     PortalConnection,
     pair_portal,
     send_heartbeat,
+    serve_live_request,
     validate_portal_url,
 )
 from open_carrier_portal.repository import Repository, SourceDatabaseProfile
@@ -58,6 +62,7 @@ from open_carrier_portal.source_credentials import save_password
 from open_carrier_portal.source_database import (
     ResourceMapping,
     SourceMapping,
+    configured_profile_database,
     configured_source_database,
 )
 
@@ -146,20 +151,7 @@ def source_for(
     profile = repository.get_source_database_profile(name)
     if profile is None or not profile.enabled:
         raise ValueError("enabled source profile not found")
-    return configured_source_database(
-        driver=profile.driver,
-        host=profile.host,
-        port=profile.port,
-        database_name=profile.database_name,
-        username=profile.username,
-        password_env_var=profile.password_env_var,
-        tls_ca_path=profile.tls_ca_path,
-        allow_insecure=profile.allow_insecure,
-        timeout_seconds=profile.timeout_seconds,
-        mapping_json=mapping.to_json() if mapping is not None else profile.mapping_json,
-        environment=os.environ,
-        metadata_path=metadata_path,
-    )
+    return configured_profile_database(profile, metadata_path, mapping)
 
 
 def http_client(ca: str = "") -> httpx.Client:
@@ -230,7 +222,12 @@ def create_admin_app(
         ):
             raise ValueError("portal connection does not match enabled connector identity")
         with http_client(portal_ca()) as client:
-            send_heartbeat(client, connection, allow_insecure_http=settings.allow_insecure_http)
+            send_heartbeat(
+                client,
+                connection,
+                allow_insecure_http=settings.allow_insecure_http,
+                repository=repository,
+            )
         store.save("heartbeat", {"seen": str(time.time())})
 
     async def agent_loop() -> None:
@@ -246,9 +243,42 @@ def create_admin_app(
                     )
             await asyncio.sleep(30)
 
+    def serve_live() -> None:
+        if not connection_file.exists() or not store.get("heartbeat").get("seen"):
+            return
+        connection = PortalConnection.load(
+            connection_file, allow_insecure_http=settings.allow_insecure_http
+        )
+        identity = repository.get_connector_identity()
+        if (
+            identity is None
+            or not identity.enabled
+            or identity.connector_id != connection.connector_id
+        ):
+            raise ValueError("live requests require an enabled paired connector identity")
+        with http_client(portal_ca()) as client:
+            serve_live_request(
+                client,
+                connection,
+                repository=repository,
+                settings=settings,
+                settings_loader=lambda: configured_settings(settings, store),
+            )
+
+    async def live_loop() -> None:
+        while True:
+            with log_context(store):
+                try:
+                    await run_in_threadpool(serve_live)
+                except (ValueError, OSError, httpx.HTTPError) as exc:
+                    log_failure("portal", "live.transport_failed", exc)
+                    await asyncio.sleep(5)
+            await asyncio.sleep(0.25)
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         task = asyncio.create_task(agent_loop())
+        live_task = asyncio.create_task(live_loop())
         log_event(
             "app", "service.started", "Connector administration service started.", store=store
         )
@@ -257,8 +287,11 @@ def create_admin_app(
         finally:
             log_event("app", "service.stopping", "Connector service is stopping.", store=store)
             task.cancel()
+            live_task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+            with suppress(asyncio.CancelledError):
+                await live_task
 
     app = FastAPI(title="Carrier Connector Administration", lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=[parsed.hostname])
@@ -488,7 +521,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             f"<button>{escape(button)}</button></form>"
         )
 
-    def company_directory(selected_profile: str, profiles: list[dict[str, str]]) -> str:
+    def company_directory(selected_profile: str, profiles: list[dict[str, str]], csrf: str) -> str:
         name = (
             selected_profile
             or settings.source_database_profile
@@ -544,6 +577,55 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         )
         if not rows:
             return content + "<p>No companies were returned by the saved Companies mapping.</p>"
+        approval = ""
+        if connection_file.exists():
+            try:
+                portal = PortalConnection.load(
+                    connection_file, allow_insecure_http=settings.allow_insecure_http
+                )
+                proposals = [
+                    local
+                    for local in repository.list_portal_policies(portal)
+                    if local.policy.state in {"pending", "needs_approval"}
+                    and not local.was_approved
+                    and time.time() - local.synced_at <= POLICY_LEASE_SECONDS
+                ]
+            except (ValueError, OSError) as exc:
+                log_failure("portal", "policies.load_failed", exc)
+                return content + (
+                    '<p role="alert">Cannot load portal approvals. Check Carrier Portal '
+                    'pairing and <a href="/admin/diagnostics">Diagnostics</a>.</p>'
+                )
+            if proposals:
+                approval = form(
+                    "approve-company-policy",
+                    csrf,
+                    f'<input type="hidden" name="profile" value="{escape(name)}">'
+                    '<label>Portal sharing proposal<select name="policy">'
+                    + "".join(
+                        f'<option value="{local.policy.policy_id}@{local.policy.revision}">'
+                        f"{escape(local.policy.recipient_name)} - revision "
+                        f"{local.policy.revision} - "
+                        + (
+                            "FULL LAYOUT"
+                            if local.policy.visibility == "full_shared_path" else "endpoints"
+                        )
+                        + "</option>"
+                        for local in proposals
+                    )
+                    + "</select></label>"
+                    + field("company", "Company ID from this database")
+                    + '<label><input type="checkbox" name="consent" value="yes" required>'
+                    "Approve this company's current and future billed circuits, endpoints "
+                    "and linked monitoring status for the selected portal recipient.</label>"
+                    '<label><input type="checkbox" name="layout_consent" value="yes">'
+                    "For a FULL LAYOUT proposal, also approve all intermediate ports, patches, "
+                    "pseudowires and their device/rack/site context and Observium status. "
+                    "This does not grant independent inventory browsing.</label>"
+                    "<p>The ID is validated against this database; a company name is never "
+                    "used as identity. Approval grants no independent device/port access.</p>",
+                    "Approve company link and circuit policy",
+                )
         return (
             content
             + (
@@ -561,7 +643,71 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     for row in rows[:100]
                 ]
             )
+            + approval
         )
+
+    def portal_policy_content(csrf: str) -> str:
+        content = (
+            "<h3>Portal company-sharing approvals</h3>"
+            "<p>Manage proposals and revocation in Carrier Portal &rarr; Permissions. "
+            "Here the data owner selects and approves the database company, or stops sharing. "
+            "Source records stay in your database. Approved partner circuit lists and "
+            "endpoint/status reads are available through the portal's live JSON APIs.</p>"
+        )
+        if not connection_file.exists():
+            return content + '<p><a href="/admin/portal">Pair Carrier Portal</a> first.</p>'
+        try:
+            portal = PortalConnection.load(
+                connection_file, allow_insecure_http=settings.allow_insecure_http
+            )
+            policies = repository.list_portal_policies(portal)
+        except (ValueError, OSError) as exc:
+            log_failure("portal", "policies.load_failed", exc)
+            return content + (
+                '<p role="alert">Cannot load sharing approvals. Check Carrier Portal '
+                'pairing and <a href="/admin/diagnostics">Diagnostics</a>.</p>'
+            )
+        if not policies:
+            return content + (
+                "<p>No proposals received. Propose sharing on the portal, then "
+                '<a href="/admin/portal">Check connection</a> or wait for the next heartbeat.</p>'
+            )
+        for local in policies:
+            policy = local.policy
+            state = (
+                "Offline - approval cannot authorize requests"
+                if time.time() - local.synced_at > POLICY_LEASE_SECONDS
+                else (
+                    "Approved locally; waiting for portal acknowledgement"
+                    if local.receipt and policy.state != "active"
+                    else policy.state
+                )
+            )
+            if local.was_approved and local.receipt is None and policy.state != "revoked":
+                state += " - stopped or mapping changed; new approval required"
+            elif policy.state == "active" and local.receipt is None:
+                state = "No local approval - request a new revision in the portal"
+            view_label = (
+                "Full circuit layout"
+                if policy.visibility == "full_shared_path" else "Endpoints only"
+            )
+            content += (
+                f"<h4>{escape(policy.recipient_name)} - revision {policy.revision}</h4>"
+                f"<p>{escape(state)} &mdash; "
+                f"{view_label}</p>"
+            )
+            if local.receipt:
+                content += (
+                    f"<p>Database profile ID: {escape(local.receipt.source_profile_id)}; "
+                    f"company ID: {escape(local.receipt.source_company_id)}</p>"
+                )
+                content += form(
+                    "stop-company-policy",
+                    csrf,
+                    f'<input type="hidden" name="policy" value="{policy.policy_id}">',
+                    "Stop sharing immediately",
+                )
+        return content
 
     def render(section: str, csrf: str, selected_profile: str = "") -> str:
         identity = repository.get_connector_identity()
@@ -637,7 +783,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     "good" if connected else "attention" if paired and portal.get("error") else "",
                     "Link this connector to your company account with a one-time pairing code. "
                     "Not required for direct partner sharing. Currently provides registration "
-                    "and online status only.",
+                    "and online status, plus owner-approved company policy synchronization.",
                     "View portal connection" if paired else "Connect to Carrier Portal",
                 ),
             )
@@ -696,13 +842,15 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             )
         if section == "portal":
             paired = connection_file.exists()
+            portal = None
             portal_url = settings.portal_url
             connection_error = ""
             if paired:
                 try:
-                    portal_url = PortalConnection.load(
+                    portal = PortalConnection.load(
                         connection_file, allow_insecure_http=settings.allow_insecure_http
-                    ).portal_url
+                    )
+                    portal_url = portal.portal_url
                 except (ValueError, OSError) as exc:
                     log_failure("portal", "saved_connection.failed", exc)
                     connection_error = (
@@ -771,6 +919,68 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 if paired
                 else "Your connector has not been linked to a Carrier Portal account."
             )
+            owner_sources = (
+                "<section><h2>My company inventory in Carrier Portal</h2>"
+                "<p>Explicitly enable each database your portal company users may browse. "
+                "This exposes its full circuit inventory, including circuits billed to partners, "
+                "with endpoint details and linked monitoring only. It does not grant partners "
+                "any additional access. No raw tables, private management fields or writes.</p>"
+            )
+            if (
+                portal is not None
+                and identity is not None
+                and identity.enabled
+                and identity.connector_id == portal.connector_id
+            ):
+                enabled = repository.list_portal_owner_sources(portal)
+                options = "".join(
+                    f'<option value="{escape(p["name"])}">{escape(p["name"])}</option>'
+                    for p in snapshot["profiles"]
+                    if p["enabled"] == "1"
+                )
+                owner_sources += form(
+                    "enable-owner-source",
+                    csrf,
+                    '<label>Database<select name="profile" required>'
+                    + options
+                    + "</select></label>"
+                    '<label><input type="checkbox" name="consent" value="yes" required>'
+                    "I approve full circuit inventory access for our portal company users."
+                    "</label>"
+                    '<label><input type="checkbox" name="explorer_consent" value="yes">'
+                    "Also enable our company hierarchy explorer: sites, racks, devices, ports, "
+                    "company relationships and related circuits (read-only safe fields)."
+                    "</label>"
+                    '<label><input type="checkbox" name="layout_consent" value="yes">'
+                    "Also enable full circuit layouts: intermediate ports, patches, pseudowires "
+                    "and linked Observium status (read-only safe fields).</label>"
+                    "<p>Existing circuit-only approvals do not enable these broader views. "
+                    "Re-pairing, disabling or changing the database/mapping requires "
+                    "fresh approval. Up to 100 databases per pairing.</p>",
+                    "Enable own-company browsing",
+                )
+                for source in enabled:
+                    owner_sources += (
+                        f"<p><strong>{escape(source.name)}</strong> &mdash; enabled"
+                        + (" with full circuit layouts" if source.layout_enabled else "")
+                        + (
+                            " with hierarchy explorer</p>"
+                            if source.explorer_enabled
+                            else " (circuits only)</p>"
+                        )
+                        + form(
+                            "stop-owner-source",
+                            csrf,
+                            '<input type="hidden" name="profile_id" '
+                            f'value="{source.source_profile_id}">',
+                            "Stop own-company browsing",
+                        )
+                    )
+                if not enabled:
+                    owner_sources += "<p>No databases enabled for own-company browsing.</p>"
+            else:
+                owner_sources += "<p>Pair an enabled connector before approving a database.</p>"
+            owner_sources += "</section>"
             return (
                 '<p class="portal-intro">Link this connector to your company&rsquo;s '
                 "Carrier Portal account in three simple steps. "
@@ -809,8 +1019,10 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 "<p>Your database password and monitoring credentials stay on "
                 "this connector. They are not sent to Carrier Portal.</p>"
                 '<p class="portal-note"><strong>Available today:</strong> connector '
-                "registration and online status. Live data retrieval and sharing-permission "
-                "synchronization are not available yet.</p></aside></div>"
+                "registration, online status and company-policy approval synchronization. "
+                'Approve proposals on <a href="/admin/partners">Partners</a>. '
+                "Approved partner circuit lists and endpoint/status reads are available live "
+                "through the portal's Browse Data interface.</p></aside></div>" + owner_sources
             )
         if section in {"sources", "mapping"}:
             name = (
@@ -1062,7 +1274,8 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             )
         if section == "partners":
             return (
-                company_directory(selected_profile, snapshot["profiles"])
+                portal_policy_content(csrf)
+                + company_directory(selected_profile, snapshot["profiles"], csrf)
                 + "<h3>Partner access</h3>"
                 "<p>Partners query this connector without the portal. Confirm bilateral consent "
                 "out of band. Grants with no resource IDs cover ALL resources in that scope.</p>"
@@ -1248,6 +1461,68 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             if connection_file.exists():
                 connection_file.unlink()
             store.save("heartbeat", {})
+        elif action in {"enable-owner-source", "stop-owner-source"}:
+            portal = PortalConnection.load(
+                connection_file, allow_insecure_http=settings.allow_insecure_http
+            )
+            if action == "enable-owner-source":
+                if text(data, "consent", required=False) != "yes":
+                    raise ValueError("explicit owner approval is required")
+                approve_owner_source(
+                    repository,
+                    portal,
+                    metadata_path=settings.database_path,
+                    profile_name=text(data, "profile"),
+                    approved_by=username,
+                    explorer_enabled=text(data, "explorer_consent", required=False) == "yes",
+                    layout_enabled=text(data, "layout_consent", required=False) == "yes",
+                )
+            else:
+                repository.stop_portal_owner_source(
+                    portal, source_profile_id=text(data, "profile_id")
+                )
+            store.audit(username, action)
+            return (
+                "<p>Own-company inventory access updated. Stopped access is denied immediately.</p>"
+                '<p><a href="/admin/portal">Back to Carrier Portal connection</a></p>'
+            )
+        elif action in {"approve-company-policy", "stop-company-policy"}:
+            portal = PortalConnection.load(
+                connection_file, allow_insecure_http=settings.allow_insecure_http
+            )
+            identity = repository.get_connector_identity()
+            if (
+                identity is None
+                or not identity.enabled
+                or identity.connector_id != portal.connector_id
+            ):
+                raise ValueError("an enabled paired connector identity is required")
+            if action == "stop-company-policy":
+                policy_id = text(data, "policy")
+                repository.stop_portal_policy(portal, policy_id=policy_id)
+            else:
+                if text(data, "consent", required=False) != "yes":
+                    raise ValueError("explicit owner approval is required")
+                policy_id, separator, revision = text(data, "policy").partition("@")
+                if not separator:
+                    raise ValueError("select a versioned portal policy")
+                approve_company_policy(
+                    repository,
+                    portal,
+                    metadata_path=settings.database_path,
+                    policy_id=policy_id,
+                    revision=int(revision),
+                    profile_name=text(data, "profile"),
+                    company_id=text(data, "company"),
+                    approved_by=username,
+                    layout_consent=text(data, "layout_consent", required=False) == "yes",
+                )
+            store.audit(username, f"{action}:{policy_id}")
+            return (
+                "<p>Company sharing decision saved. A stopped policy is denied immediately. "
+                "The next heartbeat reports the decision to the portal.</p>"
+                '<p><a href="/admin/partners">Back to Partners</a></p>'
+            )
         elif action in {
             "source",
             "test-connection",

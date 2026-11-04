@@ -5,12 +5,17 @@ from typing import Any, Literal
 from starlette.concurrency import run_in_threadpool
 
 from open_carrier_portal.adapters.base import MonitoringAdapter
+from open_carrier_portal.diagnostics import log_failure
 from open_carrier_portal.errors import (
     ConfigurationError,
+    ConnectorError,
     IntegrationUnavailableError,
+    RateLimitError,
+    ResourceNotFoundError,
     SourceDatabaseError,
     SourceDatabaseUnavailableError,
     UpstreamResponseError,
+    UpstreamTimeoutError,
 )
 from open_carrier_portal.models import (
     CircuitCompany,
@@ -63,10 +68,16 @@ class CircuitReader:
         repository: Repository,
         source: SourceDatabase,
         monitoring: MonitoringAdapter | None,
+        *,
+        integration: str = "nettool",
+        monitoring_required: bool = True,
     ) -> None:
         self.repository = repository
         self.source = source
         self.monitoring = monitoring
+        self.integration = integration
+        self.monitoring_required = monitoring_required
+        self._monitoring_unavailable = False
         self._ports: dict[str, CircuitPort] = {}
         self._devices: dict[str, CircuitDevice] = {}
         self._sites: dict[str, CircuitSite] = {}
@@ -74,6 +85,13 @@ class CircuitReader:
         self._endpoint_sites: tuple[CircuitSite, CircuitSite] | None = None
         self._rows_read = 0
         self._omitted: set[str] = set()
+
+    def _monitoring_failed(self, exc: ConnectorError) -> None:
+        if self.monitoring_required:
+            raise exc
+        log_failure("observium", "circuit.status_unavailable", exc)
+        if isinstance(exc, (IntegrationUnavailableError, UpstreamTimeoutError, RateLimitError)):
+            self._monitoring_unavailable = True
 
     @property
     def missing_fields(self) -> dict[str, list[str]]:
@@ -101,7 +119,7 @@ class CircuitReader:
             )
 
     def public_id(self, kind: str, source_id: object) -> str:
-        return self.repository.ocp_resource_id("nettool", kind, str(source_id))
+        return self.repository.ocp_resource_id(self.integration, kind, str(source_id))
 
     async def rows(
         self,
@@ -243,15 +261,34 @@ class CircuitReader:
             )
             observed_id = row.get("observium_id")
             if observed_id is not None:
-                if self.monitoring is None:
-                    device = device.model_copy(update={"monitoring_state": "not_configured"})
+                if self.monitoring is None or self._monitoring_unavailable:
+                    device = device.model_copy(
+                        update={
+                            "monitoring_state": "unavailable"
+                            if self._monitoring_unavailable
+                            else "not_configured",
+                        }
+                    )
                 else:
                     public_id = self.repository.ocp_resource_id(
                         "observium",
                         "device",
                         str(observed_id),
                     )
-                    observed = await self.monitoring.get_device(public_id)
+                    try:
+                        observed = await self.monitoring.get_device(public_id)
+                    except (
+                        IntegrationUnavailableError,
+                        UpstreamTimeoutError,
+                        RateLimitError,
+                        ResourceNotFoundError,
+                        UpstreamResponseError,
+                    ) as exc:
+                        self._monitoring_failed(exc)
+                        self._devices[key] = device.model_copy(
+                            update={"monitoring_state": "unavailable"}
+                        )
+                        return self._devices[key]
                     if observed.id != public_id:
                         raise UpstreamResponseError("Monitoring returned a different device")
                     device = device.model_copy(
@@ -287,8 +324,14 @@ class CircuitReader:
             )
             observed_id = row.get("observium_id")
             if observed_id is not None:
-                if self.monitoring is None:
-                    port = port.model_copy(update={"monitoring_state": "not_configured"})
+                if self.monitoring is None or self._monitoring_unavailable:
+                    port = port.model_copy(
+                        update={
+                            "monitoring_state": "unavailable"
+                            if self._monitoring_unavailable
+                            else "not_configured",
+                        }
+                    )
                 else:
                     device_row = await self.reference("devices", row["device_id"])
                     assert device_row is not None
@@ -302,7 +345,20 @@ class CircuitReader:
                         "interface",
                         str(observed_id),
                     )
-                    observed = await self.monitoring.get_interface(public_id)
+                    try:
+                        observed = await self.monitoring.get_interface(public_id)
+                    except (
+                        IntegrationUnavailableError,
+                        UpstreamTimeoutError,
+                        RateLimitError,
+                        ResourceNotFoundError,
+                        UpstreamResponseError,
+                    ) as exc:
+                        self._monitoring_failed(exc)
+                        self._ports[key] = port.model_copy(
+                            update={"monitoring_state": "unavailable"}
+                        )
+                        return self._ports[key]
                     if observed.id != public_id:
                         raise UpstreamResponseError("Monitoring returned a different interface")
                     if observed.device_id != self.repository.ocp_resource_id(

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -31,6 +32,30 @@ _ENVIRONMENT_VARIABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESOURCE_TYPES = tuple(SOURCE_RESOURCES)
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _SCHEMA_DISCOVERY_LIMIT = 50_000
+
+if TYPE_CHECKING:
+    from open_carrier_portal.repository import SourceDatabaseProfile
+
+
+def configured_profile_database(
+    profile: SourceDatabaseProfile, metadata_path: Path, mapping: SourceMapping | None = None
+) -> SourceDatabase:
+    if not profile.enabled:
+        raise ConfigurationError("enabled source profile not found")
+    return configured_source_database(
+        driver=profile.driver,
+        host=profile.host,
+        port=profile.port,
+        database_name=profile.database_name,
+        username=profile.username,
+        password_env_var=profile.password_env_var,
+        tls_ca_path=profile.tls_ca_path,
+        allow_insecure=profile.allow_insecure,
+        timeout_seconds=profile.timeout_seconds,
+        mapping_json=mapping.to_json() if mapping is not None else profile.mapping_json,
+        environment=os.environ,
+        metadata_path=metadata_path,
+    )
 
 
 def _identifier(value: str, field_name: str) -> str:
@@ -695,6 +720,160 @@ class SourceDatabase:
             order_by=order_by,
         )
 
+    def fetch_by_ids(self, resource_type: str, identifiers: list[str]) -> list[dict[str, Any]]:
+        if not identifiers or len(identifiers) > 100:
+            raise ConfigurationError("reference reads require between 1 and 100 identifiers")
+        if resource_type not in self._mapping.resources:
+            raise ConfigurationError(f"no mapping configured for {resource_type}")
+        mapping = self._mapping.resources[resource_type]
+        if "source_id" not in mapping.columns:
+            raise ConfigurationError("reference reads require a mapped source ID")
+        self._validate_join_targets(mapping)
+        base = self._compile_select(resource_type, 1, paginate=False)[0]
+        placeholder = "?" if self._settings.driver == "sqlite" else "%s"
+        key = self._quote("source_id", "mapping field")
+        sql = (
+            f"SELECT * FROM ({base}) AS related WHERE {key} IN "
+            f"({', '.join(placeholder for _ in identifiers)}) LIMIT {placeholder}"
+        )
+        try:
+            with self._cursor() as cursor:
+                cursor.execute(sql, (*identifiers, len(identifiers) + 1))
+                rows = [dict(row) for row in cursor.fetchall()]
+        except SourceDatabaseUnavailableError:
+            raise
+        except (sqlite3.Error, pymysql.MySQLError) as exc:
+            log_failure("database", "query.failed", exc, driver=self.driver)
+            raise SourceDatabaseQueryError("Mapped reference records could not be read") from exc
+        if len({str(row["source_id"]) for row in rows}) != len(rows):
+            raise SourceDatabaseQueryError("Mapped reference identifiers must be unique")
+        return rows
+
+    def fetch_page(
+        self, resource_type: str, filters: Mapping[str, object], *, offset: int, limit: int
+    ) -> list[dict[str, Any]]:
+        if not filters or resource_type not in self._mapping.resources:
+            raise ConfigurationError("a mapped resource and scoped filters are required")
+        mapping = self._mapping.resources[resource_type]
+        if set(filters) - set(mapping.columns) or "source_id" not in mapping.columns:
+            raise ConfigurationError("pagination requires mapped filters and source ID")
+        if not 0 <= offset <= 999_900 or not 1 <= limit <= 100:
+            raise ConfigurationError("source page bounds are invalid")
+        return self._select(
+            resource_type, limit, filters=filters, order_by="source_id", offset=offset
+        )
+
+    def fetch_inventory_page(
+        self, resource_type: str, *, offset: int, limit: int
+    ) -> list[dict[str, Any]]:
+        if resource_type not in self._mapping.resources or "source_id" not in (
+            self._mapping.resources[resource_type].columns
+        ):
+            raise ConfigurationError(
+                "inventory pagination requires a mapped resource and source ID"
+            )
+        if not 0 <= offset <= 999_900 or not 1 <= limit <= 100:
+            raise ConfigurationError("source page bounds are invalid")
+        return self._select(resource_type, limit, order_by="source_id", offset=offset)
+
+    def fetch_explorer_page(
+        self,
+        resource_type: str,
+        *,
+        filters: Mapping[str, object] | None = None,
+        query: str = "",
+        related_port_id: object | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        if resource_type not in {"locations", "racks", "devices", "ports", "companies", "circuits"}:
+            raise ConfigurationError("unsupported explorer resource")
+        if not 0 <= offset <= 999_900 or not 1 <= limit <= 100 or len(query) > 120:
+            raise ConfigurationError("explorer query bounds are invalid")
+        if related_port_id is not None and resource_type != "circuits":
+            raise ConfigurationError("port membership applies only to circuits")
+
+        def mapped(resource: str) -> str:
+            if resource not in self._mapping.resources:
+                raise ConfigurationError(f"no mapping configured for {resource}")
+            self._validate_join_targets(self._mapping.resources[resource])
+            return self._compile_select(resource, 1, paginate=False)[0]
+
+        base = mapped(resource_type)
+        columns = self._mapping.resources[resource_type].columns
+        if "source_id" not in columns or set(filters or {}) - set(columns):
+            raise ConfigurationError("explorer requires mapped filters and source ID")
+
+        def quote(name: str) -> str:
+            return self._quote(name, "mapping field")
+
+        placeholder = "?" if self._settings.driver == "sqlite" else "%s"
+        conditions = [f"{quote(field)} = {placeholder}" for field in (filters or {})]
+        parameters: list[object] = list((filters or {}).values())
+        if query.strip():
+            fields = (
+                ("address1", "city", "state", "postal_code")
+                if resource_type == "locations"
+                else ("name",)
+            )
+            fields = tuple(field for field in fields if field in columns)
+            if not fields:
+                raise ConfigurationError("map display fields before searching this resource")
+            cast_type = "TEXT" if self._settings.driver == "sqlite" else "CHAR"
+            conditions.append(
+                "("
+                + " OR ".join(
+                    f"CAST({quote(field)} AS {cast_type}) LIKE {placeholder} ESCAPE '!'"
+                    for field in fields
+                )
+                + ")"
+            )
+            escaped = query.strip().replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            parameters.extend(["%" + escaped + "%"] * len(fields))
+        if related_port_id is not None:
+            if "circuit_layout_id" not in columns:
+                raise ConfigurationError("map the circuit layout reference for related circuits")
+            endpoints = mapped("circuit_layouts")
+            required = {"source_id", "port_a_id", "port_z_id"}
+            if not required <= set(self._mapping.resources["circuit_layouts"].columns):
+                raise ConfigurationError("map both circuit endpoint ports")
+            membership = (
+                f"SELECT {quote('source_id')} FROM ({endpoints}) AS endpoints "
+                f"WHERE {quote('port_a_id')} = {placeholder} "
+                f"OR {quote('port_z_id')} = {placeholder}"
+            )
+            parameters.extend([related_port_id, related_port_id])
+            if "circuit_layout_items" in self._mapping.resources:
+                if not {"circuit_layout_id", "item_type", "item_source_id"} <= set(
+                    self._mapping.resources["circuit_layout_items"].columns
+                ):
+                    raise ConfigurationError("complete the mapped circuit path membership fields")
+                route = mapped("circuit_layout_items")
+                membership += (
+                    f" UNION SELECT {quote('circuit_layout_id')} FROM ({route}) AS route "
+                    f"WHERE LOWER({quote('item_type')}) = 'port' "
+                    f"AND {quote('item_source_id')} = {placeholder}"
+                )
+                parameters.append(related_port_id)
+            conditions.append(f"{quote('circuit_layout_id')} IN ({membership})")
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        sql = (
+            f"SELECT * FROM ({base}) AS inventory{where} ORDER BY {quote('source_id')} "
+            f"LIMIT {placeholder} OFFSET {placeholder}"
+        )
+        try:
+            with self._cursor() as cursor:
+                cursor.execute(sql, (*parameters, limit + 1, offset))
+                rows = cursor.fetchall()
+        except SourceDatabaseUnavailableError:
+            raise
+        except (sqlite3.Error, pymysql.MySQLError) as exc:
+            log_failure("database", "query.failed", exc, driver=self.driver)
+            raise SourceDatabaseQueryError(
+                "The mapped explorer query could not be completed"
+            ) from exc
+        return [dict(row) for row in rows]
+
     def _select(
         self,
         resource_type: str,
@@ -702,11 +881,12 @@ class SourceDatabase:
         *,
         filters: Mapping[str, object] | None = None,
         order_by: str | None = None,
+        offset: int | None = None,
     ) -> list[dict[str, Any]]:
         try:
             self._validate_join_targets(self._mapping.resources[resource_type])
             query, parameters = self._compile_select(
-                resource_type, limit, filters=filters, order_by=order_by
+                resource_type, limit, filters=filters, order_by=order_by, offset=offset
             )
             with self._cursor() as cursor:
                 cursor.execute(query, parameters)
@@ -718,7 +898,7 @@ class SourceDatabase:
             raise SourceDatabaseQueryError(
                 f"The configured mapping for {resource_type} could not be queried"
             ) from exc
-        if filters and len(rows) > limit:
+        if offset is None and filters and len(rows) > limit:
             log_event(
                 "database",
                 "query.row_limit_exceeded",
@@ -740,6 +920,8 @@ class SourceDatabase:
         *,
         filters: Mapping[str, object] | None = None,
         order_by: str | None = None,
+        offset: int | None = None,
+        paginate: bool = True,
     ) -> tuple[str, tuple[object, ...]]:
         mapping = self._mapping.resources[resource_type]
 
@@ -774,10 +956,17 @@ class SourceDatabase:
         order_clause = (
             "" if order_by is None else f" ORDER BY {column_sql(mapping.columns[order_by])}"
         )
+        offset_clause = "" if offset is None else f" OFFSET {placeholder}"
+        if not paginate:
+            return f"SELECT {selected_columns} FROM {table}{where_clause}{order_clause}", parameters
         return (
             f"SELECT {selected_columns} FROM {table}{where_clause}{order_clause} "
-            f"LIMIT {placeholder}",
-            (*parameters, limit + 1 if filters else limit),
+            f"LIMIT {placeholder}{offset_clause}",
+            (
+                *parameters,
+                limit + 1 if filters or offset is not None else limit,
+                *((offset,) if offset is not None else ()),
+            ),
         )
 
     def _quote(self, value: str, field_name: str) -> str:
