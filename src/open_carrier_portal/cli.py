@@ -168,7 +168,7 @@ def _main(context: LogContext) -> None:
             ):
                 parser.error(
                     "use loopback with an SSH tunnel or HTTPS reverse proxy; direct private-IP "
-                    "testing requires OCP_ALLOW_INSECURE_HTTP=true and a matching --base-url"
+                    "testing requires OCP_TEST_MODE=true and a matching --base-url"
                 )
             try:
                 base_url = validate_connector_url(

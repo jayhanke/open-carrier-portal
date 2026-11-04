@@ -52,7 +52,7 @@ def test_portal_url_accepts_secure_or_loopback_origins(url: str) -> None:
 @pytest.mark.parametrize("host", ["10.210.4.224", "172.16.0.1", "192.168.1.1", "[fd00::1]"])
 def test_portal_private_http_requires_its_own_opt_in(host):
     url = f"http://{host}:8080"
-    with pytest.raises(ValueError, match="OCP_ALLOW_INSECURE_HTTP"):
+    with pytest.raises(ValueError, match="OCP_TEST_MODE"):
         validate_portal_url(url)
     assert validate_portal_url(url + "/", allow_insecure_http=True) == url
 
@@ -216,7 +216,7 @@ def test_cli_private_http_pairing_and_agent_honor_environment(tmp_path, monkeypa
     monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "s" * 48)
     monkeypatch.setenv("OCP_ISSUER_URL", "http://localhost:8000")
     monkeypatch.setenv("OCP_PORTAL_URL", "http://10.210.4.224:8080")
-    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setenv("OCP_TEST_MODE", "true")
     repo = Repository(metadata, "s" * 48)
     repo.initialize()
     repo.put_connector_identity(
@@ -260,9 +260,9 @@ def test_cli_private_http_pairing_and_agent_honor_environment(tmp_path, monkeypa
     main()
     assert requests == ["/api/connectors/pair", "/api/connectors/heartbeat"]
     monkeypatch.delenv("OCP_PORTAL_URL")
-    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "false")
+    monkeypatch.setenv("OCP_TEST_MODE", "false")
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 2
     assert len(requests) == 2
-    assert "OCP_ALLOW_INSECURE_HTTP" in capsys.readouterr().err
+    assert "OCP_TEST_MODE" in capsys.readouterr().err

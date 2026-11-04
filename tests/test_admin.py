@@ -493,7 +493,7 @@ def test_cli_password_reset_applies_to_running_private_http_app(tmp_path, monkey
     monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "s" * 48)
     monkeypatch.setenv("OCP_DATABASE_PATH", str(tmp_path / "metadata.db"))
     monkeypatch.setenv("OCP_ISSUER_URL", origin)
-    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setenv("OCP_TEST_MODE", "true")
     monkeypatch.setattr(cli, "getpass", lambda _: "original-password")
     monkeypatch.setattr("sys.argv", ["ocp", "create-admin", "--username", "admin"])
     cli.main()
@@ -1246,7 +1246,7 @@ def test_cli_private_network_testing_bind(tmp_path, monkeypatch, host, origin, a
 
     monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "s" * 48)
     monkeypatch.setenv("OCP_DATABASE_PATH", str(tmp_path / "metadata.db"))
-    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setenv("OCP_TEST_MODE", "true")
     monkeypatch.setattr("sys.argv", ["ocp", "serve", "--host", host, "--base-url", origin])
     started = []
     monkeypatch.setattr("uvicorn.run", lambda app, **options: started.append((app, options)))

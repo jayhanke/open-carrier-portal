@@ -46,7 +46,7 @@ def validate_connector_url(value: str, *, allow_insecure_http: bool = False) -> 
         return value.rstrip("/")
     raise ConfigurationError(
         "connector URL must use HTTPS outside localhost; trusted private-IP HTTP testing "
-        "requires OCP_ALLOW_INSECURE_HTTP=true"
+        "requires OCP_TEST_MODE=true"
     )
 
 
@@ -57,7 +57,7 @@ def validate_portal_url(value: str, *, allow_insecure_http: bool = False) -> str
         raise ValueError(
             "portal URL must be an HTTPS origin without credentials or a path "
             "(HTTP allowed on localhost; trusted private-IP HTTP testing requires "
-            "OCP_ALLOW_INSECURE_HTTP=true)"
+            "OCP_TEST_MODE=true)"
         ) from exc
 
 
@@ -146,7 +146,7 @@ class Settings:
             observium_ca_bundle=os.getenv("OCP_OBSERVIUM_CA_BUNDLE"),
             observium_timeout_seconds=_env_int("OCP_OBSERVIUM_TIMEOUT_SECONDS", 15, 1),
             source_database_profile=os.getenv("OCP_SOURCE_DB_PROFILE"),
-            allow_insecure_http=_env_bool("OCP_ALLOW_INSECURE_HTTP", False),
+            allow_insecure_http=_env_bool("OCP_TEST_MODE", False),
             portal_url=os.getenv("OCP_PORTAL_URL", "").strip().rstrip("/") or None,
             portal_ca_bundle=os.getenv("OCP_PORTAL_CA_BUNDLE", "").strip() or None,
         )

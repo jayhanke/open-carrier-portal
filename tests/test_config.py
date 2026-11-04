@@ -9,7 +9,7 @@ from open_carrier_portal.errors import ConfigurationError
 @pytest.mark.parametrize("host", ["10.210.4.223", "172.16.0.1", "192.168.1.1", "[fd00::1]"])
 def test_private_http_requires_explicit_opt_in(host):
     url = f"http://{host}:8000"
-    with pytest.raises(ConfigurationError, match="OCP_ALLOW_INSECURE_HTTP"):
+    with pytest.raises(ConfigurationError, match="OCP_TEST_MODE"):
         validate_connector_url(url)
     assert validate_connector_url(url, allow_insecure_http=True) == url
     with pytest.raises(ConfigurationError):
@@ -45,12 +45,12 @@ def test_http_opt_in_does_not_allow_public_or_invalid_origins(url):
 def test_http_opt_in_from_environment(monkeypatch):
     monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "s" * 48)
     monkeypatch.setenv("OCP_ISSUER_URL", "http://10.210.4.223:8000")
-    monkeypatch.delenv("OCP_ALLOW_INSECURE_HTTP", raising=False)
+    monkeypatch.delenv("OCP_TEST_MODE", raising=False)
     with pytest.raises(ConfigurationError):
         Settings.from_env()
-    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setenv("OCP_TEST_MODE", "true")
     assert Settings.from_env().allow_insecure_http
-    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "invalid")
+    monkeypatch.setenv("OCP_TEST_MODE", "invalid")
     with pytest.raises(ConfigurationError, match="must be true or false"):
         Settings.from_env()
 
@@ -63,25 +63,44 @@ def test_portal_configuration_from_environment(monkeypatch):
     assert settings.portal_url == "https://portal.example"
     assert settings.portal_ca_bundle == "trusted-portal-ca.pem"
     monkeypatch.setenv("OCP_PORTAL_URL", "http://10.210.4.224:8080")
-    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "false")
+    monkeypatch.setenv("OCP_TEST_MODE", "false")
     with pytest.raises(ConfigurationError, match="OCP_PORTAL_URL"):
         Settings.from_env()
-    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setenv("OCP_TEST_MODE", "true")
     monkeypatch.setenv("OCP_ISSUER_URL", "http://10.210.4.223:8000")
     settings = Settings.from_env()
     assert settings.portal_url == "http://10.210.4.224:8080"
     assert settings.issuer_url == "http://10.210.4.223:8000"
     assert settings.allow_insecure_http
-    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "invalid")
+    monkeypatch.setenv("OCP_TEST_MODE", "invalid")
     with pytest.raises(ConfigurationError, match="must be true or false"):
         Settings.from_env()
 
 
 def test_testing_mode_does_not_relax_observium_requirement(monkeypatch):
     monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "s" * 48)
-    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setenv("OCP_TEST_MODE", "true")
     monkeypatch.setenv("OCP_ISSUER_URL", "http://10.210.4.223:8000")
     assert Settings.from_env().allow_insecure_http
     monkeypatch.setenv("OCP_OBSERVIUM_BASE_URL", "http://10.210.4.224")
     with pytest.raises(ConfigurationError, match="OCP_OBSERVIUM_BASE_URL must use HTTPS"):
         Settings.from_env()
+
+
+@pytest.mark.parametrize("old_name", ["OCP_ALLOW_INSECURE_HTTP", "OCP_PORTAL_ALLOW_INSECURE_HTTP"])
+def test_only_test_mode_enables_private_http(monkeypatch, old_name):
+    monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "s" * 48)
+    monkeypatch.setenv("OCP_ISSUER_URL", "http://10.210.4.223:8000")
+    monkeypatch.setenv("OCP_PORTAL_URL", "http://10.210.4.224:8080")
+    monkeypatch.setenv(old_name, "true")
+    monkeypatch.delenv("OCP_TEST_MODE", raising=False)
+    with pytest.raises(ConfigurationError, match="OCP_TEST_MODE"):
+        Settings.from_env()
+    monkeypatch.setenv("OCP_TEST_MODE", "false")
+    with pytest.raises(ConfigurationError, match="OCP_TEST_MODE"):
+        Settings.from_env()
+    monkeypatch.setenv("OCP_TEST_MODE", "true")
+    monkeypatch.setenv(old_name, "false")
+    settings = Settings.from_env()
+    assert settings.allow_insecure_http
+    assert settings.portal_url == "http://10.210.4.224:8080"

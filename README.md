@@ -233,13 +233,13 @@ ocp run-portal-agent
 
 Use the portal's reachable HTTPS origin in production. Localhost HTTP is allowed
 for development on the same machine. For testing on a trusted private network,
-the single default-off `OCP_ALLOW_INSECURE_HTTP=true` testing-mode setting permits
+the single default-off `OCP_TEST_MODE=true` testing-mode setting permits
 private-IP HTTP for both the connector listener and portal pairing/heartbeats.
 It accepts literal RFC1918 IPv4 or ULA IPv6 addresses only:
 
 ```ini
 OCP_PORTAL_URL=http://10.210.4.224:8080
-OCP_ALLOW_INSECURE_HTTP=true
+OCP_TEST_MODE=true
 ```
 
 Set these in the connector service's environment and restart it before pairing.
@@ -254,6 +254,8 @@ Use this one flag for supported testing-mode behavior; there is no separate port
 testing flag. Set it in each service's environment when running both apps over
 private HTTP. It does not relax authentication, authorization, Observium or outbound
 partner connection requirements, or HTTPS certificate verification.
+When updating an existing test deployment, replace `OCP_ALLOW_INSECURE_HTTP` or
+`OCP_PORTAL_ALLOW_INSECURE_HTTP` with `OCP_TEST_MODE`; the old names no longer enable testing.
 The agent verifies TLS for HTTPS and does not
 follow redirects or use environment-provided proxies. The portal's organization
 association comes from the pairing code, not a user-supplied tenant ID; pairing
@@ -322,11 +324,11 @@ The legacy `ocp serve-admin` command now starts the same combined application,
 also on port 8000 by default.
 
 For temporary testing on a trusted private network only, explicitly set
-`OCP_ALLOW_INSECURE_HTTP=true` in the connector environment. This permits literal
+`OCP_TEST_MODE=true` in the connector environment. This permits literal
 RFC1918/ULA private IPs, not public IPs or arbitrary HTTP hostnames. For example:
 
 ```ini
-OCP_ALLOW_INSECURE_HTTP=true
+OCP_TEST_MODE=true
 OCP_ISSUER_URL=http://10.210.4.223:8000
 OCP_ADMIN_BASE_URL=http://10.210.4.223:8000
 ```
