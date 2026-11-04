@@ -412,6 +412,80 @@ def test_owner_layout_column_migration_keeps_old_approval_endpoint_only(live_sou
     assert migrated.grant_id == source.grant_id and not migrated.layout_enabled
 
 
+@pytest.mark.parametrize("audience", ["owner", "partner"])
+@pytest.mark.parametrize(
+    "behavior", ["null_zero", "zero_zero", "null_linked", "zero_linked", "mixed"]
+)
+def test_unlinked_monitoring_never_breaks_full_layouts(live_source, audience, behavior, caplog):
+    settings, repo, connection, _, database = live_source
+    with closing(sqlite3.connect(database)) as db, db:
+        statements = {
+            "null_zero": ["UPDATE Device SET ObserviumID=NULL", "UPDATE Port SET ObserviumID=0"],
+            "zero_zero": ["UPDATE Device SET ObserviumID=0", "UPDATE Port SET ObserviumID=0"],
+            "null_linked": ["UPDATE Device SET ObserviumID=NULL"],
+            "zero_linked": ["UPDATE Device SET ObserviumID=0"],
+            "mixed": ["UPDATE Device SET ObserviumID=NULL WHERE DeviceID=301"],
+        }
+        for statement in statements[behavior]:
+            db.execute(statement)
+    request = owner_layout(live_source) if audience == "owner" else partner_layout(live_source)
+    calls = []
+
+    def upstream(http_request):
+        calls.append(http_request.url.path)
+        number = int(http_request.url.path.rstrip("/").rsplit("/", 1)[1])
+        assert number > 0
+        if "/devices/" in http_request.url.path:
+            return httpx.Response(
+                200,
+                json={
+                    "devices": [
+                        {"device_id": number, "hostname": "private-host", "status": 1}
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "ports": [{
+                    "port_id": number, "device_id": {1101: 1301, 1202: 1302}[number],
+                    "ifOperStatus": "up", "ifAdminStatus": "up",
+                }]
+            },
+        )
+
+    async def read():
+        monitoring = ObserviumAdapter(
+            base_url="https://monitoring.example", api_token="test-private-token",
+            repository=repo, transport=httpx.MockTransport(upstream),
+        )
+        try:
+            return await execute_live_request(
+                repo, connection, request, metadata_path=settings.database_path,
+                monitoring=monitoring,
+            )
+        finally:
+            await monitoring.close()
+
+    result = asyncio.run(read())
+    assert result.error is None and len(result.circuit.layout.items) == 4
+    assert result.circuit.inventory_links == (audience == "owner")
+    statuses = [endpoint.port_status for endpoint in result.circuit.endpoints]
+    if behavior == "mixed":
+        assert statuses[0].state == "unavailable"
+        assert statuses[0].operational_status is None
+        assert statuses[1].state == "available" and statuses[1].operational_status == "up"
+        assert set(calls) == {"/api/v0/devices/1302/", "/api/v0/ports/1202/"}
+    else:
+        assert not calls
+        expected = "not_linked" if behavior.endswith("zero") else "unavailable"
+        assert all(
+            status.state == expected and status.operational_status is None for status in statuses
+        )
+    if behavior in {"null_linked", "zero_linked", "mixed"}:
+        assert "circuit.device_link_missing" in caplog.text
+
+
 @pytest.mark.parametrize("behavior", ["offline", "missing_port", "wrong_device", "stop"])
 def test_full_layout_monitoring_failures_are_explicit_and_never_healthy(live_source, behavior):
     settings, repo, connection, _, _ = live_source

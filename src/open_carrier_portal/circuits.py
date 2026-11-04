@@ -43,6 +43,13 @@ def _text(value: object) -> str | None:
     return None if value is None else str(value)
 
 
+def _observium_id(value: object) -> str | None:
+    if value is None or value == 0:
+        return None
+    identifier = str(value).strip()
+    return identifier if identifier and identifier != "0" else None
+
+
 def _coordinate(value: object) -> float | None:
     if value is None:
         return None
@@ -263,7 +270,7 @@ class CircuitReader:
                     for rack in racks
                 ],
             )
-            observed_id = row.get("observium_id")
+            observed_id = _observium_id(row.get("observium_id"))
             if observed_id is not None:
                 if self.monitoring is None or self._monitoring_unavailable:
                     device = device.model_copy(
@@ -277,7 +284,7 @@ class CircuitReader:
                     public_id = self.repository.ocp_resource_id(
                         "observium",
                         "device",
-                        str(observed_id),
+                        observed_id,
                     )
                     try:
                         observed = await self.monitoring.get_device(public_id)
@@ -326,7 +333,7 @@ class CircuitReader:
                 owner_company=await self.company(row.get("owner_company_id")),
                 connector_type=_text(row.get("connector_type")),
             )
-            observed_id = row.get("observium_id")
+            observed_id = _observium_id(row.get("observium_id"))
             if observed_id is not None:
                 if self.monitoring is None or self._monitoring_unavailable:
                     port = port.model_copy(
@@ -339,15 +346,27 @@ class CircuitReader:
                 else:
                     device_row = await self.reference("devices", row["device_id"])
                     assert device_row is not None
-                    device_observed_id = device_row.get("observium_id")
+                    device_observed_id = _observium_id(device_row.get("observium_id"))
                     if device_observed_id is None:
-                        raise UpstreamResponseError(
-                            "A monitored port requires its device's Observium ID"
+                        if self.monitoring_required:
+                            raise UpstreamResponseError(
+                                "A monitored port requires its device's Observium ID"
+                            )
+                        log_event(
+                            "observium",
+                            "circuit.device_link_missing",
+                            "Port status cannot be verified without its device's Observium ID. "
+                            "The layout is retained with unavailable port readings.",
+                            level=logging.WARNING,
                         )
+                        self._ports[key] = port.model_copy(
+                            update={"monitoring_state": "unavailable"}
+                        )
+                        return self._ports[key]
                     public_id = self.repository.ocp_resource_id(
                         "observium",
                         "interface",
-                        str(observed_id),
+                        observed_id,
                     )
                     try:
                         observed = await self.monitoring.get_interface(public_id)
@@ -366,7 +385,7 @@ class CircuitReader:
                     if observed.id != public_id:
                         raise UpstreamResponseError("Monitoring returned a different interface")
                     if observed.device_id != self.repository.ocp_resource_id(
-                        "observium", "device", str(device_observed_id)
+                        "observium", "device", device_observed_id
                     ):
                         raise UpstreamResponseError("Monitoring interface/device linkage differs")
                     port = port.model_copy(

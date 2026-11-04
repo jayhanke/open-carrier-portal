@@ -167,6 +167,12 @@ rack or location record fails explicitly instead of returning a successful parti
 Optional secondary patch port references may be NULL or zero (including `"0"`); these
 mean no secondary port, not a reference to port 0. Nonzero secondary references must
 resolve to existing ports; primary port references remain required.
+Device and port Observium links treat NULL, zero (including `"0"`) and blank values as
+unlinked, never as an Observium record to query. In full live layouts, a positive port
+link without a linked inventory device keeps the layout visible with **Unavailable**
+port readings and a `circuit.device_link_missing` diagnostic; no status is trusted without
+device linkage. Strict direct/endpoint-only reads retain their existing missing-device-link
+error. A returned interface/device identity mismatch still fails the read.
 Companies, rack positions and service enrichment remain optional. If a service is
 mapped, map its type and bandwidth as well as its ID. Unconfigured optional enrichment referenced
 by a circuit is listed in `omitted_enrichment`; incomplete configured mappings,

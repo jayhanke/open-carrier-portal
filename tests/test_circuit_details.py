@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 from npdb_fixture import create_npdb
 
 from open_carrier_portal.adapters.observium import ObserviumAdapter
+from open_carrier_portal.circuits import _observium_id
 from open_carrier_portal.config import Settings
 from open_carrier_portal.main import create_app
 from open_carrier_portal.repository import Repository
@@ -219,11 +221,27 @@ def test_companies_and_racks_are_optional_enrichment(circuit_app):
     assert body["path"]["items"][0]["port"]["device"]["site"]["location"]["id"]
 
 
-def test_null_monitoring_ids_allow_unmonitored_inventory(circuit_app):
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None), (0, None), (0.0, None), (Decimal("0.00"), None),
+        ("0", None), (" 0 ", None), ("", None), (" ", None),
+        (1301, "1301"), (" 1301 ", "1301"),
+    ],
+)
+def test_observium_link_ids_normalize_only_unlinked_sentinels(value, expected):
+    assert _observium_id(value) == expected
+
+
+@pytest.mark.parametrize(
+    "device_id,port_id",
+    [(None, None), (None, 0), (0, 0), ("0", "0"), ("", ""), (" ", " ")],
+)
+def test_unlinked_monitoring_ids_allow_unmonitored_inventory(circuit_app, device_id, port_id):
     app, client_id, _, circuit_id, database, requests, _ = circuit_app
     with sqlite3.connect(database) as connection:
-        connection.execute("UPDATE Device SET ObserviumID = NULL")
-        connection.execute("UPDATE Port SET ObserviumID = NULL")
+        connection.execute("UPDATE Device SET ObserviumID = ?", (device_id,))
+        connection.execute("UPDATE Port SET ObserviumID = ?", (port_id,))
     with TestClient(app) as client:
         response = client.get("/v1/circuits/" + circuit_id, headers=token(client, client_id))
     assert response.status_code == 200, response.text
@@ -263,10 +281,13 @@ def test_monitoring_mappings_can_be_omitted_without_a_monitoring_integration(cir
     assert not requests
 
 
-def test_monitored_port_requires_its_devices_monitoring_link(circuit_app):
+@pytest.mark.parametrize("device_id", [None, 0, ""])
+def test_monitored_port_requires_its_devices_monitoring_link(circuit_app, device_id):
     app, client_id, _, circuit_id, database, requests, _ = circuit_app
     with sqlite3.connect(database) as connection:
-        connection.execute("UPDATE Device SET ObserviumID = NULL WHERE DeviceID = 301")
+        connection.execute(
+            "UPDATE Device SET ObserviumID = ? WHERE DeviceID = 301", (device_id,)
+        )
     with TestClient(app) as client:
         response = client.get("/v1/circuits/" + circuit_id, headers=token(client, client_id))
     assert response.status_code == 502, response.text
