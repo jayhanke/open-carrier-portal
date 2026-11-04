@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
+import sys
 import uuid
 from getpass import getpass
 from pathlib import Path
@@ -11,7 +11,15 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from open_carrier_portal.admin_store import AdminStore
 from open_carrier_portal.config import Settings, is_private_network_host, validate_connector_url
+from open_carrier_portal.diagnostics import (
+    LogContext,
+    configure_logging,
+    log_context,
+    log_event,
+    log_failure,
+)
 from open_carrier_portal.models import ConnectorIdentity
 from open_carrier_portal.portal_agent import (
     DEFAULT_CONNECTION_FILE,
@@ -30,6 +38,19 @@ from open_carrier_portal.source_database import SourceMapping, configured_source
 
 
 def main() -> None:
+    configure_logging()
+    with log_context() as context:
+        try:
+            _main(context)
+        finally:
+            exc = sys.exception()
+            if exc is None or (isinstance(exc, SystemExit) and exc.code in {None, 0}):
+                log_event("cli", "command.completed", "CLI command completed.")
+            else:
+                log_failure("cli", "command.failed", exc)
+
+
+def _main(context: LogContext) -> None:
     parser = argparse.ArgumentParser(prog="ocp")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -126,10 +147,11 @@ def main() -> None:
     settings = Settings.from_env()
     repository = Repository(settings.database_path, settings.token_signing_key)
     repository.initialize()
+    context.store = AdminStore(settings.database_path)
+    context.store.initialize()
+    log_event("cli", "command.started", "CLI command started.", command=args.command)
 
     if args.command in {"create-admin", "reset-admin-password", "serve", "serve-admin"}:
-        from open_carrier_portal.admin_store import AdminStore
-
         store = AdminStore(settings.database_path)
         store.initialize()
         if args.command in {"serve", "serve-admin"}:
@@ -161,6 +183,7 @@ def main() -> None:
                 ),
                 host=args.host,
                 port=args.port,
+                access_log=False,
             )
             return
         password = getpass("Local administrator password (10-256 characters): ")
@@ -180,9 +203,6 @@ def main() -> None:
         identity = repository.get_connector_identity()
         if identity is None or not identity.enabled:
             parser.error("initialize an enabled connector first with ocp init")
-        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-        # Never log HTTP requests or credentials, including through httpx's info logger.
-        logging.getLogger("httpx").setLevel(logging.WARNING)
         try:
             with httpx.Client(timeout=15, follow_redirects=False, trust_env=False) as client:
                 if args.command == "pair-portal":
@@ -361,8 +381,6 @@ def main() -> None:
     )
     source.health_check()
     source.validate_mapping()
-    from open_carrier_portal.admin_store import AdminStore
-
     store = AdminStore(settings.database_path)
     store.initialize()
     missing = source.missing_fields_for(

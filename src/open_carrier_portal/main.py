@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 from fastapi import Depends, FastAPI, Form, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -20,6 +21,13 @@ from open_carrier_portal.adapters.observium import ObserviumAdapter
 from open_carrier_portal.auth import AuthenticationService, Principal
 from open_carrier_portal.circuits import CircuitReader
 from open_carrier_portal.config import Settings
+from open_carrier_portal.diagnostics import (
+    configure_logging,
+    install_request_logging,
+    log_context,
+    log_event,
+    log_failure,
+)
 from open_carrier_portal.errors import (
     AuthenticationError,
     ConfigurationError,
@@ -61,6 +69,7 @@ def create_app(
     admin_base_url: str | None = None,
     connection_file: Path = DEFAULT_CONNECTION_FILE,
 ) -> FastAPI:
+    configure_logging()
     repository = repository or Repository(settings.database_path, settings.token_signing_key)
     repository.initialize()
     from open_carrier_portal.admin import configured_settings, create_admin_app
@@ -70,9 +79,12 @@ def create_app(
     admin_store.initialize()
     environment_settings = settings
     configuration_error = ""
+    phase = "integration_settings"
     try:
-        settings = configured_settings(settings, admin_store)
+        with log_context(admin_store):
+            settings = configured_settings(settings, admin_store)
         if source_database is None and settings.source_database_profile:
+            phase = "database_configuration"
             profile = repository.get_source_database_profile(settings.source_database_profile)
             if profile is None or not profile.enabled:
                 raise ConfigurationError("selected source profile is missing or disabled")
@@ -91,6 +103,7 @@ def create_app(
                 metadata_path=settings.database_path,
             )
         if adapter is None and settings.observium_enabled:
+            phase = "observium_configuration"
             adapter = ObserviumAdapter(
                 base_url=settings.observium_base_url or "",
                 api_token=settings.observium_api_token or "",
@@ -98,7 +111,9 @@ def create_app(
                 timeout_seconds=settings.observium_timeout_seconds,
                 ca_bundle=settings.observium_ca_bundle,
             )
-    except ValueError, OSError:
+    except (ValueError, OSError, httpx.InvalidURL) as exc:
+        with log_context(admin_store):
+            log_failure("app", f"startup.{phase}", exc)
         configuration_error = (
             "Integration configuration is invalid. Check the selected source profile, mapping, "
             "TLS CA paths, saved database credentials, and source/Observium secret environment "
@@ -144,6 +159,15 @@ def create_app(
     app.state.auth_service = auth_service
     app.state.admin_store = admin_app.state.admin_store
     app.state.admin_app = admin_app
+    log_event(
+        "app",
+        "startup.completed",
+        "Connector API initialized.",
+        store=admin_store,
+        monitoring_enabled=int(adapter is not None),
+        database_enabled=int(source_database is not None),
+        configuration_failed=int(bool(configuration_error)),
+    )
 
     @app.middleware("http")
     async def correlation_id_middleware(
@@ -159,6 +183,7 @@ def create_app(
 
     @app.exception_handler(ConnectorError)
     async def connector_error_handler(request: Request, exc: ConnectorError) -> JSONResponse:
+        log_failure("api", "operation.failed", exc, http_status=exc.status_code)
         headers: dict[str, str] = {}
         if exc.status_code == 401:
             headers["WWW-Authenticate"] = "Bearer"
@@ -182,6 +207,12 @@ def create_app(
         request: Request,
         _: RequestValidationError,
     ) -> JSONResponse:
+        log_event(
+            "api",
+            "request.invalid",
+            "Request validation failed; parameters were not logged.",
+            level=logging.WARNING,
+        )
         return JSONResponse(
             status_code=400,
             content={
@@ -208,6 +239,13 @@ def create_app(
         if configuration_error:
             raise IntegrationUnavailableError(configuration_error)
         if adapter is None:
+            log_event(
+                "observium",
+                "configuration.not_active",
+                "Monitoring is not active in this running API. Configure Observium and "
+                "restart after saving; a successful UI test alone does not activate the API.",
+                level=logging.ERROR,
+            )
             raise IntegrationUnavailableError("Observium integration is not configured")
         return adapter
 
@@ -215,6 +253,13 @@ def create_app(
         if configuration_error:
             raise IntegrationUnavailableError(configuration_error)
         if source_database is None:
+            log_event(
+                "database",
+                "configuration.not_active",
+                "An operational database is not active in this API. Select the database "
+                "connection and restart after saving.",
+                level=logging.ERROR,
+            )
             raise IntegrationUnavailableError("NetTool source database is not configured")
         return source_database
 
@@ -601,12 +646,19 @@ def create_app(
         return result
 
     app.mount("/", admin_app)
+    install_request_logging(app, admin_store)
     return app
 
 
 def create_app_from_env() -> FastAPI:
+    configure_logging()
+    try:
+        settings = Settings.from_env()
+    except ValueError as exc:
+        log_failure("app", "environment.failed", exc)
+        raise
     return create_app(
-        Settings.from_env(),
+        settings,
         admin_base_url=os.getenv("OCP_ADMIN_BASE_URL"),
         connection_file=Path(os.getenv("OCP_PORTAL_CONNECTION_FILE", str(DEFAULT_CONNECTION_FILE))),
     )

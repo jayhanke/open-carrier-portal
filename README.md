@@ -440,8 +440,33 @@ session hashes, partner grants, configuration and audit events.
   TLS verification cannot be disabled, redirects are rejected, and tokens are
   neither persisted nor displayed. This is manual browsing, not background
   synchronization. Saving a new connection name preserves other saved connections.
-- **Diagnostics:** bounded, escaped views of the latest 50 local administration
-  and partner API audit events. No raw configuration/secret bundle is exported.
+- **Diagnostics:** Observium connection logs plus a collapsible view of all recent
+  operational events, alongside the existing administration/partner API audit trails.
+  Operational logs cover startup/configuration, HTTP request outcomes, administrator
+  actions/session failures, database connectivity/mapping errors, Observium HTTP and
+  transport failures, portal pairing/heartbeats and CLI outcomes. The newest 100 events
+  per view are displayed; the newest 2,000 operational events are retained in the
+  connector metadata database. This does not prune the existing audit trails.
+  Each HTTP response includes a generated `X-Request-ID`; error pages show this
+  diagnostic reference, which ties request and integration events together.
+  Existing `X-Correlation-ID` API behavior remains separate and unchanged.
+  Tokens, passwords, cookies, pairing codes, query strings, SQL/parameters and
+  source/response records are not included in operational logs. Upstream failures
+  record safe categories, HTTP status and target origin without URL credentials
+  or paths. Unhandled server errors retain stack locations, not raw exception
+  messages or payloads. Raw Uvicorn access logs are replaced with safe route-template
+  request logs.
+  Events are also written to service stderr: use `journalctl -u your-service-name -f`
+  for systemd or `docker logs --tail 100 -f your-container-name` for Docker.
+  Configure long-term collection/retention in your deployment. If local diagnostics
+  persistence fails, `diagnostics.storage_failed` is reported in service output
+  rather than silently hiding the logging failure.
+  For an Observium failure, check **Observium connection logs** first: missing
+  setup/token, expired admin form verification, DNS/TLS/timeout, rejected credentials,
+  HTTP 404/429/5xx, redirects and invalid JSON are distinguished. No raw
+  configuration/secret bundle is exported.
+  Observium redirects do not pass a health check, even if they contain success-shaped
+  JSON; configure the final HTTPS installation base URL instead.
 - **Account:** change your password and invalidate that account's admin sessions.
   Additional local admins and forgotten-password recovery require CLI operator
   access:

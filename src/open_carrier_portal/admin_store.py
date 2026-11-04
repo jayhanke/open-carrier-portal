@@ -7,6 +7,7 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 from open_carrier_portal.security import hash_client_secret, verify_client_secret
@@ -49,6 +50,12 @@ class AdminStore:
                 );
                 CREATE TABLE IF NOT EXISTS local_admin_audit (
                     occurred REAL NOT NULL, username TEXT NOT NULL, operation TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS local_operational_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    occurred REAL NOT NULL, level TEXT NOT NULL, component TEXT NOT NULL,
+                    event TEXT NOT NULL, message TEXT NOT NULL, request_id TEXT NOT NULL,
+                    details TEXT NOT NULL
                 );
             """)
 
@@ -187,3 +194,47 @@ class AdminStore:
                 "SELECT * FROM local_admin_audit ORDER BY occurred DESC LIMIT 50"
             ).fetchall()
         return [{key: str(value) for key, value in dict(row).items()} for row in rows]
+
+    def record_event(
+        self,
+        *,
+        level: str,
+        component: str,
+        event: str,
+        message: str,
+        request_id: str,
+        details: dict[str, str | int],
+    ) -> None:
+        with self.connection() as db:
+            db.execute(
+                "INSERT INTO local_operational_logs "
+                "(occurred, level, component, event, message, request_id, details) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), level, component, event, message, request_id, json.dumps(details)),
+            )
+            db.execute(
+                "DELETE FROM local_operational_logs WHERE id NOT IN "
+                "(SELECT id FROM local_operational_logs ORDER BY id DESC LIMIT 2000)"
+            )
+
+    def recent_events(self, component: str | None = None) -> list[dict[str, str]]:
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT occurred, level, component, event, message, request_id, details "
+                "FROM local_operational_logs "
+                + ("WHERE component = ? " if component is not None else "")
+                + "ORDER BY id DESC LIMIT 100",
+                (component,) if component is not None else (),
+            ).fetchall()
+        return [
+            {
+                "UTC": datetime.fromtimestamp(row["occurred"], UTC).isoformat(timespec="seconds"),
+                "level": row["level"],
+                "component": row["component"],
+                "event": row["event"],
+                "message": row["message"],
+                "reference": row["request_id"],
+                "details": row["details"],
+            }
+            for row in rows
+        ]

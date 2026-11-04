@@ -26,6 +26,15 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from open_carrier_portal.admin_store import ADMIN_SESSION_IDLE_SECONDS, AdminStore
 from open_carrier_portal.config import Settings, is_private_network_host, validate_connector_url
+from open_carrier_portal.diagnostics import (
+    configure_logging,
+    failure_reason,
+    install_request_logging,
+    log_context,
+    log_event,
+    log_failure,
+    request_reference,
+)
 from open_carrier_portal.errors import ConnectorError, SourceDatabaseError
 from open_carrier_portal.models import ConnectorIdentity
 from open_carrier_portal.portal_agent import (
@@ -69,7 +78,6 @@ SECTION_LABELS = {
     "sources": "Connections",
     "remote": "Partner connections",
 }
-logger = logging.getLogger(__name__)
 
 
 def escape(value: object) -> str:
@@ -107,6 +115,14 @@ def configured_settings(settings: Settings, store: AdminStore) -> Settings:
     if monitoring and not settings.observium_base_url:
         token = os.getenv(monitoring["token_env"])
         if not token:
+            log_event(
+                "observium",
+                "configuration.token_missing",
+                "The selected token variable is absent from the connector service environment. "
+                "Set it for the service and restart; do not enter a token on Connections.",
+                level=logging.ERROR,
+                store=store,
+            )
             raise ValueError(
                 "The named Observium token environment variable is missing in the connector "
                 "service. Set the actual API token in that service's environment, then restart "
@@ -162,17 +178,28 @@ def create_admin_app(
     connection_file: Path = DEFAULT_CONNECTION_FILE,
     configuration_error: str = "",
 ) -> FastAPI:
+    configure_logging()
     base_url = validate_connector_url(base_url, allow_insecure_http=settings.allow_insecure_http)
     parsed = urlsplit(base_url)
-    if parsed.scheme == "http" and is_private_network_host(parsed.hostname or ""):
-        logger.warning(
-            "Insecure private-network HTTP testing enabled: admin passwords, sessions and "
-            "partner credentials are not encrypted. Do not expose this listener publicly."
-        )
     repository = Repository(settings.database_path, settings.token_signing_key)
     repository.initialize()
     store = AdminStore(settings.database_path)
     store.initialize()
+    log_event(
+        "app",
+        "admin.initialized",
+        "Administration initialized.",
+        store=store,
+    )
+    if parsed.scheme == "http" and is_private_network_host(parsed.hostname or ""):
+        log_event(
+            "app",
+            "testing.private_http_enabled",
+            "Insecure private-network HTTP testing enabled: admin passwords, sessions and "
+            "partner credentials are not encrypted. Do not expose this listener publicly.",
+            level=logging.WARNING,
+            store=store,
+        )
 
     def monitoring_enabled() -> bool:
         return bool(settings.observium_base_url or store.get("observium").get("url"))
@@ -197,24 +224,27 @@ def create_admin_app(
 
     async def agent_loop() -> None:
         while True:
-            try:
-                await run_in_threadpool(heartbeat)
-            except ValueError, OSError, httpx.HTTPError:
-                logger.warning(
-                    "Portal heartbeat failed; check pairing, certificate trust and connectivity"
-                )
-                store.save(
-                    "heartbeat",
-                    {"error": "Heartbeat failed; test or reconnect on the Portal page."},
-                )
+            with log_context(store):
+                try:
+                    await run_in_threadpool(heartbeat)
+                except (ValueError, OSError, httpx.HTTPError) as exc:
+                    log_failure("portal", "heartbeat.failed", exc)
+                    store.save(
+                        "heartbeat",
+                        {"error": "Heartbeat failed; test or reconnect on the Portal page."},
+                    )
             await asyncio.sleep(30)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         task = asyncio.create_task(agent_loop())
+        log_event(
+            "app", "service.started", "Connector administration service started.", store=store
+        )
         try:
             yield
         finally:
+            log_event("app", "service.stopping", "Connector service is stopping.", store=store)
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
@@ -251,6 +281,12 @@ def create_admin_app(
         signed_in: bool = True,
         username: str = "",
     ):
+        if status >= 400:
+            reference = request_reference()
+            if reference:
+                content += f"<p>Diagnostic reference: <code>{escape(reference)}</code>.</p>"
+            if signed_in:
+                content += '<p><a href="/admin/diagnostics">View Diagnostics logs</a></p>'
         if signed_in and configuration_error:
             content = f'<p class="notice">{escape(configuration_error)}</p>' + content
         nav = (
@@ -579,8 +615,8 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             if paired:
                 try:
                     portal_url = PortalConnection.load(connection_file).portal_url
-                except ValueError, OSError:
-                    logger.warning("Saved portal connection is invalid or unreadable")
+                except (ValueError, OSError) as exc:
+                    log_failure("portal", "saved_connection.failed", exc)
                     connection_error = (
                         "The saved connection could not be read. Disconnect it locally, "
                         "then obtain a new pairing code."
@@ -1037,6 +1073,15 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             )
         return (
             "<p>Recent events only; source records and credentials are not exported.</p>"
+            + "<h3>Observium connection logs</h3>"
+            + table(store.recent_events("observium"))
+            + "<details><summary>All operational logs</summary>"
+            + "<p>Latest 100 events shown; the latest 2,000 are retained locally. "
+            "The same events are written to service output. For Linux deployments use "
+            "journalctl for your systemd service or docker logs for your container. "
+            "Long-term retention is managed by your deployment.</p>"
+            + table(store.recent_events())
+            + "</details>"
             + "<h3>Administration</h3>"
             + table(store.recent_audit())
             + "<h3>Partner API requests</h3>"
@@ -1298,6 +1343,13 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 )
             env = env_name(text(data, "token_env"))
             if not os.getenv(env):
+                log_event(
+                    "observium",
+                    "configuration.token_missing",
+                    "Cannot save monitoring settings: the selected token variable is missing "
+                    "in this connector process. Set the service environment and restart.",
+                    level=logging.ERROR,
+                )
                 raise ValueError(
                     "The named token environment variable is missing in the connector service. "
                     "Set the actual API token in that service's environment and restart the "
@@ -1306,12 +1358,23 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             ca = text(data, "ca", required=False)
             ssl.create_default_context(cafile=ca or None)
             store.save("observium", {"url": url, "token_env": env, "ca": ca})
+            log_event(
+                "observium",
+                "configuration.saved",
+                "Monitoring URL, token-variable name and TLS settings saved. "
+                "Restart to apply them to the partner API; no token was stored.",
+            )
             return (
                 "<p>Saved the URL, token environment-variable name and TLS settings only. "
                 "No API token was stored. Restart the connector to apply changes to the "
                 'partner API.</p><p><a href="/admin/sources">Back to connections</a></p>'
             )
         elif action == "test-observium":
+            log_event(
+                "observium",
+                "connection.test_started",
+                "Testing the effective Observium configuration.",
+            )
             if "api_token" in data or "url" in data:
                 raise ValueError(
                     "Direct token testing has been removed. Set the token in the connector "
@@ -1322,6 +1385,13 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
 
             effective = configured_settings(settings, store)
             if not effective.observium_enabled:
+                log_event(
+                    "observium",
+                    "configuration.not_configured",
+                    "No effective Observium connection is configured. Save the URL and "
+                    "token-variable name on Connections, or configure the deployment environment.",
+                    level=logging.ERROR,
+                )
                 raise ValueError("Observium is not configured")
             adapter = ObserviumAdapter(
                 base_url=effective.observium_base_url or "",
@@ -1338,6 +1408,11 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     await adapter.close()
 
             asyncio.run(check())
+            log_event(
+                "observium",
+                "connection.test_passed",
+                "Observium health check passed.",
+            )
             return (
                 "<p>Observium health check passed.</p>"
                 + '<p><a href="/admin/sources">Back to connections</a></p>'
@@ -1492,6 +1567,12 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         token = request.cookies.get("ocp_admin", "")
         session = store.session(token)
         if not session:
+            log_event(
+                "admin",
+                "session.unavailable",
+                "Administrator session is missing, expired or revoked. Sign in to continue.",
+                level=logging.WARNING,
+            )
             return JSONResponse({"error": "Sign in to continue."}, status_code=401, headers=headers)
         if request.method == "POST":
             origin = request.headers.get("origin")
@@ -1499,6 +1580,12 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             if origin not in {None, base_url} or not secrets.compare_digest(
                 supplied, session["csrf"]
             ):
+                log_event(
+                    "admin",
+                    "session.verification_failed",
+                    "Session renewal origin or CSRF verification was rejected.",
+                    level=logging.WARNING,
+                )
                 return JSONResponse(
                     {"error": "Session verification failed. Sign in again."},
                     status_code=403,
@@ -1560,7 +1647,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         try:
             return JSONResponse(await run_in_threadpool(discover))
         except (ValueError, SourceDatabaseError, OSError) as exc:
-            logger.warning("Mapping schema discovery failed for the selected database connection")
+            log_failure("database", "schema.failed", exc)
             return JSONResponse(
                 {
                     "error": (
@@ -1629,14 +1716,17 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         try:
             result = await run_in_threadpool(apply)
         except (ValueError, SourceDatabaseError) as exc:
+            log_failure("database", "mapping.failed", exc)
             store.audit(session["username"], "mapping.workspace.failed")
             return JSONResponse({"error": str(exc)}, status_code=400)
-        except OSError:
+        except OSError as exc:
+            log_failure("database", "mapping.failed", exc)
             store.audit(session["username"], "mapping.workspace.failed")
             return JSONResponse(
                 {"error": "Cannot read source credentials or certificate files."}, status_code=400
             )
         store.audit(session["username"], "mapping.workspace." + str(data.get("operation")))
+        log_event("database", "mapping.completed", "Mapping preview or save completed.")
         return JSONResponse(result)
 
     @app.get("/")
@@ -1700,6 +1790,12 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
     async def admin_action(action: str, request: Request):
         origin = request.headers.get("origin")
         if origin and origin != base_url:
+            log_event(
+                "admin",
+                "verification.origin_rejected",
+                "Admin request origin was rejected.",
+                level=logging.WARNING,
+            )
             return Response("Invalid origin", status_code=403)
         if len(await request.body()) > 131072:
             return Response("Form too large", status_code=413)
@@ -1712,6 +1808,21 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             else (session["csrf"] if session else "")
         )
         if not expected or not isinstance(csrf, str) or not secrets.compare_digest(expected, csrf):
+            log_event(
+                "admin",
+                "verification.session_or_csrf_failed",
+                "Admin form session or CSRF verification failed. Sign in and resume or "
+                "refresh the form; no connection attempt was made.",
+                level=logging.WARNING,
+            )
+            if action in {"observium", "test-observium"}:
+                log_event(
+                    "observium",
+                    "connection.blocked_by_admin_session",
+                    "The monitoring action was blocked by expired or invalid admin form "
+                    "verification. Sign in again; Observium was not contacted.",
+                    level=logging.WARNING,
+                )
             return Response("Form expired or unauthorized. Reload and sign in.", status_code=403)
         if session is not None and action != "login":
             request.state.admin_activity = request.cookies["ocp_admin"]
@@ -1724,6 +1835,12 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     request.client.host if request.client else "unknown",
                 )
                 if not result:
+                    log_event(
+                        "admin",
+                        "login.failed",
+                        "Administrator authentication failed.",
+                        level=logging.WARNING,
+                    )
                     return page(
                         "Sign in failed",
                         '<p>Incorrect credentials. <a href="/admin/login">Try again</a>.</p>',
@@ -1734,6 +1851,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 response = RedirectResponse("/admin/setup", status_code=303)
                 set_session_cookie(response, result[0])
                 response.delete_cookie("ocp_admin_login")
+                log_event("admin", "login.succeeded", "Administrator authenticated.")
                 return response
             if session is None:
                 return Response("Sign in required", status_code=403)
@@ -1741,6 +1859,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 store.logout(request.cookies.get("ocp_admin", ""))
                 response = RedirectResponse("/admin/login", status_code=303)
                 response.delete_cookie("ocp_admin")
+                log_event("admin", "logout.completed", "Administrator signed out.")
                 return response
             if action == "password":
                 with store.connection() as db:
@@ -1757,9 +1876,20 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 if text(data, "password") != text(data, "confirm"):
                     raise ValueError("passwords do not match")
                 store.set_password(session["username"], text(data, "password"), reset=True)
+                log_event(
+                    "admin",
+                    "password.changed",
+                    "Administrator password changed; sessions revoked.",
+                )
                 return RedirectResponse("/admin/login", status_code=303)
             content = await run_in_threadpool(execute, action, data, session["username"])
             store.audit(session["username"], action + ".success")
+            log_event(
+                "admin",
+                "action.completed",
+                "Administrator action completed.",
+                action=action,
+            )
             return page(
                 "Result",
                 content + '<p><a href="/admin/setup">Back to setup</a></p>',
@@ -1767,6 +1897,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 username=session["username"],
             )
         except (ValueError, ConnectorError, SourceDatabaseError) as exc:
+            log_failure("admin", "action.failed", exc)
             store.audit(session["username"] if session else "anonymous", action + ".failed")
             return page(
                 "Action failed",
@@ -1776,11 +1907,14 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 signed_in=session is not None,
                 username=session["username"] if session else "",
             )
-        except httpx.HTTPError, OSError:
+        except (httpx.HTTPError, httpx.InvalidURL, OSError) as exc:
+            log_failure("admin", "action.failed", exc)
             store.audit(session["username"] if session else "anonymous", action + ".failed")
+            _, explanation = failure_reason(exc)
             return page(
                 "Connection failed",
-                "<p>Request failed. Check server paths, credentials, endpoint, trust and network. "
+                f"<p>{escape(explanation)}</p>"
+                "<p>Check server paths, credentials, endpoint, trust and network. "
                 "No TLS bypass is permitted. Disconnect an existing pairing file first.</p>",
                 expected,
                 status=400,
@@ -1788,6 +1922,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 username=session["username"] if session else "",
             )
 
+    install_request_logging(app, store)
     return app
 
 

@@ -11,8 +11,9 @@ from uuid import UUID
 
 import httpx
 
+from open_carrier_portal.diagnostics import log_event, log_failure, target_origin
+
 DEFAULT_CONNECTION_FILE = Path.home() / ".open-carrier-portal" / "portal-connection.json"
-logger = logging.getLogger(__name__)
 
 
 def validate_portal_url(value: str) -> str:
@@ -75,6 +76,12 @@ def pair_portal(
     connector_id = str(UUID(connector_id))
     if not 40 <= len(code) <= 128:
         raise ValueError("invalid pairing code")
+    log_event(
+        "portal",
+        "pairing.started",
+        "Starting portal pairing.",
+        target=target_origin(portal_url),
+    )
     connection_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(connection_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -106,22 +113,41 @@ def pair_portal(
             )
             stream.flush()
             os.fsync(stream.fileno())
-    except httpx.HTTPError, ValueError, OSError:
+    except (httpx.HTTPError, ValueError, OSError) as exc:
+        log_failure("portal", "pairing.failed", exc)
         connection_file.unlink()
         raise
+    log_event("portal", "pairing.completed", "Portal pairing completed.")
     return connection
 
 
 def send_heartbeat(client: httpx.Client, connection: PortalConnection) -> None:
+    log_event("portal", "heartbeat.started", "Sending portal heartbeat.")
     response = client.post(
         f"{connection.portal_url}/api/connectors/heartbeat",
         headers={"Authorization": f"Bearer {connection.token}"},
         json={"connector_id": connection.connector_id},
     )
     response.raise_for_status()
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError:
+        log_event(
+            "portal",
+            "heartbeat.invalid_json",
+            "Portal heartbeat did not return JSON; response contents were not logged.",
+            level=logging.ERROR,
+        )
+        raise
     if not isinstance(data, dict) or data.get("status") != "connected":
+        log_event(
+            "portal",
+            "heartbeat.invalid_response",
+            "Portal returned an invalid heartbeat response; contents were not logged.",
+            level=logging.ERROR,
+        )
         raise ValueError("portal returned an invalid heartbeat response")
+    log_event("portal", "heartbeat.accepted", "Portal heartbeat accepted.")
 
 
 def run_agent(client: httpx.Client, connection: PortalConnection, *, once: bool = False) -> None:
@@ -129,17 +155,13 @@ def run_agent(client: httpx.Client, connection: PortalConnection, *, once: bool 
         try:
             send_heartbeat(client, connection)
         except httpx.HTTPStatusError as exc:
+            log_failure("portal", "heartbeat.failed", exc)
             if once or exc.response.status_code < 500:
                 raise
-            logger.warning(
-                "Portal heartbeat failed (HTTP %s); retrying in 30s", exc.response.status_code
-            )
-        except httpx.RequestError:
+        except httpx.RequestError as exc:
+            log_failure("portal", "heartbeat.failed", exc)
             if once:
                 raise
-            logger.warning("Portal is unreachable; retrying heartbeat in 30s")
-        else:
-            logger.info("Portal heartbeat accepted")
         if once:
             return
         time.sleep(30)

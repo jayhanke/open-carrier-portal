@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -8,7 +10,13 @@ import httpx
 import pytest
 
 from open_carrier_portal.adapters.observium import ObserviumAdapter
-from open_carrier_portal.errors import CapabilityNotSupportedError, UpstreamResponseError
+from open_carrier_portal.admin_store import AdminStore
+from open_carrier_portal.diagnostics import log_context
+from open_carrier_portal.errors import (
+    CapabilityNotSupportedError,
+    ConnectorError,
+    UpstreamResponseError,
+)
 from open_carrier_portal.repository import Repository
 
 pytestmark = pytest.mark.anyio
@@ -102,3 +110,90 @@ async def test_numeric_metrics_are_not_fabricated(repository: Repository) -> Non
             )
     finally:
         await adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "event"),
+    [
+        (401, "request.credential_rejected"),
+        (403, "request.credential_rejected"),
+        (404, "request.endpoint_missing"),
+        (429, "request.rate_limited"),
+        (503, "request.upstream_failed"),
+        (200, "response.invalid_json"),
+    ],
+)
+async def test_health_failure_has_safe_actionable_log(repository, tmp_path, caplog, status, event):
+    store = AdminStore(tmp_path / "logs.db")
+    store.initialize()
+    adapter = ObserviumAdapter(
+        base_url="https://user:private-url-password@observium.example",
+        api_token="private-api-token",
+        repository=repository,
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(status, text="private-upstream-response")
+        ),
+    )
+    with log_context(store) as context:
+        try:
+            with pytest.raises(ConnectorError):
+                await adapter.health_check()
+        finally:
+            await adapter.close()
+    events = store.recent_events()
+    assert events[0]["event"] == event
+    assert events[0]["reference"] == context.request_id
+    assert json.loads(events[0]["details"])["http_status"] == status
+    for private in ("private-url-password", "private-api-token", "private-upstream-response"):
+        assert private not in json.dumps(events)
+        assert private not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("cause", "event"),
+    [
+        (ssl.SSLCertVerificationError(1, "private-error"), "request.tls_verification_failed"),
+        (socket.gaierror(-2, "private-error"), "request.dns_failed"),
+        (ConnectionRefusedError("private-error"), "request.connection_refused"),
+    ],
+)
+async def test_transport_failure_keeps_safe_root_cause(repository, tmp_path, cause, event):
+    def handler(_request):
+        raise httpx.ConnectError("private-network-error") from cause
+
+    store = AdminStore(tmp_path / "logs.db")
+    store.initialize()
+    adapter = ObserviumAdapter(
+        base_url="https://observium.example",
+        api_token="private-api-token",
+        repository=repository,
+        transport=httpx.MockTransport(handler),
+    )
+    with log_context(store):
+        try:
+            with pytest.raises(ConnectorError):
+                await adapter.health_check()
+        finally:
+            await adapter.close()
+    events = store.recent_events("observium")
+    assert events[0]["event"] == event
+    assert "private-error" not in json.dumps(events)
+    assert "private-network-error" not in json.dumps(events)
+
+
+async def test_redirect_cannot_pass_health_check_even_with_success_json(repository, tmp_path):
+    store = AdminStore(tmp_path / "logs.db")
+    store.initialize()
+    adapter = ObserviumAdapter(
+        base_url="https://observium.example",
+        api_token="private-api-token",
+        repository=repository,
+        transport=httpx.MockTransport(lambda _: httpx.Response(302, json={"status": "ok"})),
+    )
+    with log_context(store):
+        try:
+            with pytest.raises(UpstreamResponseError):
+                await adapter.health_check()
+        finally:
+            await adapter.close()
+    assert store.recent_events("observium")[0]["event"] == "request.redirected"

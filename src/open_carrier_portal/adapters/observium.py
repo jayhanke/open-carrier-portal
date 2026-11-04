@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -7,6 +9,7 @@ from typing import Any
 import httpx
 
 from open_carrier_portal.adapters.base import MonitoringAdapter
+from open_carrier_portal.diagnostics import log_event, log_failure, target_origin
 from open_carrier_portal.errors import (
     CapabilityNotSupportedError,
     IntegrationUnavailableError,
@@ -50,6 +53,7 @@ class ObserviumAdapter(MonitoringAdapter):
             transport=transport,
         )
         self._repository = repository
+        self._target = target_origin(base_url)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -132,12 +136,69 @@ class ObserviumAdapter(MonitoringAdapter):
         *,
         params: Mapping[str, str | int] | None = None,
     ) -> dict[str, Any]:
+        operation = (
+            "health"
+            if path == "api/v0/openapi.json"
+            else "devices"
+            if path.startswith("api/v0/devices/")
+            else "ports"
+            if path.startswith("api/v0/ports/")
+            else "alerts"
+            if path.startswith("api/v0/alerts/")
+            else "other"
+        )
+        started = time.monotonic()
+        log_event(
+            "observium",
+            "request.started",
+            "Starting Observium health check (GET api/v0/openapi.json)."
+            if operation == "health"
+            else "Starting Observium API request.",
+            operation=operation,
+            target=self._target,
+        )
         try:
             response = await self._client.get(path, params=params)
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
+            log_failure("observium", "request", exc, operation=operation, target=self._target)
             raise UpstreamTimeoutError() from None
-        except httpx.RequestError:
+        except httpx.RequestError as exc:
+            log_failure("observium", "request", exc, operation=operation, target=self._target)
             raise IntegrationUnavailableError() from None
+        status = response.status_code
+        if status >= 300:
+            reason = (
+                "credential_rejected"
+                if status in {401, 403}
+                else "endpoint_missing"
+                if status == 404
+                else "rate_limited"
+                if status == 429
+                else "upstream_failed"
+                if status >= 500
+                else "redirected"
+                if status < 400
+                else "http_error"
+            )
+            explanation = (
+                "Observium rejected the token or its permissions."
+                if status in {401, 403}
+                else "Observium API endpoint was not found; check the base URL and REST API."
+                if status == 404
+                else "Observium returned an HTTP error or redirect; check its service and base URL."
+            )
+            log_event(
+                "observium",
+                f"request.{reason}",
+                explanation,
+                level=logging.ERROR,
+                http_status=status,
+                operation=operation,
+                target=self._target,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+        if 300 <= status < 400:
+            raise UpstreamResponseError()
         if response.status_code == 404:
             raise ResourceNotFoundError()
         if response.status_code == 429:
@@ -152,11 +213,42 @@ class ObserviumAdapter(MonitoringAdapter):
         try:
             payload = response.json()
         except ValueError:
+            log_event(
+                "observium",
+                "response.invalid_json",
+                "Observium did not return JSON; check the API URL and login/proxy redirects.",
+                level=logging.ERROR,
+                operation=operation,
+                http_status=status,
+            )
             raise UpstreamResponseError() from None
         if not isinstance(payload, dict):
+            log_event(
+                "observium",
+                "response.invalid_shape",
+                "Observium returned an unexpected JSON shape.",
+                level=logging.ERROR,
+                operation=operation,
+            )
             raise UpstreamResponseError()
         if payload.get("status") not in {None, "ok"}:
+            log_event(
+                "observium",
+                "response.failed_status",
+                "Observium JSON reported a non-success status; response contents were not logged.",
+                level=logging.ERROR,
+                operation=operation,
+            )
             raise UpstreamResponseError()
+        log_event(
+            "observium",
+            "request.completed",
+            "Observium returned a successful JSON response.",
+            operation=operation,
+            target=self._target,
+            http_status=status,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
         return payload
 
     @staticmethod
@@ -169,8 +261,20 @@ class ObserviumAdapter(MonitoringAdapter):
         elif isinstance(raw, list):
             values = raw
         else:
+            log_event(
+                "observium",
+                "response.invalid_collection",
+                "Observium returned an invalid record collection; contents were not logged.",
+                level=logging.ERROR,
+            )
             raise UpstreamResponseError()
         if not all(isinstance(record, dict) for record in values):
+            log_event(
+                "observium",
+                "response.invalid_record",
+                "Observium returned an invalid record shape; contents were not logged.",
+                level=logging.ERROR,
+            )
             raise UpstreamResponseError()
         return values
 

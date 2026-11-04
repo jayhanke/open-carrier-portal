@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from collections.abc import Iterator, Mapping
@@ -12,6 +13,7 @@ from typing import Any, Literal, Protocol
 import pymysql
 from pymysql.cursors import DictCursor
 
+from open_carrier_portal.diagnostics import log_event, log_failure
 from open_carrier_portal.errors import (
     ConfigurationError,
     SourceDatabaseQueryError,
@@ -482,6 +484,7 @@ class SourceDatabase:
                     ssl_disabled=self._settings.tls_ca is None,
                 )
         except (sqlite3.Error, pymysql.MySQLError) as exc:
+            log_failure("database", "connection.failed", exc, driver=self.driver)
             raise SourceDatabaseUnavailableError(
                 "The configured source database could not be reached"
             ) from exc
@@ -525,11 +528,16 @@ class SourceDatabase:
         except SourceDatabaseUnavailableError:
             raise
         except (sqlite3.Error, pymysql.MySQLError) as exc:
+            log_failure("database", "health.failed", exc, driver=self.driver)
             raise SourceDatabaseQueryError("The source database health query failed") from exc
+        log_event(
+            "database", "health.passed", "Database health query succeeded.", driver=self.driver
+        )
 
     def validate_mapping(self) -> None:
         for resource_type in self._mapping.resources:
             self._select(resource_type, limit=0)
+        log_event("database", "mapping.validated", "Mapped database columns validated.")
 
     def describe_schema(self) -> list[dict[str, str]]:
         """Discover identifiers only; never return source records or arbitrary SQL results."""
@@ -563,6 +571,7 @@ class SourceDatabase:
         except SourceDatabaseUnavailableError:
             raise
         except (sqlite3.Error, pymysql.MySQLError) as exc:
+            log_failure("database", "schema.failed", exc, driver=self.driver)
             raise SourceDatabaseQueryError("Source schema discovery failed") from exc
 
     def fetch(self, resource_type: str, limit: int = 100) -> list[dict[str, Any]]:
@@ -628,6 +637,7 @@ class SourceDatabase:
         except SourceDatabaseUnavailableError:
             raise
         except (sqlite3.Error, pymysql.MySQLError) as exc:
+            log_failure("database", "relationships.failed", exc, driver=self.driver)
             raise SourceDatabaseQueryError("Source relationship discovery failed") from exc
 
     def _validate_join_targets(self, mapping: ResourceMapping) -> None:
@@ -704,10 +714,17 @@ class SourceDatabase:
         except SourceDatabaseUnavailableError:
             raise
         except (sqlite3.Error, pymysql.MySQLError) as exc:
+            log_failure("database", "query.failed", exc, driver=self.driver)
             raise SourceDatabaseQueryError(
                 f"The configured mapping for {resource_type} could not be queried"
             ) from exc
         if filters and len(rows) > limit:
+            log_event(
+                "database",
+                "query.row_limit_exceeded",
+                "Mapped database query exceeded its row limit.",
+                level=logging.ERROR,
+            )
             raise SourceDatabaseQueryError(
                 f"The configured query for {resource_type} exceeded its row limit"
             )
@@ -808,6 +825,13 @@ def configured_source_database(
 
         password = read_password(metadata_path, password_env_var)
     if not password:
+        log_event(
+            "database",
+            "configuration.password_missing",
+            "No database password was resolved. Configure the named environment variable "
+            "or save the database password through Connections.",
+            level=logging.ERROR,
+        )
         raise ConfigurationError(
             f"source database password is required: configure {password_env_var}"
             + (" or save a password through Connections" if metadata_path is not None else "")

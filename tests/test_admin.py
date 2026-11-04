@@ -1058,7 +1058,7 @@ def test_cli_serves_api_and_admin_together(tmp_path: Path, monkeypatch, command)
     cli.main()
     assert len(started) == 1
     app, options = started[0]
-    assert options == {"host": "127.0.0.1", "port": 8000}
+    assert options == {"host": "127.0.0.1", "port": 8000, "access_log": False}
     with TestClient(app, base_url="http://127.0.0.1:8000") as client:
         assert client.get("/health/live").status_code == 200
         assert client.get("/admin/setup").url.path == "/admin/login"
@@ -1181,6 +1181,46 @@ def test_observium_page_explains_environment_setup_without_token_input(admin, mo
         page = client.get("/admin/sources").text
         assert "Named token variable: available" in page
         assert "private-test-token" not in page
+
+
+def test_observium_failures_are_visible_in_diagnostics_with_request_reference(admin, monkeypatch):
+    app, _, _ = admin
+    monkeypatch.delenv("MISSING_OBSERVIUM_LOG_TOKEN", raising=False)
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        response = post(
+            client,
+            "observium",
+            url="https://monitoring.example",
+            token_env="MISSING_OBSERVIUM_LOG_TOKEN",
+        )
+        assert response.status_code == 400
+        reference = response.headers["X-Request-ID"]
+        assert reference in response.text
+        assert "View Diagnostics logs" in response.text
+        events = app.state.admin_store.recent_events("observium")
+        assert events[0]["event"] == "configuration.token_missing"
+        assert events[0]["reference"] == reference
+        page = client.get("/admin/diagnostics").text
+        assert "Observium connection logs" in page
+        assert "configuration.token_missing" in page
+        assert reference in page
+
+
+def test_observium_session_block_is_logged_before_any_upstream_attempt(admin, monkeypatch):
+    from unittest.mock import MagicMock
+
+    app, _, _ = admin
+    factory = MagicMock()
+    monkeypatch.setattr("open_carrier_portal.adapters.observium.ObserviumAdapter", factory)
+    with TestClient(app, base_url=BASE) as client:
+        response = client.post("/admin/test-observium", data={"csrf": "private-stale-csrf"})
+    assert response.status_code == 403
+    events = app.state.admin_store.recent_events("observium")
+    assert events[0]["event"] == "connection.blocked_by_admin_session"
+    assert events[0]["reference"] == response.headers["X-Request-ID"]
+    assert "private-stale-csrf" not in json.dumps(events)
+    factory.assert_not_called()
 
 
 def test_observium_missing_environment_error_explains_restart_and_never_saves(admin, monkeypatch):
