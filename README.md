@@ -232,7 +232,29 @@ ocp run-portal-agent
 ```
 
 Use the portal's reachable HTTPS origin in production. Localhost HTTP is allowed
-only for development on the same machine. The agent verifies TLS and does not
+for development on the same machine. For testing on a trusted private network,
+the single default-off `OCP_ALLOW_INSECURE_HTTP=true` testing-mode setting permits
+private-IP HTTP for both the connector listener and portal pairing/heartbeats.
+It accepts literal RFC1918 IPv4 or ULA IPv6 addresses only:
+
+```ini
+OCP_PORTAL_URL=http://10.210.4.224:8080
+OCP_ALLOW_INSECURE_HTTP=true
+```
+
+Set these in the connector service's environment and restart it before pairing.
+Include the `http://` scheme; do not append `/portal` or `/api`. This opt-in is
+required for pairing, loading a saved HTTP connection and sending heartbeats,
+including the CLI agent. It is not stored in the pairing file, so disabling it
+blocks further private HTTP heartbeats. Pairing codes and portal credentials
+travel without encryption; restrict both hosts and the network to trusted users,
+and switch to HTTPS and disable the option for production. HTTP to public IPs,
+non-localhost DNS names, link-local addresses or malformed origins remains blocked.
+Use this one flag for supported testing-mode behavior; there is no separate portal
+testing flag. Set it in each service's environment when running both apps over
+private HTTP. It does not relax authentication, authorization, Observium or outbound
+partner connection requirements, or HTTPS certificate verification.
+The agent verifies TLS for HTTPS and does not
 follow redirects or use environment-provided proxies. The portal's organization
 association comes from the pairing code, not a user-supplied tenant ID; pairing
 does not rewrite the connector's existing local identity or partner configuration.
@@ -315,8 +337,9 @@ origin; wildcard network binds are not allowed. A warning is logged: admin
 passwords, session cookies, partner secrets and data travel without encryption.
 Restrict the listener to authorized test clients using your firewall. Disable
 the option and return to a loopback listener behind HTTPS after testing.
-This option does not relax TLS requirements for Observium, outbound partner
-connections, or hosted-portal pairing.
+The same flag also enables private-IP HTTP portal pairing and heartbeats as described
+above. It does not relax TLS requirements for Observium or outbound partner connections,
+or disable authentication or sharing permissions.
 
 Missing/disabled source profiles, invalid mappings, or missing saved integration
 credentials are logged and shown to signed-in administrators. Integration endpoints
@@ -531,8 +554,8 @@ token issuer and does not need changing just to use an SSH tunnel for the UI.
 
 The hosted portal connection still supports **pairing and heartbeats only**.
 Live portal resource retrieval, remote commands, and portal/connector grant
-synchronization are not implemented. Your private-network HTTP portal cannot be
-paired remotely until HTTPS and certificate trust are configured. Direct partner
+synchronization are not implemented. Remote portal pairing requires HTTPS and
+certificate trust, except for the explicit private-IP HTTP testing opt-in above. Direct partner
 sharing and outbound partner browsing are independent of the hosted portal.
 
 Run the UI integration tests with `python -m pytest tests/test_admin.py`. They

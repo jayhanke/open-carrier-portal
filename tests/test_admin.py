@@ -801,7 +801,7 @@ def test_combined_connector_admin_api_and_lifespan(admin, monkeypatch):
 
     monkeypatch.setattr(
         "open_carrier_portal.admin.send_heartbeat",
-        lambda client, connection: heartbeat_seen.set(),
+        lambda client, connection, **kwargs: heartbeat_seen.set(),
     )
     app = create_app(
         settings, admin_base_url=BASE, connection_file=connection_file, adapter=adapter
@@ -865,15 +865,20 @@ def test_combined_connector_configuration_failure_keeps_admin_available(admin, f
     assert "Integration configuration is invalid" in caplog.text
 
 
-def test_pairing_heartbeat_and_local_disconnect(admin, monkeypatch):
+@pytest.mark.parametrize(
+    ("portal_url", "insecure"),
+    [("https://portal.example", False), ("http://10.210.4.224:8080", True)],
+)
+def test_pairing_heartbeat_and_local_disconnect(admin, monkeypatch, portal_url, insecure):
     from dataclasses import replace
 
     _, settings, connection_file = admin
     app = create_admin_app(
         replace(
             settings,
-            portal_url="https://portal.example",
+            portal_url=portal_url,
             portal_ca_bundle="trusted-portal-ca.pem",
+            allow_insecure_http=insecure,
         ),
         connection_file=connection_file,
     )
@@ -882,8 +887,7 @@ def test_pairing_heartbeat_and_local_disconnect(admin, monkeypatch):
     cas = []
 
     def handler(request: httpx.Request):
-        assert request.url.host == "portal.example"
-        assert request.url.scheme == "https"
+        assert str(request.url).startswith(portal_url + "/api/connectors/")
         requests.append(request.url.path)
         if request.url.path.endswith("/pair"):
             return httpx.Response(200, json={"organization_id": organization, "token": "t" * 64})
@@ -899,7 +903,8 @@ def test_pairing_heartbeat_and_local_disconnect(admin, monkeypatch):
         post(client, "identity", name="Carrier")
         page = client.get("/admin/portal")
         assert "Connect to Carrier Portal" in page.text
-        assert 'href="https://portal.example/portal/connector"' in page.text
+        assert f'href="{portal_url}/portal/connector"' in page.text
+        assert ("Private-network HTTP testing enabled" in page.text) == insecure
         assert 'name="url"' not in page.text
         assert 'name="ca"' not in page.text
         assert "15 minutes" in page.text
@@ -910,7 +915,10 @@ def test_pairing_heartbeat_and_local_disconnect(admin, monkeypatch):
             ).status_code
             == 200
         )
-        assert PortalConnection.load(connection_file).organization_id == organization
+        assert (
+            PortalConnection.load(connection_file, allow_insecure_http=insecure).organization_id
+            == organization
+        )
         assert "Paired &mdash; waiting for a heartbeat" in client.get("/admin/portal").text
         assert 'name="code"' not in client.get("/admin/portal").text
         assert post(client, "heartbeat").status_code == 200

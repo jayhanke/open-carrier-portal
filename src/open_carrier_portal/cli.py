@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import uuid
@@ -200,6 +201,14 @@ def _main(context: LogContext) -> None:
         return
 
     if args.command in {"pair-portal", "run-portal-agent"}:
+        if settings.allow_insecure_http:
+            log_event(
+                "portal",
+                "testing.private_http_enabled",
+                "Private-IP HTTP portal testing enabled: portal credentials are not encrypted "
+                "over HTTP. Use only on a trusted network.",
+                level=logging.WARNING,
+            )
         identity = repository.get_connector_identity()
         if identity is None or not identity.enabled:
             parser.error("initialize an enabled connector first with ocp init")
@@ -212,16 +221,25 @@ def _main(context: LogContext) -> None:
                         connector_id=identity.connector_id,
                         code=getpass("One-time portal pairing code: ").strip(),
                         connection_file=args.connection_file,
+                        allow_insecure_http=settings.allow_insecure_http,
                     )
                     print(
                         f"Paired. Private credentials saved to {args.connection_file}. "
                         "Run ocp run-portal-agent to connect."
                     )
                 else:
-                    connection = PortalConnection.load(args.connection_file)
+                    connection = PortalConnection.load(
+                        args.connection_file,
+                        allow_insecure_http=settings.allow_insecure_http,
+                    )
                     if connection.connector_id != identity.connector_id:
                         parser.error("connection belongs to a different connector; pair again")
-                    run_agent(client, connection, once=args.once)
+                    run_agent(
+                        client,
+                        connection,
+                        once=args.once,
+                        allow_insecure_http=settings.allow_insecure_http,
+                    )
         except FileExistsError:
             parser.error(
                 "connection file already exists; choose a new --connection-file to replace pairing"

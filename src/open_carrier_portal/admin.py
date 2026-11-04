@@ -200,6 +200,15 @@ def create_admin_app(
             level=logging.WARNING,
             store=store,
         )
+    if settings.allow_insecure_http:
+        log_event(
+            "portal",
+            "testing.private_http_enabled",
+            "Private-IP HTTP portal testing enabled: pairing codes and portal credentials "
+            "are not encrypted over HTTP. Use only on a trusted network.",
+            level=logging.WARNING,
+            store=store,
+        )
 
     def monitoring_enabled() -> bool:
         return bool(settings.observium_base_url or store.get("observium").get("url"))
@@ -210,7 +219,9 @@ def create_admin_app(
     def heartbeat() -> None:
         if not connection_file.exists():
             return
-        connection = PortalConnection.load(connection_file)
+        connection = PortalConnection.load(
+            connection_file, allow_insecure_http=settings.allow_insecure_http
+        )
         identity = repository.get_connector_identity()
         if (
             identity is None
@@ -219,7 +230,7 @@ def create_admin_app(
         ):
             raise ValueError("portal connection does not match enabled connector identity")
         with http_client(portal_ca()) as client:
-            send_heartbeat(client, connection)
+            send_heartbeat(client, connection, allow_insecure_http=settings.allow_insecure_http)
         store.save("heartbeat", {"seen": str(time.time())})
 
     async def agent_loop() -> None:
@@ -689,7 +700,9 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             connection_error = ""
             if paired:
                 try:
-                    portal_url = PortalConnection.load(connection_file).portal_url
+                    portal_url = PortalConnection.load(
+                        connection_file, allow_insecure_http=settings.allow_insecure_http
+                    ).portal_url
                 except (ValueError, OSError) as exc:
                     log_failure("portal", "saved_connection.failed", exc)
                     connection_error = (
@@ -762,7 +775,14 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 '<p class="portal-intro">Link this connector to your company&rsquo;s '
                 "Carrier Portal account in three simple steps. "
                 "You can also use direct partner sharing without connecting to the portal.</p>"
-                '<div class="portal-grid"><ol class="portal-steps">'
+                + (
+                    '<p class="portal-warning"><strong>Private-network HTTP testing enabled.'
+                    "</strong> Pairing codes and portal credentials are not encrypted over HTTP. "
+                    "Use only on a trusted network; switch to HTTPS for production.</p>"
+                    if settings.allow_insecure_http
+                    else ""
+                )
+                + '<div class="portal-grid"><ol class="portal-steps">'
                 '<li class="portal-step"><div class="portal-step-content">'
                 "<h3>Open Carrier Portal</h3>"
                 "<p>Sign in with your <strong>company administrator account</strong>, "
@@ -1211,6 +1231,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     connector_id=identity.connector_id,
                     code=text(data, "code"),
                     connection_file=connection_file,
+                    allow_insecure_http=settings.allow_insecure_http,
                 )
             store.save("portal", {"ca": ca})
             store.save("heartbeat", {})

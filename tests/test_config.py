@@ -62,7 +62,26 @@ def test_portal_configuration_from_environment(monkeypatch):
     settings = Settings.from_env()
     assert settings.portal_url == "https://portal.example"
     assert settings.portal_ca_bundle == "trusted-portal-ca.pem"
-    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
     monkeypatch.setenv("OCP_PORTAL_URL", "http://10.210.4.224:8080")
+    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "false")
     with pytest.raises(ConfigurationError, match="OCP_PORTAL_URL"):
+        Settings.from_env()
+    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setenv("OCP_ISSUER_URL", "http://10.210.4.223:8000")
+    settings = Settings.from_env()
+    assert settings.portal_url == "http://10.210.4.224:8080"
+    assert settings.issuer_url == "http://10.210.4.223:8000"
+    assert settings.allow_insecure_http
+    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "invalid")
+    with pytest.raises(ConfigurationError, match="must be true or false"):
+        Settings.from_env()
+
+
+def test_testing_mode_does_not_relax_observium_requirement(monkeypatch):
+    monkeypatch.setenv("OCP_TOKEN_SIGNING_KEY", "s" * 48)
+    monkeypatch.setenv("OCP_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setenv("OCP_ISSUER_URL", "http://10.210.4.223:8000")
+    assert Settings.from_env().allow_insecure_http
+    monkeypatch.setenv("OCP_OBSERVIUM_BASE_URL", "http://10.210.4.224")
+    with pytest.raises(ConfigurationError, match="OCP_OBSERVIUM_BASE_URL must use HTTPS"):
         Settings.from_env()

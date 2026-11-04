@@ -6,34 +6,14 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
 
+from open_carrier_portal.config import validate_portal_url
 from open_carrier_portal.diagnostics import log_event, log_failure, target_origin
 
 DEFAULT_CONNECTION_FILE = Path.home() / ".open-carrier-portal" / "portal-connection.json"
-
-
-def validate_portal_url(value: str) -> str:
-    parsed = urlsplit(value)
-    if (
-        not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-        or parsed.path not in {"", "/"}
-        or (
-            parsed.scheme != "https"
-            and not (
-                parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-            )
-        )
-    ):
-        raise ValueError("portal URL must be an HTTPS origin (HTTP allowed only on localhost)")
-    return value.rstrip("/")
 
 
 @dataclass(frozen=True)
@@ -44,7 +24,7 @@ class PortalConnection:
     token: str
 
     @classmethod
-    def load(cls, path: Path) -> PortalConnection:
+    def load(cls, path: Path, *, allow_insecure_http: bool = False) -> PortalConnection:
         if os.name != "nt" and path.stat().st_mode & 0o077:
             raise ValueError("connection file must be private; run chmod 600 on it")
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -57,7 +37,7 @@ class PortalConnection:
         if not 40 <= len(token) <= 128 or not token.isascii() or not token.isprintable():
             raise ValueError("invalid portal connection credential")
         return cls(
-            validate_portal_url(data["portal_url"]),
+            validate_portal_url(data["portal_url"], allow_insecure_http=allow_insecure_http),
             str(UUID(data["connector_id"])),
             str(UUID(data["organization_id"])),
             token,
@@ -71,11 +51,19 @@ def pair_portal(
     connector_id: str,
     code: str,
     connection_file: Path,
+    allow_insecure_http: bool = False,
 ) -> PortalConnection:
-    portal_url = validate_portal_url(portal_url)
+    portal_url = validate_portal_url(portal_url, allow_insecure_http=allow_insecure_http)
     connector_id = str(UUID(connector_id))
     if not 40 <= len(code) <= 128:
         raise ValueError("invalid pairing code")
+    if allow_insecure_http and portal_url.startswith("http://"):
+        log_event(
+            "portal",
+            "pairing.insecure_http",
+            "HTTP portal pairing sends the pairing code and portal credential without encryption.",
+            level=logging.WARNING,
+        )
     log_event(
         "portal",
         "pairing.started",
@@ -121,10 +109,16 @@ def pair_portal(
     return connection
 
 
-def send_heartbeat(client: httpx.Client, connection: PortalConnection) -> None:
+def send_heartbeat(
+    client: httpx.Client,
+    connection: PortalConnection,
+    *,
+    allow_insecure_http: bool = False,
+) -> None:
+    portal_url = validate_portal_url(connection.portal_url, allow_insecure_http=allow_insecure_http)
     log_event("portal", "heartbeat.started", "Sending portal heartbeat.")
     response = client.post(
-        f"{connection.portal_url}/api/connectors/heartbeat",
+        f"{portal_url}/api/connectors/heartbeat",
         headers={"Authorization": f"Bearer {connection.token}"},
         json={"connector_id": connection.connector_id},
     )
@@ -150,10 +144,16 @@ def send_heartbeat(client: httpx.Client, connection: PortalConnection) -> None:
     log_event("portal", "heartbeat.accepted", "Portal heartbeat accepted.")
 
 
-def run_agent(client: httpx.Client, connection: PortalConnection, *, once: bool = False) -> None:
+def run_agent(
+    client: httpx.Client,
+    connection: PortalConnection,
+    *,
+    once: bool = False,
+    allow_insecure_http: bool = False,
+) -> None:
     while True:
         try:
-            send_heartbeat(client, connection)
+            send_heartbeat(client, connection, allow_insecure_http=allow_insecure_http)
         except httpx.HTTPStatusError as exc:
             log_failure("portal", "heartbeat.failed", exc)
             if once or exc.response.status_code < 500:

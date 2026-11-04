@@ -7,7 +7,6 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from open_carrier_portal.errors import ConfigurationError
-from open_carrier_portal.portal_agent import validate_portal_url
 
 PRIVATE_NETWORKS = tuple(
     ip_network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
@@ -49,6 +48,17 @@ def validate_connector_url(value: str, *, allow_insecure_http: bool = False) -> 
         "connector URL must use HTTPS outside localhost; trusted private-IP HTTP testing "
         "requires OCP_ALLOW_INSECURE_HTTP=true"
     )
+
+
+def validate_portal_url(value: str, *, allow_insecure_http: bool = False) -> str:
+    try:
+        return validate_connector_url(value, allow_insecure_http=allow_insecure_http)
+    except ValueError as exc:
+        raise ValueError(
+            "portal URL must be an HTTPS origin without credentials or a path "
+            "(HTTP allowed on localhost; trusted private-IP HTTP testing requires "
+            "OCP_ALLOW_INSECURE_HTTP=true)"
+        ) from exc
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -98,7 +108,7 @@ class Settings:
         validate_connector_url(self.issuer_url, allow_insecure_http=self.allow_insecure_http)
         if self.portal_url:
             try:
-                validate_portal_url(self.portal_url)
+                validate_portal_url(self.portal_url, allow_insecure_http=self.allow_insecure_http)
             except ValueError as exc:
                 raise ConfigurationError(f"OCP_PORTAL_URL: {exc}") from exc
         if self.observium_base_url:
