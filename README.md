@@ -422,7 +422,14 @@ session hashes, partner grants, configuration and audit events.
   database. Validation checks schema and join keys, not complete source-data
   referential integrity or read-only permissions. Restart the connector after
   saving to apply mappings to the running API.
-- **Partners:** provision direct inbound partners after confirming bilateral
+- **Partners:** the **Companies from your database** directory reads company names
+  and local source IDs through the saved `companies.source_id` and `companies.name`
+  mapping. It defaults to the selected source connection, or lets you choose a
+  connection explicitly. The read-only preview shows at most 100 companies and
+  indicates when more exist; it does not persist company records, create partners,
+  or grant access. Missing mappings and database failures are shown explicitly,
+  with failures recorded in Diagnostics without company records.
+  Provision direct inbound partners after confirming bilateral
   approval out of band. Select scopes and specific opaque resource IDs, or
   explicitly opt in to all resources for those scopes. Client secrets appear
   **once**, only in the successful creation response. Copy them privately;

@@ -56,6 +56,165 @@ def post(browser: TestClient, action: str, **data):
     return browser.post("/admin/" + action, data={"csrf": csrf(browser), **data})
 
 
+@pytest.fixture
+def company_source(admin, tmp_path):
+    app, _, _ = admin
+    database = tmp_path / "customer-directory.db"
+    with sqlite3.connect(database) as db:
+        db.execute(
+            "CREATE TABLE customer_accounts (account_key INTEGER PRIMARY KEY, display_label TEXT)"
+        )
+        db.executemany(
+            "INSERT INTO customer_accounts VALUES (?, ?)",
+            [(42, "Example <Carrier>"), (77, "Second company")],
+        )
+    app.state.repository.put_source_database_profile(
+        name="customer-db",
+        driver="sqlite",
+        database_name=str(database),
+        host=None,
+        port=None,
+        username=None,
+        password_env_var=None,
+        tls_ca_path=None,
+        timeout_seconds=10,
+        mapping_json=json.dumps(
+            {
+                "resources": {
+                    "companies": {
+                        "table": "customer_accounts",
+                        "columns": {"source_id": "account_key", "name": "display_label"},
+                    },
+                    "circuits": {
+                        "table": "not_needed_for_company_directory",
+                        "columns": {"source_id": "id"},
+                    },
+                }
+            }
+        ),
+    )
+    return database
+
+
+def test_partners_displays_companies_from_selected_saved_mapping(admin, company_source):
+    app, _, _ = admin
+    with TestClient(app, base_url=BASE) as client:
+        assert client.get("/admin/partners?profile=customer-db").url.path == "/admin/login"
+        login(client)
+        content = client.get("/admin/partners?profile=customer-db").text
+        assert "Companies from your database" in content
+        assert "Company ID in your database" in content
+        assert "<td>42</td>" in content
+        assert "Example &lt;Carrier&gt;" in content
+        assert "Example <Carrier>" not in content
+        assert "Second company" in content
+        assert "2 mapped companies." in content
+        assert 'value="customer-db" selected' in content
+        assert "Could not load mapped companies" not in content
+        assert 'action="/admin/partner"' in content
+        assert app.state.repository.administration_snapshot()["partners"] == []
+        events = app.state.admin_store.recent_events("database")
+        event = next(event for event in events if event["event"] == "companies.loaded")
+        assert json.loads(event["details"]) == {"rows_shown": 2, "truncated": 0}
+        assert "Example" not in json.dumps(events)
+    with sqlite3.connect(company_source) as db:
+        assert db.execute("SELECT COUNT(*) FROM customer_accounts").fetchone()[0] == 2
+
+
+def test_partners_uses_selected_connection_and_does_not_guess_one(admin, company_source):
+    app, _, _ = admin
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        content = client.get("/admin/partners").text
+        assert "Select a database connection" in content
+        assert "Second company" not in content
+        app.state.admin_store.save("source", {"name": "customer-db"})
+        content = client.get("/admin/partners").text
+        assert "Second company" in content
+
+
+@pytest.mark.parametrize("columns", [{}, {"source_id": "account_key"}, {"name": "display_label"}])
+def test_partners_requires_only_the_companies_mapping(admin, company_source, columns):
+    app, _, _ = admin
+    app.state.repository.put_source_database_profile(
+        name="customer-db",
+        driver="sqlite",
+        database_name=str(company_source),
+        host=None,
+        port=None,
+        username=None,
+        password_env_var=None,
+        tls_ca_path=None,
+        timeout_seconds=10,
+        mapping_json=json.dumps(
+            {"resources": {"companies": {"table": "customer_accounts", "columns": columns}}}
+            if columns
+            else {"resources": {}}
+        ),
+    )
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        response = client.get("/admin/partners?profile=customer-db")
+        assert response.status_code == 200
+        assert "Save a Companies mapping" in response.text
+        assert 'href="/admin/mapping?profile=customer-db"' in response.text
+        assert "Second company" not in response.text
+
+
+def test_partners_empty_company_directory_is_not_an_error(admin, company_source):
+    app, _, _ = admin
+    with sqlite3.connect(company_source) as db:
+        db.execute("DELETE FROM customer_accounts")
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        content = client.get("/admin/partners?profile=customer-db").text
+        assert "No companies were returned" in content
+        assert "Could not load" not in content
+
+
+@pytest.mark.parametrize("failure", ["missing-profile", "query", "invalid-company"])
+def test_partners_company_errors_are_visible_and_logged(admin, company_source, failure):
+    app, _, _ = admin
+    if failure == "query":
+        with sqlite3.connect(company_source) as db:
+            db.execute("DROP TABLE customer_accounts")
+    elif failure == "invalid-company":
+        with sqlite3.connect(company_source) as db:
+            db.execute("UPDATE customer_accounts SET display_label = NULL WHERE account_key = 42")
+    profile = "missing" if failure == "missing-profile" else "customer-db"
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        response = client.get("/admin/partners?profile=" + profile)
+        assert response.status_code == 200
+        assert "Could not load mapped companies" in response.text
+        assert "Diagnostic reference:" in response.text
+        assert 'href="/admin/diagnostics"' in response.text
+        assert 'action="/admin/partner"' in response.text
+        events = app.state.admin_store.recent_events("database")
+        event = next(
+            event for event in events if event["event"].startswith("companies.load_failed.")
+        )
+        assert event["reference"] == response.headers["X-Request-ID"]
+
+
+def test_partners_company_directory_has_explicit_row_limit(admin, company_source):
+    app, _, _ = admin
+    with sqlite3.connect(company_source) as db:
+        db.executemany(
+            "INSERT INTO customer_accounts VALUES (?, ?)",
+            [(i, f"Company number {i}") for i in range(1000, 1200)],
+        )
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        content = client.get("/admin/partners?profile=customer-db").text
+        assert "Showing the first 100 companies" in content
+        assert "Company number 1097" in content
+        assert "Company number 1098" not in content
+        events = app.state.admin_store.recent_events("database")
+        event = next(event for event in events if event["event"] == "companies.loaded")
+        assert json.loads(event["details"]) == {"rows_shown": 100, "truncated": 1}
+
+
 def test_authentication_csrf_host_and_reset(admin):
     app, _, _ = admin
     with TestClient(app, base_url=BASE) as client:

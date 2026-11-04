@@ -477,6 +477,81 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             f"<button>{escape(button)}</button></form>"
         )
 
+    def company_directory(selected_profile: str, profiles: list[dict[str, str]]) -> str:
+        name = (
+            selected_profile
+            or settings.source_database_profile
+            or store.get("source").get("name", "")
+        )
+        content = (
+            "<h3>Companies from your database</h3>"
+            "<p>Read directly through the saved Companies mapping. The company ID is the "
+            "source ID in your database, not a partner ID from another connector. "
+            "Listing companies does not create partners or grant access.</p>"
+            '<form method="get" action="/admin/partners"><label>Database connection'
+            '<select name="profile"><option value="">Choose a database connection</option>'
+            + "".join(
+                f'<option value="{escape(profile["name"])}"'
+                f"{' selected' if profile['name'] == name else ''}>"
+                f"{escape(profile['name'])}"
+                f"{' (disabled)' if profile['enabled'] != '1' else ''}</option>"
+                for profile in profiles
+            )
+            + '</select></label><button type="submit">Load companies</button></form>'
+        )
+        if not name:
+            return content + "<p>Select a database connection to load its mapped companies.</p>"
+        mapping_url = "/admin/mapping?profile=" + quote(name, safe="")
+        try:
+            source = source_for(repository, name, settings.database_path)
+            if source.missing_fields_for(requirements={"companies": ("source_id", "name")}):
+                return (
+                    content + "<p>Save a Companies mapping with both Company ID (source_id) and "
+                    f'Company name (name) first. <a href="{mapping_url}">Open mapping</a>.</p>'
+                )
+            rows = source.fetch("companies", limit=101)
+            if any(
+                row[field] is None or not str(row[field]).strip()
+                for row in rows
+                for field in ("source_id", "name")
+            ):
+                raise SourceDatabaseError("Mapped companies require non-empty IDs and names")
+        except (ValueError, SourceDatabaseError, OSError) as exc:
+            log_failure("database", "companies.load_failed", exc)
+            return (
+                content + '<p class="notice" role="alert">Could not load mapped companies. '
+                "Check the database connection and saved Companies mapping. "
+                f"Diagnostic reference: <code>{escape(request_reference())}</code>. "
+                '<a href="/admin/diagnostics">View Diagnostics logs</a>.</p>'
+            )
+        log_event(
+            "database",
+            "companies.loaded",
+            "Loaded mapped companies for the partner administration page.",
+            rows_shown=min(len(rows), 100),
+            truncated=int(len(rows) > 100),
+        )
+        if not rows:
+            return content + "<p>No companies were returned by the saved Companies mapping.</p>"
+        return (
+            content
+            + (
+                "<p>Showing the first 100 companies; more are available in your database. "
+                "This directory preview is limited to 100 rows.</p>"
+                if len(rows) > 100
+                else f"<p>{len(rows)} mapped companies.</p>"
+            )
+            + table(
+                [
+                    {
+                        "Company ID in your database": str(row["source_id"]),
+                        "Company": str(row["name"]),
+                    }
+                    for row in rows[:100]
+                ]
+            )
+        )
+
     def render(section: str, csrf: str, selected_profile: str = "") -> str:
         identity = repository.get_connector_identity()
         snapshot = repository.administration_snapshot()
@@ -967,6 +1042,8 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             )
         if section == "partners":
             return (
+                company_directory(selected_profile, snapshot["profiles"])
+                + "<h3>Partner access</h3>"
                 "<p>Partners query this connector without the portal. Confirm bilateral consent "
                 "out of band. Grants with no resource IDs cover ALL resources in that scope.</p>"
                 + table(snapshot["partners"])
