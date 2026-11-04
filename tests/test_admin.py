@@ -751,7 +751,7 @@ def test_sources_mapping_preview_and_api_activation(admin, tmp_path: Path):
         ) == {"resources": {}}
         catalog = client.get("/admin/mapping/data?profile=custom").json()
         assert catalog["mapping"] == {"resources": {}}
-        assert len(catalog["target_tables"]) == 12
+        assert len(catalog["target_tables"]) == 13
         discovered = post(client, "schema", name="custom")
         assert discovered.status_code == 200
         assert "circuits" in discovered.text

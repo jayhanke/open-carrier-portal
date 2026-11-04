@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Literal
 
 from starlette.concurrency import run_in_threadpool
 
 from open_carrier_portal.adapters.base import MonitoringAdapter
-from open_carrier_portal.diagnostics import log_failure
+from open_carrier_portal.diagnostics import log_event, log_failure
 from open_carrier_portal.errors import (
     ConfigurationError,
     ConnectorError,
@@ -29,6 +30,7 @@ from open_carrier_portal.models import (
     CircuitPortStatus,
     CircuitRackUnit,
     CircuitSite,
+    PathItemIssue,
 )
 from open_carrier_portal.repository import Repository
 from open_carrier_portal.source_contract import CORE_RESOURCES, SOURCE_RESOURCES
@@ -71,12 +73,14 @@ class CircuitReader:
         *,
         integration: str = "nettool",
         monitoring_required: bool = True,
+        allow_unresolved_path_items: bool = False,
     ) -> None:
         self.repository = repository
         self.source = source
         self.monitoring = monitoring
         self.integration = integration
         self.monitoring_required = monitoring_required
+        self.allow_unresolved_path_items = allow_unresolved_path_items
         self._monitoring_unavailable = False
         self._ports: dict[str, CircuitPort] = {}
         self._devices: dict[str, CircuitDevice] = {}
@@ -409,6 +413,27 @@ class CircuitReader:
         complete = not self.missing_fields
         items: list[CircuitPathItem] = []
 
+        def add_unresolved(position: int, label: str, issue: PathItemIssue) -> None:
+            nonlocal complete
+            complete = False
+            items.append(
+                CircuitPathItem(
+                    position=position,
+                    kind="unresolved",
+                    resource_id=self.public_id("layout_item", f"{circuit_id}:{position}"),
+                    name=label[:512] or "Unknown component",
+                    issue=issue,
+                )
+            )
+            log_event(
+                "portal",
+                "path.item_unresolved",
+                "Layout item details are unavailable; its label and position were retained.",
+                level=logging.WARNING,
+                position=position,
+                reason=issue,
+            )
+
         async def add_port(source_id: object, position: int) -> None:
             port = await self.port(source_id)
             row = await self.reference("ports", source_id)
@@ -439,29 +464,60 @@ class CircuitReader:
             )
             if not rows:
                 raise UpstreamResponseError("The shared circuit has no ordered path steps")
+            components: dict[
+                str, tuple[str, Literal["patch", "pseudowire", "dark_fiber"]]
+            ] = {
+                "patch": ("patches", "patch"),
+                "pw": ("pseudowires", "pseudowire"),
+                "pseudowire": ("pseudowires", "pseudowire"),
+                "newdarkfibercircuit": ("new_dark_fiber_circuits", "dark_fiber"),
+            }
             for row in rows:
                 source_id = row.get("item_source_id")
-                if source_id is None:
-                    raise UpstreamResponseError("A path item has no source reference")
                 try:
                     position = int(row["position"])
                 except (KeyError, ValueError, TypeError) as exc:
                     raise UpstreamResponseError("A path item has an invalid position") from exc
-                kind = str(row.get("item_type", "")).strip().casefold()
+                label = str(row.get("item_type") or "").strip()
+                kind = label.casefold()
+                if source_id is None:
+                    if self.allow_unresolved_path_items:
+                        add_unresolved(position, label, "missing_reference")
+                        continue
+                    raise UpstreamResponseError("A path item has no source reference")
                 if kind == "port":
                     await add_port(source_id, position)
                     continue
-                if kind == "patch":
-                    component = await self.reference("patches", source_id)
-                    component_kind: Literal["patch", "pseudowire"] = "patch"
-                elif kind in {"pw", "pseudowire"}:
-                    component = await self.reference("pseudowires", source_id)
-                    component_kind = "pseudowire"
-                else:
+                configuration = components.get(kind)
+                if configuration is None:
+                    if self.allow_unresolved_path_items:
+                        add_unresolved(position, label, "unsupported_type")
+                        continue
                     raise UpstreamResponseError(
                         "The circuit path contains an unsupported item type"
                     )
+                resource, component_kind = configuration
+                if self.allow_unresolved_path_items:
+                    if not self.source.has_resource(resource) or resource in self.missing_fields:
+                        add_unresolved(position, label, "mapping_missing")
+                        continue
+                    component = await self.one(resource, source_id)
+                    if component is None:
+                        add_unresolved(position, label, "missing_reference")
+                        continue
+                else:
+                    component = await self.reference(resource, source_id)
                 assert component is not None
+                if component_kind == "dark_fiber":
+                    items.append(
+                        CircuitPathItem(
+                            position=position,
+                            kind="dark_fiber",
+                            resource_id=self.public_id("dark_fiber", source_id),
+                            name=_text(component.get("name")),
+                        )
+                    )
+                    continue
                 a_id, z_id = component.get("port_a_id"), component.get("port_b_id")
                 a = await self.port(a_id)
                 z = await self.port(z_id)

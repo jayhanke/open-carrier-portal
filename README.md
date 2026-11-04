@@ -122,10 +122,10 @@ but v1 has no policy switch to publish them. No new child-resource enumeration r
 are introduced by circuit sharing.
 
 Mapping targets come from a separate OCP field catalog, not a copy of the source
-schema. The mapping board shows connected database tables on the left and twelve
+schema. The mapping board shows connected database tables on the left and thirteen
 OCP target tables on the right: **Circuits, Devices, Ports/interfaces, Locations,
-Companies, Racks, Rack positions, Services, Circuit paths, Circuit path steps, Patches
-and Pseudowires**. Search the right-hand catalog by table or field.
+Companies, Racks, Rack positions, Services, Circuit paths, Circuit path steps, Patches,
+Pseudowires and Dark fiber circuits**. Search the right-hand catalog by table or field.
 Each OCP table has a **?** button with its purpose, relationship meanings and example
 source-column assignments. Open it by mouse or keyboard; close with **Close**, Escape
 or a click outside. Opening help does not select a source section or change a draft.
@@ -303,9 +303,25 @@ For partner clients, propose **Full circuit layout and port monitoring** in port
 **Setup → Permissions**, then approve the new revision under connector **Partners**
 with the **FULL LAYOUT** checkbox. The company-billing filter and final live authorization
 still apply; this exposes infrastructure within the circuit, not independent browsing.
-The ordered layout projects mapped ports, patches, pseudowires and secondary patch ports
+The ordered layout projects mapped ports, patches, pseudowires, dark-fiber segments and secondary patch ports
 (up to 200 nodes), with device/rack/site context and live Observium port status.
-Unsupported types or broken/ambiguous path references are reported, not omitted.
+Live portal layouts retain unknown component types as labeled steps using their declared
+`item_type` (`TableName` in NetTool), in the original order. Unmapped component sections or
+missing component records also retain their label with **Details unavailable**. The layout
+is explicitly marked incomplete; no connections or healthy monitoring are invented. The
+connector logs `path.item_unresolved` with its position and a safe reason code. Only approved
+canonical mappings are queried: a source type label never becomes an arbitrary table query.
+This behavior applies to full-layout owner and partner views, not endpoint-only shares.
+Invalid ordering, ambiguous identities, broken required port/device links, source-query
+failures and authorization failures remain errors. The direct shared-circuit API stays strict.
+`NewDarkFiberCircuit` steps use the optional **Dark fiber circuits** mapping:
+`NewDarkFiberCircuitID` to `source_id` and `Description` to `name`. Like SFNCustomer,
+the step shows the segment description; linked port status remains on surrounding Port
+steps. No dark-fiber billing/order fields or independent browsing are exposed. Existing
+saved mappings are not automatically expanded: add and validate this mapping when these
+steps need enriched descriptions, then re-enable own-company browsing (or reapprove the
+partner policy) because the source mapping fingerprint has changed. Default labels need
+no new mapping or approval. Update both applications together.
 `ports.observium_id` selects the exact Observium interface; `devices.observium_id`
 verifies that it belongs to the mapped device. Keep the existing Observium connection
 enabled and configured on the connector. No credentials or raw monitoring rows reach
@@ -843,7 +859,7 @@ ocp revoke-circuit-share `
 
 `endpoints` visibility returns only the configured A/Z ports. `sfn_path` and
 `full_shared_path` return the ordered `CircuitLayoutItem` path, resolving only its
-`Port`, `Patch`, and `PW` source records. Every returned component ID is opaque and is
+`Port`, `Patch`, `PW`, and mapped `NewDarkFiberCircuit` source records. Every returned component ID is opaque and is
 available only inside the authorized parent circuit response.
 
 Initialize the owning organization and create the first mutually approved partner:

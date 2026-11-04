@@ -95,6 +95,10 @@ def test_nettool_defaults_map_complete_circuit_path() -> None:
             "port_b_id": "PortBID",
         },
     )
+    assert resources["new_dark_fiber_circuits"] == ResourceMapping(
+        "NewDarkFiberCircuit",
+        {"source_id": "NewDarkFiberCircuitID", "name": "Description"},
+    )
 
 
 def test_source_database_fetch_matching_filters_and_orders_mapped_fields(

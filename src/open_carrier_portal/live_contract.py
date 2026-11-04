@@ -99,16 +99,30 @@ class LayoutPort(LivePort):
     role: Literal["port", "a", "z", "a_secondary", "z_secondary"]
 
 
+PathItemIssue = Literal["unsupported_type", "mapping_missing", "missing_reference"]
+
+
 class LivePathItem(WireModel):
     position: int = Field(ge=0, strict=True)
-    kind: Literal["port", "patch", "pseudowire"]
+    kind: Literal["port", "patch", "pseudowire", "dark_fiber", "unresolved"]
     name: str | None = Field(default=None, max_length=512)
+    issue: PathItemIssue | None = None
     patch_type: str | None = Field(default=None, max_length=120)
-    ports: list[LayoutPort] = Field(min_length=1, max_length=4)
+    ports: list[LayoutPort] = Field(max_length=4)
 
     @model_validator(mode="after")
     def valid_ports(self) -> Self:
         roles = [port.role for port in self.ports]
+        if self.kind == "unresolved":
+            if self.issue is None or roles or self.patch_type is not None or not self.name:
+                raise ValueError("unresolved path nodes require a label and issue, not readings")
+            return self
+        if self.issue is not None:
+            raise ValueError("only unresolved path nodes may carry an issue")
+        if self.kind == "dark_fiber":
+            if roles or self.patch_type is not None:
+                raise ValueError("dark-fiber segments carry a description, not port readings")
+            return self
         if (self.kind == "port" and roles != ["port"]) or (
             self.kind != "port"
             and (

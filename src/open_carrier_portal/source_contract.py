@@ -112,6 +112,9 @@ SOURCE_RESOURCES = {
         ("source_id", "port_a_id", "port_b_id"),
         ("pseudowire_id",),
     ),
+    "new_dark_fiber_circuits": ResourceDefinition(
+        "Dark fiber circuits (optional)", ("source_id",), ("name",)
+    ),
 }
 
 CORE_RESOURCES = (
@@ -328,6 +331,23 @@ OCP_TABLES = {
             ("PseudoWire.PortBID", "pseudowires.port_b_id"),
         ),
     },
+    "new_dark_fiber_circuits": {
+        "label": "Dark fiber circuits",
+        "description": "Dark-fiber segment descriptions within an approved circuit path.",
+        "resources": ("new_dark_fiber_circuits",),
+        "help": (
+            "Optionally map this section to enrich NewDarkFiberCircuit steps with "
+            "descriptions. Without it, live portal layouts retain the declared item label "
+            "and mark its details unavailable. With it, the path shows the segment "
+            "description, as in SFNCustomer; adjacent Port steps "
+            "provide connected equipment and Observium status. This grants no separate "
+            "dark-fiber inventory browsing or billing/order access."
+        ),
+        "examples": (
+            ("NewDarkFiberCircuit.NewDarkFiberCircuitID", "new_dark_fiber_circuits.source_id"),
+            ("NewDarkFiberCircuit.Description", "new_dark_fiber_circuits.name"),
+        ),
+    },
 }
 
 MAPPING_GROUPS = {
@@ -353,6 +373,7 @@ MAPPING_GROUPS = {
             "devices",
             "patches",
             "pseudowires",
+            "new_dark_fiber_circuits",
         ),
     },
 }
@@ -412,6 +433,7 @@ BASIC_FIELDS = {
         "port_b_secondary_id",
     ),
     "pseudowires": ("source_id", "pseudowire_id", "port_a_id", "port_b_id"),
+    "new_dark_fiber_circuits": ("source_id", "name"),
 }
 
 SHARING_FIELDS = {

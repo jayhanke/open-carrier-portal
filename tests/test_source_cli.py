@@ -61,6 +61,7 @@ def test_configure_and_test_sqlite_source_profile(
         "companies",
         "devices",
         "locations",
+        "new_dark_fiber_circuits",
         "patches",
         "ports",
         "pseudowires",

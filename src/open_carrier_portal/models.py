@@ -178,13 +178,17 @@ class CircuitPort(BaseModel):
     monitoring: CircuitPortStatus | None = None
 
 
+PathItemIssue = Literal["unsupported_type", "mapping_missing", "missing_reference"]
+
+
 class CircuitPathItem(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     position: int = Field(ge=0)
-    kind: Literal["port", "patch", "pseudowire"]
+    kind: Literal["port", "patch", "pseudowire", "dark_fiber", "unresolved"]
     resource_id: str
     name: str | None = None
+    issue: PathItemIssue | None = None
     device_id: str | None = None
     patch_type: str | int | None = None
     port_a_id: str | None = None

@@ -540,6 +540,48 @@ def test_zero_secondary_patch_ports_do_not_break_direct_circuit_reads(
     assert patch["port_b_secondary_id"] is None
 
 
+@pytest.mark.parametrize("suffix", ["", "/path"])
+def test_dark_fiber_segment_is_resolved_inside_the_authorized_path(circuit_app, suffix):
+    app, client_id, _, circuit_id, source_path, _, _ = circuit_app
+    with sqlite3.connect(source_path) as db:
+        db.execute("INSERT INTO CircuitLayoutItem VALUES(5,42,25,'NewDarkFiberCircuit',701)")
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/circuits/" + circuit_id + suffix, headers=token(client, client_id)
+        )
+    assert response.status_code == 200, response.text
+    path = response.json()["path"] if not suffix else response.json()
+    segment = path["items"][2]
+    assert segment["kind"] == "dark_fiber"
+    assert segment["name"] == "Example dark fiber segment"
+    assert segment["resource_id"].startswith("dark_fiber_")
+    assert segment["port"] is None and segment["port_a"] is None
+
+
+def test_unmapped_dark_fiber_segment_is_an_explicit_error(circuit_app):
+    app, client_id, _, circuit_id, source_path, _, _ = circuit_app
+    with sqlite3.connect(source_path) as db:
+        db.execute("INSERT INTO CircuitLayoutItem VALUES(5,42,25,'NewDarkFiberCircuit',701)")
+    del app.state.source_database._mapping.resources["new_dark_fiber_circuits"]
+    with TestClient(app) as client:
+        response = client.get("/v1/circuits/" + circuit_id, headers=token(client, client_id))
+    assert response.status_code == 502
+    assert "source mapping for new_dark_fiber_circuits" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("suffix", ["", "/path"])
+def test_direct_api_remains_strict_for_unknown_path_items(circuit_app, suffix):
+    app, client_id, _, circuit_id, source_path, _, _ = circuit_app
+    with sqlite3.connect(source_path) as db:
+        db.execute("UPDATE CircuitLayoutItem SET TableName='FutureTransport'")
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/circuits/" + circuit_id + suffix, headers=token(client, client_id)
+        )
+    assert response.status_code == 502
+    assert "unsupported item type" in response.json()["error"]["message"]
+
+
 def test_mapper_catalog_and_legacy_mapping_preservation(circuit_app):
     from test_admin import login
 
@@ -636,6 +678,7 @@ def test_ocp_catalog_covers_inventory_and_device_port_monitoring_only():
         "path_steps",
         "patches",
         "pseudowires",
+        "new_dark_fiber_circuits",
     }
     inventory = [resource for table in OCP_TABLES.values() for resource in table["resources"]]
     assert sorted(inventory) == sorted(SOURCE_RESOURCES)

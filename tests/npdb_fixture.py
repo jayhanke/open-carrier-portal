@@ -62,6 +62,9 @@ def create_npdb(path: Path) -> None:
                 PseudoWireID INTEGER PRIMARY KEY, PWID INTEGER,
                 PortAID INTEGER REFERENCES Port, PortBID INTEGER REFERENCES Port
             );
+            CREATE TABLE NewDarkFiberCircuit (
+                NewDarkFiberCircuitID INTEGER PRIMARY KEY, Description TEXT
+            );
             INSERT INTO company VALUES (7, 'Example Carrier'), (8, 'Example Partner');
             INSERT INTO Location VALUES
                 (10, '100 Main Street', NULL, 'Example City', 'IA', '50000', 42, -93, '2', '201');
@@ -93,4 +96,5 @@ def create_npdb(path: Path) -> None:
             INSERT INTO Patch VALUES
                 (501, 'fiber', 101, 202, NULL, NULL, NULL, NULL, '2026-01-01', NULL, NULL, 0, 5);
             INSERT INTO PseudoWire VALUES (601, 65000, 101, 202);
+            INSERT INTO NewDarkFiberCircuit VALUES (701, 'Example dark fiber segment');
         """)

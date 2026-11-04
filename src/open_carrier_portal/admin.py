@@ -620,7 +620,8 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     "and linked monitoring status for the selected portal recipient.</label>"
                     '<label><input type="checkbox" name="layout_consent" value="yes">'
                     "For a FULL LAYOUT proposal, also approve all intermediate ports, patches, "
-                    "pseudowires and their device/rack/site context and Observium status. "
+                    "pseudowires, dark-fiber descriptions and their device/rack/site context "
+                    "and Observium status. "
                     "This does not grant independent inventory browsing.</label>"
                     "<p>The ID is validated against this database; a company name is never "
                     "used as identity. Approval grants no independent device/port access.</p>",
@@ -952,8 +953,9 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     "company relationships and related circuits (read-only safe fields)."
                     "</label>"
                     '<label><input type="checkbox" name="layout_consent" value="yes">'
-                    "Also enable full circuit layouts: intermediate ports, patches, pseudowires "
-                    "and linked Observium status (read-only safe fields).</label>"
+                    "Also enable full circuit layouts: intermediate ports, patches, pseudowires, "
+                    "dark-fiber descriptions and linked Observium status (read-only safe fields)."
+                    "</label>"
                     "<p>Existing circuit-only approvals do not enable these broader views. "
                     "Re-pairing, disabling or changing the database/mapping requires "
                     "fresh approval. Up to 100 databases per pairing.</p>",

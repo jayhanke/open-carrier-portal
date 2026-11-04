@@ -387,6 +387,10 @@ class SourceMapping:
                         "port_b_id": "PortBID",
                     },
                 ),
+                "new_dark_fiber_circuits": ResourceMapping(
+                    "NewDarkFiberCircuit",
+                    {"source_id": "NewDarkFiberCircuitID", "name": "Description"},
+                ),
             }
         )
 

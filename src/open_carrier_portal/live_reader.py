@@ -253,6 +253,7 @@ async def _read(
         monitoring,
         integration=integration,
         monitoring_required=not layout_enabled,
+        allow_unresolved_path_items=layout_enabled,
     )
     reader.require_view(
         "summary"
@@ -345,6 +346,7 @@ async def _read(
                         position=item.position,
                         kind=item.kind,
                         name=item.name,
+                        issue=item.issue,
                         patch_type=str(item.patch_type) if item.patch_type is not None else None,
                         ports=ports,
                     )
