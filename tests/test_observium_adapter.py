@@ -72,6 +72,104 @@ async def test_maps_devices_and_keeps_token_in_authorization_header(
     assert "277" not in result.items[0].id
 
 
+@pytest.mark.parametrize("shape", ["singular", "plural"])
+async def test_port_detail_maps_reported_optical_power(repository, shape):
+    record = {
+        "port_id": 12, "device_id": 277, "ifName": "xe-0/0/1",
+        "ifOperStatus": "up", "ifAdminStatus": "up", "ifSpeed": "10000000000",
+        "sensor_rx_power": "-12.75", "sensor_tx_power": 0,
+        "last_polled": "2026-11-05 19:30:00",
+    }
+    payload = {"port": record} if shape == "singular" else {"ports": {"12": record}}
+    paths = []
+
+    def upstream(request):
+        paths.append(request.url.path)
+        return httpx.Response(200, json=payload)
+
+    adapter = ObserviumAdapter(
+        base_url="https://observium.example", api_token="private-token",
+        repository=repository, transport=httpx.MockTransport(upstream),
+    )
+    try:
+        port = await adapter.get_interface(
+            repository.ocp_resource_id("observium", "interface", "12")
+        )
+    finally:
+        await adapter.close()
+    assert paths == ["/api/v0/ports/12/"]
+    assert port.optical_rx_dbm == -12.75 and port.optical_tx_dbm == 0
+    assert port.speed_bps == 10_000_000_000 and port.operational_status == "up"
+    assert port.device_id == repository.ocp_resource_id("observium", "device", "277")
+
+
+async def test_device_detail_accepts_single_record_response(repository):
+    adapter = ObserviumAdapter(
+        base_url="https://observium.example", api_token="private-token",
+        repository=repository,
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, json={"device": {"device_id": 277, "hostname": "edge-a", "status": 1}}
+            )
+        ),
+    )
+    identifier = repository.ocp_resource_id("observium", "device", "277")
+    try:
+        device = await adapter.get_device(identifier)
+    finally:
+        await adapter.close()
+    assert device.id == identifier and device.operational_status == "up"
+
+
+@pytest.mark.parametrize("value", ["not-a-number", "NaN", "inf", True, {"invalid": "reading"}])
+async def test_invalid_optical_reading_keeps_verified_port_status_and_logs_safely(
+    repository, value, caplog
+):
+    adapter = ObserviumAdapter(
+        base_url="https://observium.example", api_token="private-token", repository=repository,
+        transport=httpx.MockTransport(lambda _: httpx.Response(
+            200, json={"port": {
+                "port_id": 12, "device_id": 277, "ifName": "ethernet",
+                "ifOperStatus": "up", "sensor_rx_power": value, "sensor_tx_power": -1.2,
+            }},
+        )),
+    )
+    try:
+        port = await adapter.get_interface(
+            repository.ocp_resource_id("observium", "interface", "12")
+        )
+    finally:
+        await adapter.close()
+    assert port.operational_status == "up"
+    assert port.optical_rx_dbm is None and port.optical_tx_dbm == -1.2
+    assert "response.optical_invalid" in caplog.text and "sensor_rx_power" in caplog.text
+    assert "not-a-number" not in caplog.text and "private-token" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "status,event",
+    [(404, "resource_missing"), (503, "upstream_failed"), (401, "credential_rejected")],
+)
+async def test_detail_http_errors_distinguish_record_lookup_from_global_connection_failure(
+    repository, caplog, status, event
+):
+    adapter = ObserviumAdapter(
+        base_url="https://observium.example", api_token="private-token", repository=repository,
+        transport=httpx.MockTransport(lambda _: httpx.Response(status)),
+    )
+    try:
+        with pytest.raises(ConnectorError):
+            await adapter.get_interface(
+                repository.ocp_resource_id("observium", "interface", "12")
+            )
+    finally:
+        await adapter.close()
+    assert f"request.{event}" in caplog.text
+    if status == 404:
+        assert "mapped record ID and API route" in caplog.text
+    assert "request.endpoint_missing" not in caplog.text
+
+
 async def test_rejects_malformed_upstream_shape(repository: Repository) -> None:
     transport = httpx.MockTransport(
         lambda _: httpx.Response(

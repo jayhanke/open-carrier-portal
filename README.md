@@ -112,8 +112,14 @@ Configured-upstream errors are explicit failed responses and audited, not empty
 successes. Port status includes interface name/description, speed, administrative
 and operational status and last poll time. Optical fields are nullable, with
 `optical_state=not_reported` when the adapter supplies neither value. The current
-Observium adapter does not yet resolve optical sensors: their payload, port association
-and direction must be verified rather than guessed from sensor descriptions.
+Observium adapter reads `sensor_rx_power` and `sensor_tx_power` (dBm) when supplied on
+the verified port record, including a genuine zero reading. Missing values stay
+unreported; invalid/non-finite readings are omitted with `response.optical_invalid`
+warnings without discarding other valid port status. Separate sensor records and
+sensor-description matching are not used. Detail reads accept the API's single
+`port`/`device` response as well as its plural record collections; ambiguous detail
+collections are rejected. A detail 404 reports `request.resource_missing` with
+record-ID/API-route guidance, rather than implying every API endpoint is unavailable.
 
 Public circuit responses whitelist fields; they never return source management IPs,
 port IP addresses, MACs, asset IDs, service-order references, credentials or raw source

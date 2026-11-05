@@ -98,7 +98,10 @@ def unmap_layout_resource(fixture, resource):
 
 
 @pytest.mark.parametrize("audience", ["owner", "partner"])
-def test_full_layout_has_ordered_components_and_linked_observium_status(live_source, audience):
+@pytest.mark.parametrize("shape", ["singular", "plural"])
+def test_full_layout_has_ordered_components_and_linked_observium_status(
+    live_source, audience, shape
+):
     settings, repo, connection, _, database = live_source
     request = owner_layout(live_source) if audience == "owner" else partner_layout(live_source)
     with closing(sqlite3.connect(database)) as db, db:
@@ -111,33 +114,25 @@ def test_full_layout_has_ordered_components_and_linked_observium_status(live_sou
         calls.append(request.url.path)
         number = int(request.url.path.rstrip("/").rsplit("/", 1)[1])
         if "/devices/" in request.url.path:
+            record = {
+                "device_id": number, "hostname": "private-management-address", "status": 1,
+            }
             return httpx.Response(
-                200,
-                json={
-                    "devices": [
-                        {
-                            "device_id": number,
-                            "hostname": "private-management-address",
-                            "status": 1,
-                        }
-                    ]
-                },
+                200, json={"device": record} if shape == "singular" else {"devices": [record]},
             )
+        record = {
+            "port_id": number,
+            "device_id": {1101: 1301, 1202: 1302, 1999: 1999}[number],
+            "ifName": "monitoring-name",
+            "ifAdminStatus": "up",
+            "ifOperStatus": "down" if number == 1999 else "up",
+            "ifSpeed": 10000000000,
+            "sensor_rx_power": "-12.75",
+            "sensor_tx_power": 0,
+            "last_polled": "2026-11-04T20:30:00Z",
+        }
         return httpx.Response(
-            200,
-            json={
-                "ports": [
-                    {
-                        "port_id": number,
-                        "device_id": {1101: 1301, 1202: 1302, 1999: 1999}[number],
-                        "ifName": "monitoring-name",
-                        "ifAdminStatus": "up",
-                        "ifOperStatus": "down" if number == 1999 else "up",
-                        "ifSpeed": 10000000000,
-                        "last_polled": "2026-11-04T20:30:00Z",
-                    }
-                ]
-            },
+            200, json={"port": record} if shape == "singular" else {"ports": [record]},
         )
 
     async def read():
@@ -171,6 +166,8 @@ def test_full_layout_has_ordered_components_and_linked_observium_status(live_sou
     assert [port.role for port in layout.items[1].ports] == ["a", "z", "z_secondary"]
     assert layout.items[2].ports[0].port_status.operational_status == "down"
     assert layout.items[0].ports[0].port_status.speed_bps == 10000000000
+    assert layout.items[0].ports[0].port_status.optical_rx_dbm == -12.75
+    assert layout.items[0].ports[0].port_status.optical_tx_dbm == 0
     assert all(port.rack and port.location for item in layout.items for port in item.ports)
     assert all(count == 1 for count in Counter(calls).values())
     assert set(calls) == {

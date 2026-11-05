@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -89,10 +90,7 @@ class ObserviumAdapter(MonitoringAdapter):
         if source_id is None:
             raise ResourceNotFoundError()
         payload = await self._request_json(f"api/v0/devices/{source_id}/")
-        records = self._records(payload, "devices")
-        if not records:
-            raise ResourceNotFoundError()
-        return self._map_device(records[0])
+        return self._map_device(self._detail_record(payload, "devices", "device"))
 
     async def list_interfaces(self, *, page: int, page_size: int) -> Page[Interface]:
         payload = await self._request_json(
@@ -108,10 +106,7 @@ class ObserviumAdapter(MonitoringAdapter):
         if source_id is None:
             raise ResourceNotFoundError()
         payload = await self._request_json(f"api/v0/ports/{source_id}/")
-        records = self._records(payload, "ports")
-        if not records:
-            raise ResourceNotFoundError()
-        return self._map_interface(records[0])
+        return self._map_interface(self._detail_record(payload, "ports", "port"))
 
     async def list_alarms(self, *, page: int, page_size: int) -> Page[Alarm]:
         payload = await self._request_json(
@@ -173,10 +168,14 @@ class ObserviumAdapter(MonitoringAdapter):
             raise IntegrationUnavailableError() from None
         status = response.status_code
         if status >= 300:
+            detail_lookup = (
+                not health_check and operation in {"devices", "ports"}
+                and len(path.rstrip("/").split("/")) == 4
+            )
             reason = (
                 "credential_rejected"
                 if status in {401, 403}
-                else "endpoint_missing"
+                else ("resource_missing" if detail_lookup else "endpoint_missing")
                 if status == 404
                 else "rate_limited"
                 if status == 429
@@ -189,7 +188,12 @@ class ObserviumAdapter(MonitoringAdapter):
             explanation = (
                 "Observium rejected the token or its permissions."
                 if status in {401, 403}
-                else "Observium API endpoint was not found; check the base URL and REST API."
+                else (
+                    "Observium detail lookup returned 404; "
+                    "check the mapped record ID and API route."
+                    if detail_lookup
+                    else "Observium API endpoint was not found; check the base URL and REST API."
+                )
                 if status == 404
                 else "Observium returned an HTTP error or redirect; check its service and base URL."
             )
@@ -258,6 +262,34 @@ class ObserviumAdapter(MonitoringAdapter):
         return payload
 
     @staticmethod
+    def _detail_record(
+        payload: dict[str, Any], plural: str, singular: str
+    ) -> dict[str, Any]:
+        if plural not in payload and singular in payload:
+            record = payload[singular]
+            if not isinstance(record, dict):
+                log_event(
+                    "observium", "response.invalid_record",
+                    "Observium returned an invalid detail record; contents were not logged.",
+                    level=logging.ERROR,
+                )
+                raise UpstreamResponseError()
+            if not record:
+                raise ResourceNotFoundError()
+            return record
+        records = ObserviumAdapter._records(payload, plural)
+        if not records:
+            raise ResourceNotFoundError()
+        if len(records) != 1:
+            log_event(
+                "observium", "response.ambiguous_detail",
+                "Observium returned multiple records for a single-resource lookup.",
+                level=logging.ERROR,
+            )
+            raise UpstreamResponseError()
+        return records[0]
+
+    @staticmethod
     def _records(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
         raw = payload.get(key)
         if raw is None and key == "alerts":
@@ -314,6 +346,8 @@ class ObserviumAdapter(MonitoringAdapter):
             administrative_status=_optional_string(record, "ifAdminStatus"),
             operational_status=_optional_string(record, "ifOperStatus")
             or _status(record.get("status")),
+            optical_rx_dbm=_optical_power(record.get("sensor_rx_power"), "sensor_rx_power"),
+            optical_tx_dbm=_optical_power(record.get("sensor_tx_power"), "sensor_tx_power"),
             last_observed_at=_optional_datetime(record.get("last_polled")),
         )
 
@@ -341,6 +375,25 @@ class ObserviumAdapter(MonitoringAdapter):
             raised_at=_optional_datetime(record.get("last_changed") or record.get("timestamp")),
             cleared_at=_optional_datetime(record.get("cleared")),
         )
+
+
+def _optical_power(value: object, field: str) -> float | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        reading = float(str(value))
+        if not math.isfinite(reading):
+            raise ValueError
+    except (TypeError, ValueError):
+        log_event(
+            "observium", "response.optical_invalid",
+            "An optical reading is invalid; it was omitted without discarding port status.",
+            level=logging.WARNING, field=field,
+        )
+        return None
+    return reading
 
 
 def _required_id(
