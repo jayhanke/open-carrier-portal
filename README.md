@@ -120,6 +120,13 @@ sensor-description matching are not used. Detail reads accept the API's single
 `port`/`device` response as well as its plural record collections; ambiguous detail
 collections are rejected. A detail 404 reports `request.resource_missing` with
 record-ID/API-route guidance, rather than implying every API endpoint is unavailable.
+Port detail requests use `/api/v0/ports/{id}` without a trailing slash, matching SFNCustomer.
+Skipped reads now produce Observium diagnostics: `circuit.port_unlinked` and
+`circuit.device_unlinked` explain empty/zero/unmapped IDs, while
+`circuit.monitoring_not_configured` and `live.monitoring_not_configured` explain missing
+effective configuration. Circuit notices are deduplicated by reason for each reader;
+source IDs, source records and credentials are not included. Listing circuits or browsing
+inventory does not emit a live-monitoring configuration warning.
 
 Public circuit responses whitelist fields; they never return source management IPs,
 port IP addresses, MACs, asset IDs, service-order references, credentials or raw source

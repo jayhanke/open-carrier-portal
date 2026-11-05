@@ -56,6 +56,13 @@ async def monitoring_for_live(
     settings: Settings, repository: Repository, *, enabled: bool
 ) -> AsyncGenerator[MonitoringAdapter | None]:
     if not enabled or not settings.observium_enabled:
+        if enabled:
+            log_event(
+                "observium", "live.monitoring_not_configured",
+                "Live circuit monitoring is not configured; check the Observium URL and "
+                "token variable under Connections.",
+                level=logging.WARNING,
+            )
         yield None
         return
     from open_carrier_portal.adapters.observium import ObserviumAdapter

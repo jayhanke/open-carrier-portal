@@ -329,8 +329,8 @@ def test_circuit_details_follow_real_relationships_and_include_live_status(circu
     assert sorted(requests) == [
         "/api/v0/devices/1301/",
         "/api/v0/devices/1302/",
-        "/api/v0/ports/1101/",
-        "/api/v0/ports/1202/",
+        "/api/v0/ports/1101",
+        "/api/v0/ports/1202",
     ]
     for private in (
         "192.0.2.",

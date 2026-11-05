@@ -85,6 +85,8 @@ async def test_port_detail_maps_reported_optical_power(repository, shape):
 
     def upstream(request):
         paths.append(request.url.path)
+        if request.url.path != "/api/v0/ports/12":
+            return httpx.Response(404)
         return httpx.Response(200, json=payload)
 
     adapter = ObserviumAdapter(
@@ -97,7 +99,7 @@ async def test_port_detail_maps_reported_optical_power(repository, shape):
         )
     finally:
         await adapter.close()
-    assert paths == ["/api/v0/ports/12/"]
+    assert paths == ["/api/v0/ports/12"]
     assert port.optical_rx_dbm == -12.75 and port.optical_tx_dbm == 0
     assert port.speed_bps == 10_000_000_000 and port.operational_status == "up"
     assert port.device_id == repository.ocp_resource_id("observium", "device", "277")

@@ -12,8 +12,10 @@ from test_live_transport import live_source as live_source
 from test_owner_browsing import enable, owner_job
 
 from open_carrier_portal.adapters.observium import ObserviumAdapter
+from open_carrier_portal.admin_store import AdminStore
 from open_carrier_portal.company_access import approve_company_policy
 from open_carrier_portal.company_policies import PolicySnapshot
+from open_carrier_portal.diagnostics import log_context
 from open_carrier_portal.live_contract import LivePathItem
 from open_carrier_portal.live_reader import execute_live_request
 from open_carrier_portal.owner_access import approve_owner_source
@@ -174,9 +176,9 @@ def test_full_layout_has_ordered_components_and_linked_observium_status(
         "/api/v0/devices/1301/",
         "/api/v0/devices/1302/",
         "/api/v0/devices/1999/",
-        "/api/v0/ports/1101/",
-        "/api/v0/ports/1202/",
-        "/api/v0/ports/1999/",
+        "/api/v0/ports/1101",
+        "/api/v0/ports/1202",
+        "/api/v0/ports/1999",
     }
     assert result.circuit.inventory_links == (audience == "owner")
     serialized = result.model_dump_json()
@@ -592,7 +594,9 @@ def test_owner_layout_column_migration_keeps_old_approval_endpoint_only(live_sou
 @pytest.mark.parametrize(
     "behavior", ["null_zero", "zero_zero", "null_linked", "zero_linked", "mixed"]
 )
-def test_unlinked_monitoring_never_breaks_full_layouts(live_source, audience, behavior, caplog):
+def test_unlinked_monitoring_never_breaks_full_layouts(
+    live_source, audience, behavior, caplog, tmp_path
+):
     settings, repo, connection, _, database = live_source
     with closing(sqlite3.connect(database)) as db, db:
         statements = {
@@ -643,7 +647,10 @@ def test_unlinked_monitoring_never_breaks_full_layouts(live_source, audience, be
         finally:
             await monitoring.close()
 
-    result = asyncio.run(read())
+    store = AdminStore(tmp_path / "monitoring-logs.db")
+    store.initialize()
+    with log_context(store, quiet=True):
+        result = asyncio.run(read())
     assert result.error is None and len(result.circuit.layout.items) == 4
     assert result.circuit.inventory_links == (audience == "owner")
     statuses = [endpoint.port_status for endpoint in result.circuit.endpoints]
@@ -651,7 +658,7 @@ def test_unlinked_monitoring_never_breaks_full_layouts(live_source, audience, be
         assert statuses[0].state == "unavailable"
         assert statuses[0].operational_status is None
         assert statuses[1].state == "available" and statuses[1].operational_status == "up"
-        assert set(calls) == {"/api/v0/devices/1302/", "/api/v0/ports/1202/"}
+        assert set(calls) == {"/api/v0/devices/1302/", "/api/v0/ports/1202"}
     else:
         assert not calls
         expected = "not_linked" if behavior.endswith("zero") else "unavailable"
@@ -660,6 +667,46 @@ def test_unlinked_monitoring_never_breaks_full_layouts(live_source, audience, be
         )
     if behavior in {"null_linked", "zero_linked", "mixed"}:
         assert "circuit.device_link_missing" in caplog.text
+    if behavior in {"null_zero", "zero_zero"}:
+        assert caplog.text.count("circuit.port_unlinked:") == 1
+        assert caplog.text.count("circuit.device_unlinked:") == 1
+        events = store.recent_events("observium")
+        assert {event["event"] for event in events} == {
+            "circuit.port_unlinked", "circuit.device_unlinked",
+        }
+        assert len(events) == 2
+
+
+def test_missing_monitoring_adapter_logs_configuration_warning(live_source, caplog, tmp_path):
+    request = owner_layout(live_source)
+    store = AdminStore(tmp_path / "monitoring-logs.db")
+    store.initialize()
+    with log_context(store, quiet=True):
+        result = execute(live_source, request)
+    assert result.error is None
+    assert all(
+        endpoint.port_status.state == "unavailable" for endpoint in result.circuit.endpoints
+    )
+    assert caplog.text.count("circuit.monitoring_not_configured:") == 1
+    assert [event["event"] for event in store.recent_events("observium")] == [
+        "circuit.monitoring_not_configured",
+    ]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_live_monitoring_configuration_notice_only_for_circuit_reads(
+    live_source, enabled, caplog
+):
+    from open_carrier_portal.live_reader import monitoring_for_live
+
+    settings, repo, _, _, _ = live_source
+
+    async def read():
+        async with monitoring_for_live(settings, repo, enabled=enabled) as monitoring:
+            assert monitoring is None
+
+    asyncio.run(read())
+    assert ("live.monitoring_not_configured:" in caplog.text) == enabled
 
 
 @pytest.mark.parametrize(

@@ -91,6 +91,7 @@ class CircuitReader:
         self.monitoring_required = monitoring_required
         self.allow_unresolved_path_items = allow_unresolved_path_items
         self._monitoring_unavailable = False
+        self._monitoring_notices: set[str] = set()
         self._ports: dict[str, CircuitPort] = {}
         self._devices: dict[str, CircuitDevice] = {}
         self._sites: dict[str, CircuitSite] = {}
@@ -116,6 +117,18 @@ class CircuitReader:
         log_failure("observium", "circuit.status_unavailable", exc)
         if isinstance(exc, (IntegrationUnavailableError, UpstreamTimeoutError, RateLimitError)):
             self._monitoring_unavailable = True
+
+    def _monitoring_notice(self, event: str, message: str) -> None:
+        if event not in self._monitoring_notices:
+            self._monitoring_notices.add(event)
+            log_event("observium", event, message, level=logging.WARNING)
+
+    def _monitoring_not_configured(self) -> None:
+        self._monitoring_notice(
+            "circuit.monitoring_not_configured",
+            "Circuit monitoring skipped: no Observium adapter is configured. "
+            "Check the effective monitoring connection under Connections.",
+        )
 
     @property
     def missing_fields(self) -> dict[str, list[str]]:
@@ -350,8 +363,17 @@ class CircuitReader:
                 ],
             )
             observed_id = _observium_id(row.get("observium_id"))
-            if observed_id is not None:
+            if observed_id is None:
+                self._monitoring_notice(
+                    "circuit.device_unlinked",
+                    "Device monitoring skipped: mapped devices.observium_id is empty, zero "
+                    "or unmapped. Check the source device's Observium ID and field mapping. "
+                    "No device API request was made for this missing link.",
+                )
+            else:
                 if self.monitoring is None or self._monitoring_unavailable:
+                    if self.monitoring is None:
+                        self._monitoring_not_configured()
                     device = device.model_copy(
                         update={
                             "monitoring_state": "unavailable"
@@ -417,8 +439,17 @@ class CircuitReader:
                 connector_type=_text(row.get("connector_type")),
             )
             observed_id = _observium_id(row.get("observium_id"))
-            if observed_id is not None:
+            if observed_id is None:
+                self._monitoring_notice(
+                    "circuit.port_unlinked",
+                    "Port monitoring skipped: mapped ports.observium_id is empty, zero "
+                    "or unmapped. Check the source port's Observium ID and field mapping. "
+                    "No port API request was made for this missing link.",
+                )
+            else:
                 if self.monitoring is None or self._monitoring_unavailable:
+                    if self.monitoring is None:
+                        self._monitoring_not_configured()
                     port = port.model_copy(
                         update={
                             "monitoring_state": "unavailable"

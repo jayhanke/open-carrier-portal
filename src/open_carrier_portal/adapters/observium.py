@@ -105,7 +105,7 @@ class ObserviumAdapter(MonitoringAdapter):
         source_id = self._repository.source_resource_id(interface_id, "observium", "interface")
         if source_id is None:
             raise ResourceNotFoundError()
-        payload = await self._request_json(f"api/v0/ports/{source_id}/")
+        payload = await self._request_json(f"api/v0/ports/{source_id}")
         return self._map_interface(self._detail_record(payload, "ports", "port"))
 
     async def list_alarms(self, *, page: int, page_size: int) -> Page[Alarm]:
