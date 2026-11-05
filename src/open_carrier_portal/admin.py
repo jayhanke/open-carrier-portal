@@ -14,7 +14,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -434,6 +434,17 @@ padding:1.5rem;margin:1rem 0 1.5rem}}
 .connection-list{{display:flex;gap:.8rem;flex-wrap:wrap;margin:.8rem 0}}
 .connection-list a{{color:#075985}}.connection-managed{{padding:.7rem;background:#f0f9ff;
 border-radius:6px;font-size:.9rem}}
+.company-picker{{max-height:24rem;overflow:auto;border:1px solid #ccd8e3;
+border-radius:8px;margin:1rem 0}}
+.company-picker table{{table-layout:fixed}}.company-picker .company-select{{width:3rem}}
+.company-picker .company-id{{width:30%}}
+.company-picker td,.company-picker th{{overflow-wrap:anywhere}}
+.company-picker thead{{position:sticky;top:0;background:#f1f5f9}}
+.company-picker input[type="radio"]{{width:auto;margin:0}}
+.company-picker label{{margin:0;cursor:pointer}}
+.company-picker tr:focus-within{{background:#e0f2fe}}
+.company-pages{{display:flex;gap:1rem;flex-wrap:wrap;margin:1rem 0}}
+.company-control{{width:100%;max-width:44rem;box-sizing:border-box}}
 .mapper-toolbar{{display:flex;align-items:end;gap:1rem;flex-wrap:wrap}}
 .mapper-toolbar label{{flex:1}}.mapper-toolbar select{{width:100%;box-sizing:border-box}}
 .mapper-grid{{display:grid;grid-template-columns:minmax(210px,1fr) minmax(340px,1.8fr);
@@ -521,7 +532,10 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             f"<button>{escape(button)}</button></form>"
         )
 
-    def company_directory(selected_profile: str, profiles: list[dict[str, str]], csrf: str) -> str:
+    def company_directory(
+        selected_profile: str, profiles: list[dict[str, str]], csrf: str,
+        query: str = "", offset: int = 0,
+    ) -> str:
         name = (
             selected_profile
             or settings.source_database_profile
@@ -533,7 +547,8 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             "source ID in your database, not a partner ID from another connector. "
             "Listing companies does not create partners or grant access.</p>"
             '<form method="get" action="/admin/partners"><label>Database connection'
-            '<select name="profile"><option value="">Choose a database connection</option>'
+            '<select name="profile" class="company-control">'
+            '<option value="">Choose a database connection</option>'
             + "".join(
                 f'<option value="{escape(profile["name"])}"'
                 f"{' selected' if profile['name'] == name else ''}>"
@@ -541,7 +556,10 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 f"{' (disabled)' if profile['enabled'] != '1' else ''}</option>"
                 for profile in profiles
             )
-            + '</select></label><button type="submit">Load companies</button></form>'
+            + '</select></label><label>Search company name or ID'
+            '<input type="search" name="q" class="company-control" maxlength="120" '
+            f'value="{escape(query)}">'
+            '</label><button type="submit">Load companies / search</button></form>'
         )
         if not name:
             return content + "<p>Select a database connection to load its mapped companies.</p>"
@@ -553,7 +571,9 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     content + "<p>Save a Companies mapping with both Company ID (source_id) and "
                     f'Company name (name) first. <a href="{mapping_url}">Open mapping</a>.</p>'
                 )
-            rows = source.fetch("companies", limit=101)
+            rows = source.fetch_explorer_page(
+                "companies", query=query, offset=offset, limit=100
+            )
             if any(
                 row[field] is None or not str(row[field]).strip()
                 for row in rows
@@ -575,11 +595,43 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             rows_shown=min(len(rows), 100),
             truncated=int(len(rows) > 100),
         )
+        pagination = '<div class="company-pages" role="navigation" aria-label="Company pages">'
+        if offset:
+            previous = "/admin/partners?" + urlencode({
+                "profile": name, "q": query, "offset": max(0, offset - 100),
+            })
+            pagination += f'<a rel="prev" href="{escape(previous)}">Previous companies</a>'
+        if len(rows) > 100:
+            if offset < 999_900:
+                next_page = "/admin/partners?" + urlencode({
+                    "profile": name, "q": query, "offset": offset + 100,
+                })
+                pagination += f'<a rel="next" href="{escape(next_page)}">Next companies</a>'
+            else:
+                pagination += "<p>Pagination limit reached; narrow the company search.</p>"
+        pagination += "</div>"
         if not rows:
-            return content + "<p>No companies were returned by the saved Companies mapping.</p>"
+            message = (
+                "No companies match this search."
+                if query else "No companies were returned by the saved Companies mapping."
+            )
+            return content + f"<p>{message}</p>" + pagination
+        visible_rows = rows[:100]
+        picker = (
+            '<div class="company-picker" role="region" aria-label="Database companies" '
+            'tabindex="0">'
+            + table([
+                {
+                    "Company ID in your database": str(row["source_id"]),
+                    "Company": str(row["name"]),
+                }
+                for row in visible_rows
+            ])
+            + "</div>"
+        )
         approval = ""
+        proposals = []
         if connection_file.exists():
-            proposals = []
             try:
                 portal = PortalConnection.load(
                     connection_file, allow_insecure_http=settings.allow_insecure_http
@@ -598,11 +650,32 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     'pairing and <a href="/admin/diagnostics">Diagnostics</a>.</p>'
                 )
             if proposals:
+                picker = (
+                    '<div class="company-picker" role="region" '
+                    'aria-label="Choose database company" tabindex="0"><table><thead><tr>'
+                    '<th class="company-select">Select</th>'
+                    '<th class="company-id">Company ID in your database</th><th>Company</th>'
+                    "</tr></thead><tbody>"
+                    + "".join(
+                        '<tr><td><input type="radio" name="company" '
+                        f'value="{escape(str(row["source_id"]))}" '
+                        f'id="company-option-{index}" required '
+                        f'aria-label="Select {escape(str(row["name"]))}, '
+                        f'ID {escape(str(row["source_id"]))}"></td>'
+                        f'<td>{escape(str(row["source_id"]))}</td>'
+                        f'<td><label for="company-option-{index}">'
+                        f'{escape(str(row["name"]))}</label></td></tr>'
+                        for index, row in enumerate(visible_rows)
+                    )
+                    + "</tbody></table></div>"
+                )
                 approval = form(
                     "approve-company-policy",
                     csrf,
                     f'<input type="hidden" name="profile" value="{escape(name)}">'
-                    '<label>Portal sharing proposal<select name="policy">'
+                    '<label>Portal sharing proposal'
+                    '<select name="policy" class="company-control" required>'
+                    '<option value="">Choose the portal company to share with</option>'
                     + "".join(
                         f'<option value="{local.policy.policy_id}@{local.policy.revision}">'
                         f"{escape(local.policy.recipient_name)} - revision "
@@ -615,7 +688,11 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                         for local in proposals
                     )
                     + "</select></label>"
-                    + field("company", "Company ID from this database")
+                    + "<p>Select the matching database company below. Search covers the "
+                    "whole mapped directory; use the page links for more companies. "
+                    "Changing search or page clears the selection; choose the recipient "
+                    "and company before approving.</p>"
+                    + picker + pagination
                     + '<label><input type="checkbox" name="consent" value="yes" required>'
                     "Approve this company's current and future billed circuits, endpoints "
                     "and linked monitoring status for the selected portal recipient.</label>"
@@ -624,28 +701,20 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     "pseudowires, dark-fiber descriptions and their device/rack/site context "
                     "and Observium status. "
                     "This does not grant independent inventory browsing.</label>"
-                    "<p>The ID is validated against this database; a company name is never "
+                    "<p>The selected ID is validated against this database; "
+                    "a company name is never "
                     "used as identity. Approval grants no independent device/port access.</p>",
                     "Approve company link and circuit policy",
                 )
         return (
             content
             + (
-                "<p>Showing the first 100 companies; more are available in your database. "
-                "This directory preview is limited to 100 rows.</p>"
-                if len(rows) > 100
+                f"<p>Showing companies {offset + 1}&ndash;{offset + len(visible_rows)}. "
+                "Search by name or ID to find companies on any page.</p>"
+                if len(rows) > 100 or offset or query
                 else f"<p>{len(rows)} mapped companies.</p>"
             )
-            + table(
-                [
-                    {
-                        "Company ID in your database": str(row["source_id"]),
-                        "Company": str(row["name"]),
-                    }
-                    for row in rows[:100]
-                ]
-            )
-            + approval
+            + (approval if proposals else picker + pagination + approval)
         )
 
     def portal_policy_content(csrf: str) -> str:
@@ -711,7 +780,10 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 )
         return content
 
-    def render(section: str, csrf: str, selected_profile: str = "") -> str:
+    def render(
+        section: str, csrf: str, selected_profile: str = "",
+        company_query: str = "", company_offset: int = 0,
+    ) -> str:
         identity = repository.get_connector_identity()
         snapshot = repository.administration_snapshot()
         if section == "setup":
@@ -1278,7 +1350,9 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         if section == "partners":
             return (
                 portal_policy_content(csrf)
-                + company_directory(selected_profile, snapshot["profiles"], csrf)
+                + company_directory(
+                    selected_profile, snapshot["profiles"], csrf, company_query, company_offset
+                )
                 + "<h3>Partner access</h3>"
                 "<p>Partners query this connector without the portal. Confirm bilateral consent "
                 "out of band. Grants with no resource IDs cover ALL resources in that scope.</p>"
@@ -2151,12 +2225,34 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 username=session["username"],
             )
         request.state.admin_activity = request.cookies["ocp_admin"]
+        company_query = ""
+        company_offset = 0
+        if section == "partners":
+            company_query = request.query_params.get("q", "")
+            try:
+                company_offset = int(request.query_params.get("offset", "0"))
+                if len(company_query) > 120 or not 0 <= company_offset <= 999_900:
+                    raise ValueError("company search bounds are invalid")
+            except ValueError:
+                log_event(
+                    "admin", "companies.invalid_search",
+                    "Company search bounds are invalid; no directory query was made.",
+                    level=logging.WARNING,
+                )
+                return page(
+                    "Partners",
+                    '<p role="alert">Invalid company search. Use at most 120 search characters '
+                    'and a page offset between 0 and 999900.</p>'
+                    '<p><a href="/admin/partners">Back to Partners</a></p>',
+                    session["csrf"], status=400, username=session["username"],
+                )
         return page(
             "Connect to Carrier Portal"
             if section == "portal"
             else SECTION_LABELS.get(section, section.title()),
             await run_in_threadpool(
-                render, section, session["csrf"], request.query_params.get("profile", "")
+                render, section, session["csrf"], request.query_params.get("profile", ""),
+                company_query, company_offset,
             ),
             session["csrf"],
             username=session["username"],

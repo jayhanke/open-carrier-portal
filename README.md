@@ -250,7 +250,8 @@ Partner API authorization remains unchanged.
 Update the portal and connector together. In the portal, establish an active
 relationship, then open **Permissions** and propose sharing with that partner.
 On the paired connector's **Partners** page, load the appropriate mapped database,
-select the proposal, enter the company's source ID and explicitly approve.
+select the proposal, search the directory by company name or ID, select the matching
+company row and explicitly approve. There is no manual company-ID entry.
 Company names are display-only, never an identity match.
 
 The connector verifies the company through `companies.source_id`/`companies.name`
@@ -655,8 +656,13 @@ session hashes, partner grants, configuration and audit events.
 - **Partners:** the **Companies from your database** directory reads company names
   and local source IDs through the saved `companies.source_id` and `companies.name`
   mapping. It defaults to the selected source connection, or lets you choose a
-  connection explicitly. The read-only preview shows at most 100 companies and
-  indicates when more exist; it does not persist company records, create partners,
+  connection explicitly. The searchable, scrollable directory shows up to 100 companies
+  per page, with previous/next links to reach later records. Search matches company
+  names or source IDs across the whole mapped directory, not just the current page.
+  For a pending portal proposal, select its recipient and the matching company row;
+  the form submits the exact source ID without copying or typing it. Searching or
+  paging clears the recipient/company selection, so choose both before approving.
+  Listing or selecting companies does not persist company records, create partners,
   or grant access. Missing mappings and database failures are shown explicitly,
   with failures recorded in Diagnostics without company records.
   **Portal company-sharing approvals** lists the exact received revisions. Propose

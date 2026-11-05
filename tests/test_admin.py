@@ -140,6 +140,10 @@ def test_portal_company_approval_requires_live_mapped_company_consent_and_csrf(
         assert "Recipient &lt;Carrier&gt;" in page.text
         assert "Recipient <Carrier>" not in page.text
         assert "Approve company link and circuit policy" in page.text
+        assert 'class="company-picker"' in page.text
+        assert 'type="radio" name="company" value="42"' in page.text
+        assert 'type="text" name="company"' not in page.text
+        assert "Search company name or ID" in page.text
         data = {
             "policy": f"{policy.policy_id}@1",
             "profile": "customer-db",
@@ -322,12 +326,87 @@ def test_partners_company_directory_has_explicit_row_limit(admin, company_source
     with TestClient(app, base_url=BASE) as client:
         login(client)
         content = client.get("/admin/partners?profile=customer-db").text
-        assert "Showing the first 100 companies" in content
+        assert "Showing companies 1&ndash;100" in content
         assert "Company number 1097" in content
         assert "Company number 1098" not in content
+        assert "Next companies" in content
+        second = client.get("/admin/partners?profile=customer-db&offset=100").text
+        assert "Company number 1098" in second and "Company number 1197" in second
+        assert "Company number 1198" not in second
+        last = client.get("/admin/partners?profile=customer-db&offset=200").text
+        assert "Company number 1199" in last and "Next companies" not in last
+        assert "Previous companies" in last
         events = app.state.admin_store.recent_events("database")
-        event = next(event for event in events if event["event"] == "companies.loaded")
+        event = next(
+            event for event in events
+            if event["event"] == "companies.loaded" and json.loads(event["details"])["truncated"]
+        )
         assert json.loads(event["details"]) == {"rows_shown": 100, "truncated": 1}
+
+
+@pytest.mark.parametrize("query", ["Second", "77"])
+def test_company_picker_searches_mapped_names_and_ids(admin, company_source, query):
+    app, _, _ = admin
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        page = client.get("/admin/partners", params={"profile": "customer-db", "q": query})
+        assert page.status_code == 200
+        assert "Second company" in page.text and "Example &lt;Carrier&gt;" not in page.text
+
+
+def test_company_picker_search_reaches_beyond_first_page(admin, company_source):
+    app, _, _ = admin
+    with sqlite3.connect(company_source) as db:
+        db.executemany(
+            "INSERT INTO customer_accounts VALUES (?, ?)",
+            [(i, f"Customer {i}") for i in range(1000, 1200)],
+        )
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        page = client.get(
+            "/admin/partners", params={"profile": "customer-db", "q": "1199"}
+        )
+        assert "Customer 1199" in page.text and "Customer 1198" not in page.text
+
+
+@pytest.mark.parametrize("params", [
+    {"offset": "-1"}, {"offset": "invalid"}, {"offset": "1000000"}, {"q": "x" * 121},
+])
+def test_company_picker_invalid_search_is_visible_and_logged(admin, company_source, params):
+    app, _, _ = admin
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        page = client.get("/admin/partners", params={"profile": "customer-db", **params})
+        assert page.status_code == 400 and 'role="alert"' in page.text
+        assert "Invalid company search" in page.text
+        assert any(
+            event["event"] == "companies.invalid_search"
+            for event in app.state.admin_store.recent_events("admin")
+        )
+
+
+def test_company_picker_search_is_literal_and_pagination_preserves_filter(admin, company_source):
+    app, _, _ = admin
+    with sqlite3.connect(company_source) as db:
+        db.executemany(
+            "INSERT INTO customer_accounts VALUES (?, ?)",
+            [(i, f"Customer %_! {i}") for i in range(1000, 1200)],
+        )
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        page = client.get(
+            "/admin/partners", params={"profile": "customer-db", "q": "%_!"}
+        )
+        assert "Customer %_! 1000" in page.text and "Second company" not in page.text
+        assert "q=%25_%21&amp;offset=100" in page.text
+        next_page = client.get(
+            "/admin/partners", params={"profile": "customer-db", "q": "%_!", "offset": 100}
+        )
+        assert "Customer %_! 1199" in next_page.text and "Customer %_! 1000" not in next_page.text
+        empty = client.get(
+            "/admin/partners", params={"profile": "customer-db", "q": "no-matching-company"}
+        )
+        assert "No companies match this search." in empty.text
 
 
 def test_authentication_csrf_host_and_reset(admin):
