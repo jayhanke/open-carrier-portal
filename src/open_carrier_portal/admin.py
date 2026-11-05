@@ -579,6 +579,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             return content + "<p>No companies were returned by the saved Companies mapping.</p>"
         approval = ""
         if connection_file.exists():
+            proposals = []
             try:
                 portal = PortalConnection.load(
                     connection_file, allow_insecure_http=settings.allow_insecure_http
@@ -592,7 +593,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 ]
             except (ValueError, OSError) as exc:
                 log_failure("portal", "policies.load_failed", exc)
-                return content + (
+                approval = (
                     '<p role="alert">Cannot load portal approvals. Check Carrier Portal '
                     'pairing and <a href="/admin/diagnostics">Diagnostics</a>.</p>'
                 )

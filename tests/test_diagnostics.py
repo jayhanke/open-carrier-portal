@@ -22,9 +22,11 @@ from open_carrier_portal.diagnostics import (
     log_context,
     log_event,
     log_failure,
+    record_data_issue,
     request_reference,
     target_origin,
 )
+from open_carrier_portal.errors import MissingSourceReferenceError
 
 
 @pytest.fixture
@@ -51,6 +53,26 @@ def test_failure_categories_never_include_exception_messages(exc, reason):
     code, message = failure_reason(exc)
     assert code == reason
     assert "private-error-content" not in message
+
+
+def test_missing_source_reference_has_specific_safe_failure_category():
+    reason, message = failure_reason(MissingSourceReferenceError("private-resource-content"))
+    assert reason == "source_reference_missing"
+    assert "source reference" in message and "private-resource-content" not in message
+
+
+def test_partial_data_warnings_are_deduplicated_and_bounded(store):
+    issues = []
+    with log_context(store):
+        for index in range(30):
+            for _ in range(2):
+                record_data_issue(
+                    issues, f"Layout position {index}: data unavailable.",
+                    event="circuit.data_unavailable",
+                )
+    assert len(issues) == 20
+    assert len(set(issues)) == 20
+    assert "Additional data is unavailable" in issues[-1]
 
 
 def test_wrapped_transport_error_is_actionable_without_secret_logging(store, caplog):

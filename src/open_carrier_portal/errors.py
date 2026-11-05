@@ -57,6 +57,14 @@ class UpstreamResponseError(ConnectorError):
         super().__init__(502, "invalid_upstream_response", message)
 
 
+class MissingSourceReferenceError(UpstreamResponseError):
+    """A reference is absent or resolves to no row, not an ambiguous/failed query."""
+
+    def __init__(self, resource: str) -> None:
+        super().__init__(f"The shared circuit references missing {resource} data")
+        self.code = "source_reference_missing"
+
+
 class UpstreamTimeoutError(ConnectorError):
     def __init__(self) -> None:
         super().__init__(504, "upstream_timeout", "Observium did not respond before the deadline")

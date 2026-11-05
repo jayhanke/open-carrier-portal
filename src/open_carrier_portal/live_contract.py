@@ -47,6 +47,9 @@ class InventoryView(WireModel):
     items: list[InventoryNode] = Field(max_length=100)
     next_offset: int | None = Field(default=None, ge=0, le=1_000_000, strict=True)
     relations: list[InventoryRelation] = Field(default_factory=list, max_length=6)
+    issues: list[Annotated[str, Field(min_length=1, max_length=512)]] = Field(
+        default_factory=list, max_length=20
+    )
 
     @model_validator(mode="after")
     def consistent_items(self) -> Self:
@@ -93,6 +96,29 @@ class LivePort(WireModel):
 
 class CircuitEndpoint(LivePort):
     position: Literal["a", "z"]
+
+
+class UnavailableEndpoint(WireModel):
+    position: Literal["a", "z"]
+    issue: Literal["missing_reference"] = "missing_reference"
+    port_id: None = None
+    port_name: None = None
+    device_id: None = None
+    device_name: None = None
+    rack: None = None
+    location: None = None
+    port_status: MonitoringStatus = Field(
+        default_factory=lambda: MonitoringStatus(state="unavailable")
+    )
+    device_status: MonitoringStatus = Field(
+        default_factory=lambda: MonitoringStatus(state="unavailable")
+    )
+
+    @model_validator(mode="after")
+    def no_invented_status(self) -> Self:
+        if any(status.state != "unavailable" for status in (self.port_status, self.device_status)):
+            raise ValueError("missing endpoints cannot carry monitoring readings or identity")
+        return self
 
 
 class LayoutPort(LivePort):
@@ -150,8 +176,11 @@ class LiveCircuit(CircuitSummary):
     inventory_links: bool = False
     description: str | None = Field(default=None, max_length=4000)
     active: bool | None = None
-    endpoints: list[CircuitEndpoint] = Field(min_length=2, max_length=2)
+    endpoints: list[CircuitEndpoint | UnavailableEndpoint] = Field(min_length=2, max_length=2)
     layout: LiveLayout | None = None
+    issues: list[Annotated[str, Field(min_length=1, max_length=512)]] = Field(
+        default_factory=list, max_length=20
+    )
 
     @model_validator(mode="after")
     def ordered_endpoints(self) -> Self:

@@ -340,12 +340,7 @@ def test_unknown_or_unmapped_path_items_keep_their_declared_label(
 @pytest.mark.parametrize(
     "statement",
     [
-        "DELETE FROM CircuitLayoutItem",
         "UPDATE CircuitLayoutItem SET ItemIndex=10",
-        "UPDATE Patch SET PortID_A=NULL",
-        "UPDATE Patch SET PortID_A=0",
-        "UPDATE Patch SET PortID_A_sec=99999",
-        "UPDATE Patch SET PortID_B_sec=99999",
     ],
 )
 def test_invalid_layout_is_explicitly_unavailable(live_source, statement):
@@ -354,6 +349,190 @@ def test_invalid_layout_is_explicitly_unavailable(live_source, statement):
         db.execute(statement)
     result = execute(live_source, request)
     assert result.error == "unavailable" and result.circuit is None
+
+
+@pytest.mark.parametrize("audience", ["owner", "partner"])
+@pytest.mark.parametrize("field", ["PortID_A_sec", "PortID_B_sec"])
+def test_missing_secondary_port_retains_patch_and_other_layout_steps(
+    live_source, audience, field, caplog
+):
+    request = owner_layout(live_source) if audience == "owner" else partner_layout(live_source)
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(f"UPDATE Patch SET {field}=1842 WHERE PatchID=501")
+    result = execute(live_source, request)
+    assert result.error is None
+    assert [item.position for item in result.circuit.layout.items] == [10, 20, 30, 40]
+    patch = result.circuit.layout.items[1]
+    assert patch.kind == "patch"
+    assert [port.role for port in patch.ports] == ["a", "z"]
+    assert any("secondary" in issue.lower() and "20" in issue for issue in result.circuit.issues)
+    assert "circuit.data_unavailable" in caplog.text
+    assert "1842" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize("audience", ["owner", "partner"])
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "UPDATE Patch SET PortID_A=NULL WHERE PatchID=501",
+        "UPDATE Patch SET PortID_B=1842 WHERE PatchID=501",
+        "UPDATE PseudoWire SET PortAID=1842",
+        "INSERT INTO CircuitLayoutItem VALUES(5,42,25,'Port',1842)",
+    ],
+)
+def test_missing_component_ports_are_explicit_layout_gaps(live_source, audience, statement):
+    request = owner_layout(live_source) if audience == "owner" else partner_layout(live_source)
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(statement)
+    result = execute(live_source, request)
+    assert result.error is None
+    gaps = [item for item in result.circuit.layout.items if item.kind == "unresolved"]
+    assert len(gaps) == 1 and gaps[0].issue == "missing_reference" and gaps[0].ports == []
+    assert result.circuit.layout.items[0].kind == "port"
+    assert result.circuit.layout.items[-1].kind == "port"
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "DELETE FROM Service",
+        "DELETE FROM company WHERE Company_ID=8",
+        "DELETE FROM CompanyLocation WHERE CompanyLocationID=1001",
+        "DELETE FROM Location",
+        "UPDATE Location SET Lat='invalid', Lng=200",
+        "UPDATE LitCircuit SET Active='invalid' WHERE LitCircuitID=926",
+        "DROP TABLE Service",
+        "UPDATE Device SET DeviceName=NULL WHERE DeviceID=301",
+        "UPDATE Port SET PortName=NULL WHERE PortID=101",
+    ],
+)
+def test_missing_optional_context_retains_full_circuit_with_warning(live_source, statement):
+    request = owner_layout(live_source)
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(statement)
+    result = execute(live_source, request)
+    assert result.error is None
+    assert result.circuit.layout is not None
+    assert result.circuit.issues
+    assert all(item.kind != "unresolved" for item in result.circuit.layout.items)
+    if "Active=" in statement:
+        assert result.circuit.active is None
+
+
+@pytest.mark.parametrize("audience", ["owner", "partner"])
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "DELETE FROM Port WHERE PortID=101",
+        "DELETE FROM Device WHERE DeviceID=301",
+        "UPDATE CircuitLayout SET PortA=NULL",
+        "DELETE FROM CircuitLayout",
+        "DELETE FROM CircuitLayoutItem",
+        "UPDATE LitCircuit SET CircuitLayoutID=NULL WHERE LitCircuitID=926",
+    ],
+)
+def test_missing_endpoints_or_layout_preserve_circuit_summary(live_source, audience, statement):
+    request = owner_layout(live_source) if audience == "owner" else partner_layout(live_source)
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(statement)
+    result = execute(live_source, request)
+    assert result.error is None
+    assert result.circuit.name == "Example circuit"
+    assert result.circuit.issues
+    assert len(result.circuit.endpoints) == 2
+    for endpoint in result.circuit.endpoints:
+        if endpoint.port_id is None:
+            assert endpoint.device_id is None and endpoint.port_name is None
+            assert endpoint.port_status.state == endpoint.device_status.state == "unavailable"
+    if statement.startswith(("DELETE FROM Port", "DELETE FROM Device", "UPDATE CircuitLayout")):
+        assert result.circuit.endpoints[0].port_id is None
+        assert result.circuit.endpoints[1].port_id is not None
+    assert result.circuit.layout is not None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"port_id": "port_" + "a" * 24},
+        {"device_id": "device_" + "a" * 24},
+        {"port_status": {"state": "available", "operational_status": "up"}},
+        {"device_status": {"state": "not_linked"}},
+    ],
+)
+def test_missing_endpoint_contract_forbids_identity_or_readings(changes):
+    from open_carrier_portal.live_contract import UnavailableEndpoint
+
+    with pytest.raises(ValueError):
+        UnavailableEndpoint.model_validate({"position": "a", **changes})
+
+
+def test_missing_optional_query_does_not_hide_core_query_failure(live_source):
+    request = owner_layout(live_source)
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute("DROP TABLE Port")
+    result = execute(live_source, request)
+    assert result.error == "unavailable" and result.circuit is None
+
+
+@pytest.mark.parametrize("audience", ["owner", "partner"])
+@pytest.mark.parametrize("resource", ["racks", "locations", "circuit_layout_items", "services"])
+def test_optional_mappings_are_not_required_to_approve_full_layout(
+    live_source, audience, resource
+):
+    unmap_layout_resource(live_source, resource)
+    request = owner_layout(live_source) if audience == "owner" else partner_layout(live_source)
+    result = execute(live_source, request)
+    assert result.error is None and result.circuit.issues
+    assert result.circuit.endpoints[0].port_id is not None
+    if resource == "circuit_layout_items":
+        assert result.circuit.layout.items[0].issue == "mapping_missing"
+
+
+@pytest.mark.parametrize("statement", [
+    "UPDATE Patch SET PortID_A_sec=1842",
+    "DELETE FROM Port WHERE PortID=101",
+    "DELETE FROM Device WHERE DeviceID=301",
+])
+def test_existing_endpoint_only_read_is_not_silently_expanded_or_relaxed(live_source, statement):
+    source = enable(live_source)
+    listed = execute(live_source, owner_job(live_source, source)).page
+    request = owner_job(live_source, source).model_copy(
+        update={"operation": "circuits.read", "circuit_id": listed.items[0].id}
+    )
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(statement)
+    result = execute(live_source, request)
+    if "Patch" in statement:
+        assert result.error is None and result.circuit.layout is None
+    else:
+        assert result.error == "unavailable" and result.circuit is None
+
+
+@pytest.mark.parametrize(
+    "statement,value",
+    [
+        ("UPDATE LitCircuit SET LitCircuitName=? WHERE LitCircuitID=926", "N" * 800),
+        ("UPDATE LitCircuit SET Description=? WHERE LitCircuitID=926", "D" * 5000),
+        ("UPDATE Device SET DeviceName=? WHERE DeviceID=301", "D" * 800),
+        ("UPDATE Port SET PortName=? WHERE PortID=101", "P" * 800),
+        ("UPDATE PseudoWire SET PWID=?", "W" * 800),
+        ("UPDATE Patch SET PatchType=?", "T" * 200),
+        ("UPDATE Location SET Address1=?", "A" * 800),
+    ],
+    ids=[
+        "circuit-name", "description", "device-name", "port-name",
+        "pw-label", "patch-type", "address",
+    ],
+)
+def test_oversized_optional_layout_text_is_shortened_with_warning(live_source, statement, value):
+    request = owner_layout(live_source)
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(statement, (value,))
+    result = execute(live_source, request)
+    assert result.error is None
+    assert result.circuit.issues
+    assert any("shortened" in issue.lower() for issue in result.circuit.issues)
+    assert value not in result.model_dump_json()
 
 
 def test_layout_partner_access_is_lost_after_billing_transfer(live_source):
@@ -486,7 +665,9 @@ def test_unlinked_monitoring_never_breaks_full_layouts(live_source, audience, be
         assert "circuit.device_link_missing" in caplog.text
 
 
-@pytest.mark.parametrize("behavior", ["offline", "missing_port", "wrong_device", "stop"])
+@pytest.mark.parametrize(
+    "behavior", ["offline", "missing_port", "invalid_status", "wrong_device", "stop"]
+)
 def test_full_layout_monitoring_failures_are_explicit_and_never_healthy(live_source, behavior):
     settings, repo, connection, _, _ = live_source
     request = owner_layout(live_source)
@@ -528,7 +709,8 @@ def test_full_layout_monitoring_failures_are_explicit_and_never_healthy(live_sou
                         if number == 1101
                         else 1302,
                         "ifName": "ethernet",
-                        "ifOperStatus": "up",
+                        "ifOperStatus": "X" * 200
+                        if behavior == "invalid_status" and number == 1101 else "up",
                         "ifAdminStatus": "up",
                     }
                 ]
@@ -570,3 +752,5 @@ def test_full_layout_monitoring_failures_are_explicit_and_never_healthy(live_sou
             )
         else:
             assert result.circuit.endpoints[1].port_status.operational_status == "up"
+        if behavior == "invalid_status":
+            assert result.circuit.issues

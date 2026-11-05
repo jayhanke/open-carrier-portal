@@ -219,6 +219,23 @@ def test_partners_displays_companies_from_selected_saved_mapping(admin, company_
         assert db.execute("SELECT COUNT(*) FROM customer_accounts").fetchone()[0] == 2
 
 
+def test_broken_optional_portal_pairing_does_not_hide_company_directory(admin, company_source):
+    app, _, connection_file = admin
+    connection_file.write_text("invalid pairing file", encoding="utf-8")
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        response = client.get("/admin/partners?profile=customer-db")
+        assert response.status_code == 200
+        assert "Cannot load portal approvals" in response.text
+        assert "Second company" in response.text and "<td>42</td>" in response.text
+        assert 'action="/admin/partner"' in response.text
+        assert 'action="/admin/approve-company-policy"' not in response.text
+        assert any(
+            event["event"] == "policies.load_failed.invalid_configuration"
+            for event in app.state.admin_store.recent_events("portal")
+        )
+
+
 def test_partners_uses_selected_connection_and_does_not_guess_one(admin, company_source):
     app, _, _ = admin
     with TestClient(app, base_url=BASE) as client:

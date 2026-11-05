@@ -23,7 +23,9 @@ def approve_owner_source(
     if profile is None or not profile.enabled:
         raise ValueError("enabled database profile was not found")
     source = configured_profile_database(profile, metadata_path)
-    CircuitReader(repository, source, None).require_view(
+    CircuitReader(
+        repository, source, None, allow_unresolved_path_items=layout_enabled
+    ).require_view(
         "full_shared_path" if layout_enabled else "endpoints"
     )
     source.fetch_inventory_page("circuits", offset=0, limit=1)

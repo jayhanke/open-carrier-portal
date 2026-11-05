@@ -25,7 +25,11 @@ from pydantic import ValidationError
 from starlette.middleware.base import RequestResponseEndpoint
 
 from open_carrier_portal.admin_store import AdminStore
-from open_carrier_portal.errors import ConnectorError, SourceDatabaseError
+from open_carrier_portal.errors import (
+    ConnectorError,
+    MissingSourceReferenceError,
+    SourceDatabaseError,
+)
 
 
 @dataclass
@@ -193,6 +197,11 @@ def failure_reason(exc: BaseException) -> tuple[str, str]:
             "invalid_data",
             "Data does not match the expected schema; check the upstream or mapping.",
         )
+    if isinstance(exc, MissingSourceReferenceError):
+        return (
+            exc.code,
+            "A required source reference is missing or points to a record that was not found.",
+        )
     if isinstance(exc, ConnectorError):
         return exc.code, "The connector operation was rejected or its upstream service failed."
     if isinstance(exc, (ValueError, httpx.InvalidURL)):
@@ -217,6 +226,17 @@ def log_failure(component: str, event: str, exc: BaseException, **details: str |
         exception_type=type(exc).__name__,
         **details,
     )
+
+
+def record_data_issue(issues: list[str], message: str, *, event: str) -> None:
+    """Record bounded, caller-authored warnings without logging raw source values."""
+    if message in issues:
+        return
+    log_event("portal", event, message, level=logging.WARNING)
+    if len(issues) < 19:
+        issues.append(message)
+    elif len(issues) == 19:
+        issues.append("Additional data is unavailable; see connector Diagnostics for details.")
 
 
 def target_origin(url: str) -> str:

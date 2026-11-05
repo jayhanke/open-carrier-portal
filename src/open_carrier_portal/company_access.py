@@ -39,7 +39,9 @@ def approve_company_policy(
     if local.policy.visibility == "full_shared_path":
         if not layout_consent:
             raise ValueError("explicit full layout approval is required")
-        CircuitReader(repository, source, None).require_view("full_shared_path")
+        CircuitReader(
+            repository, source, None, allow_unresolved_path_items=True
+        ).require_view("full_shared_path")
     if source.missing_fields_for(
         requirements={
             "companies": ("source_id", "name"),

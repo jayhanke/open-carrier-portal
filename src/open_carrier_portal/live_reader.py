@@ -16,7 +16,7 @@ from open_carrier_portal.circuits import CircuitReader
 from open_carrier_portal.company_access import require_company_circuit
 from open_carrier_portal.company_policies import source_fingerprint
 from open_carrier_portal.config import Settings
-from open_carrier_portal.diagnostics import log_event, log_failure
+from open_carrier_portal.diagnostics import log_event, log_failure, record_data_issue
 from open_carrier_portal.errors import (
     AuthorizationError,
     ConfigurationError,
@@ -43,6 +43,7 @@ from open_carrier_portal.live_contract import (
     OwnerLiveRequest,
     OwnerSourcePage,
     OwnerSourcesRequest,
+    UnavailableEndpoint,
 )
 from open_carrier_portal.models import CircuitPort as SourcePort
 from open_carrier_portal.portal_agent import PortalConnection
@@ -137,21 +138,66 @@ async def execute_live_request(
         )
 
 
-def _project_port(port: SourcePort, *, context: bool) -> LivePort:
+def _project_port(
+    port: SourcePort, *, context: bool, issues: list[str] | None
+) -> LivePort:
     device = port.device
     if device is None:
         raise UpstreamResponseError("a circuit port has no device")
     rack = device.site
     location = rack.location if rack else None
-    observed = port.monitoring
-    device_observed = device.monitoring
+    statuses: list[MonitoringStatus] = []
+    for label, state, observed, fields in (
+        (
+            "Port", port.monitoring_state, port.monitoring,
+            {
+                "operational_status", "administrative_status", "optical_rx_dbm",
+                "optical_tx_dbm", "last_observed_at", "speed_bps",
+            },
+        ),
+        (
+            "Device", device.monitoring_state, device.monitoring,
+            {"operational_status", "last_observed_at"},
+        ),
+    ):
+        if observed is not None and state == "available":
+            try:
+                status = MonitoringStatus(state="available", **observed.model_dump(include=fields))
+            except ValidationError:
+                if issues is None:
+                    raise
+                record_data_issue(
+                    issues,
+                    f"{label} monitoring readings are invalid and are shown as unavailable.",
+                    event="circuit.data_unavailable",
+                )
+                status = MonitoringStatus(state="unavailable")
+        else:
+            status = MonitoringStatus(
+                state="not_linked" if state == "not_linked" else "unavailable"
+            )
+        statuses.append(status)
+    port_status, device_status = statuses
+
+    def display_name(name: str, label: str) -> str:
+        if len(name) > 512 and issues is not None:
+            record_data_issue(
+                issues, f"{label} was shortened to fit the circuit view.",
+                event="circuit.data_unavailable",
+            )
+            return name[:512]
+        return name
+
     return LivePort(
         port_id=port.id,
         port_name=port.name,
         device_id=device.id,
         device_name=device.name,
         rack=(
-            InventoryRef(resource="racks", id=rack.id, name=rack.name or "Rack")
+            InventoryRef(
+                resource="racks", id=rack.id,
+                name=display_name(rack.name or "Rack", "A rack display name"),
+            )
             if context and rack
             else None
         ),
@@ -159,42 +205,16 @@ def _project_port(port: SourcePort, *, context: bool) -> LivePort:
             InventoryRef(
                 resource="locations",
                 id=location.id,
-                name=", ".join(value for value in (location.city, location.address1) if value)
-                or "Site",
+                name=display_name(
+                    ", ".join(value for value in (location.city, location.address1) if value)
+                    or "Site", "A location display name",
+                ),
             )
             if context and location
             else None
         ),
-        port_status=(
-            MonitoringStatus(
-                state="available",
-                **observed.model_dump(
-                    include={
-                        "operational_status",
-                        "administrative_status",
-                        "optical_rx_dbm",
-                        "optical_tx_dbm",
-                        "last_observed_at",
-                        "speed_bps",
-                    }
-                ),
-            )
-            if observed is not None and port.monitoring_state == "available"
-            else MonitoringStatus(
-                state="not_linked" if port.monitoring_state == "not_linked" else "unavailable"
-            )
-        ),
-        device_status=(
-            MonitoringStatus(
-                state="available",
-                operational_status=device_observed.operational_status,
-                last_observed_at=device_observed.last_observed_at,
-            )
-            if device_observed is not None and device.monitoring_state == "available"
-            else MonitoringStatus(
-                state="not_linked" if device.monitoring_state == "not_linked" else "unavailable"
-            )
-        ),
+        port_status=port_status,
+        device_status=device_status,
     )
 
 
@@ -312,13 +332,19 @@ async def _read(
         for position, item in zip(("a", "z"), details.path.items, strict=True):
             port = item.port
             if port is None:
-                raise UpstreamResponseError("a circuit endpoint has no port")
-            endpoints.append(
-                CircuitEndpoint(
-                    position="a" if position == "a" else "z",
-                    **_project_port(port, context=inventory_links or layout_enabled).model_dump(),
+                if not layout_enabled or item.issue != "missing_reference":
+                    raise UpstreamResponseError("a circuit endpoint has no port")
+                endpoints.append(UnavailableEndpoint(position="a" if position == "a" else "z"))
+            else:
+                endpoints.append(
+                    CircuitEndpoint(
+                        position="a" if position == "a" else "z",
+                        **_project_port(
+                            port, context=inventory_links or layout_enabled,
+                            issues=reader.issues if layout_enabled else None,
+                        ).model_dump(),
+                    )
                 )
-            )
         layout = None
         if layout_enabled:
             path = await reader.path(job.circuit_id, rows[0], "full_shared_path")
@@ -336,7 +362,9 @@ async def _read(
                         ports.append(
                             LayoutPort.model_validate(
                                 {
-                                    **_project_port(value, context=True).model_dump(),
+                                    **_project_port(
+                                        value, context=True, issues=reader.issues
+                                    ).model_dump(),
                                     "role": role,
                                 }
                             )
@@ -375,6 +403,7 @@ async def _read(
                 active=details.active,
                 endpoints=endpoints,
                 layout=layout,
+                issues=reader.issues,
             ),
         )
     if isinstance(job, LiveRequest):

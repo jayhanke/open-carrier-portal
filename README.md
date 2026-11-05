@@ -162,11 +162,14 @@ to-location graph. The six core mapping sections are circuits, circuit paths, po
 devices, racks and locations. These are logical targets: a customer can map several
 sections to the same source table rather than duplicate their database. Ordered-path sharing also
 needs ordered route steps, plus patch/pseudowire mappings when those step types occur.
-Primary endpoint references cannot be NULL; an empty ordered path or missing device,
-rack or location record fails explicitly instead of returning a successful partial path.
+For the strict direct API and endpoint-only grants, primary endpoint references cannot be
+NULL; an empty ordered path or missing device, rack or location record fails explicitly.
+Explicitly approved full live layouts instead retain valid data with unavailable endpoints,
+labeled gaps and visible warnings as described below.
 Optional secondary patch port references may be NULL or zero (including `"0"`); these
-mean no secondary port, not a reference to port 0. Nonzero secondary references must
-resolve to existing ports; primary port references remain required.
+mean no secondary port, not a reference to port 0. In strict reads, nonzero secondary
+references must resolve to existing ports. Full live layouts retain valid primary
+patch ports and report a missing secondary reference without inventing a connection.
 Device and port Observium links treat NULL, zero (including `"0"`) and blank values as
 unlinked, never as an Observium record to query. In full live layouts, a positive port
 link without a linked inventory device keeps the layout visible with **Unavailable**
@@ -175,9 +178,9 @@ device linkage. Strict direct/endpoint-only reads retain their existing missing-
 error. A returned interface/device identity mismatch still fails the read.
 Companies, rack positions and service enrichment remain optional. If a service is
 mapped, map its type and bandwidth as well as its ID. Unconfigured optional enrichment referenced
-by a circuit is listed in `omitted_enrichment`; incomplete configured mappings,
-broken references and upstream failures fail explicitly. Optional source values can
-be NULL.
+by a circuit is listed in `omitted_enrichment`. Full live layouts report unavailable optional
+enrichment in `issues`; core query failures still reject the read. Strict direct reads keep
+their existing incomplete-mapping and broken-reference errors. Optional source values can be NULL.
 
 Circuits no longer offer separate A/Z location or Active mapping rows. Path-bearing
 responses derive A/Z context from `circuit_layouts.port_a_id` / `port_z_id`, following
@@ -318,8 +321,25 @@ is explicitly marked incomplete; no connections or healthy monitoring are invent
 connector logs `path.item_unresolved` with its position and a safe reason code. Only approved
 canonical mappings are queried: a source type label never becomes an arbitrary table query.
 This behavior applies to full-layout owner and partner views, not endpoint-only shares.
-Invalid ordering, ambiguous identities, broken required port/device links, source-query
-failures and authorization failures remain errors. The direct shared-circuit API stays strict.
+Missing port/device records inside a full layout now become explicit unresolved steps rather
+than aborting the circuit. A missing secondary patch port retains the patch's valid primary
+ports and adds a warning identifying its layout position and A/Z side. Missing endpoint
+port/device records retain the circuit summary, the other endpoint and resolvable layout steps;
+the affected endpoint has **Details unavailable**, no invented identity and no monitoring readings.
+Missing or empty layouts show an explicit unavailable layout step, not an apparently complete path.
+Optional company/service/rack/location enrichment and invalid coordinates or inventory active
+status no longer discard otherwise valid full-layout data. Safe, bounded `issues` accompany the
+result and are logged as `circuit.data_unavailable`. The hierarchy explorer similarly keeps
+selected inventory and child lists when ancestor records are missing, reports missing optional
+service/company enrichment, and shows invalid inventory status as **Unknown**. Oversized inventory
+display fields are shortened with a warning; source identifiers are never guessed or truncated.
+Full layouts also shorten oversized display labels/descriptions with a warning. Malformed
+optional monitoring readings become **Unavailable** for the affected port/device only, after
+identity checks; other valid readings and the inventory layout remain visible.
+Invalid ordering, ambiguous identities, core source-query failures and authorization failures
+remain errors. Actual monitoring identity mismatches remain errors, not unavailable readings.
+The direct shared-circuit API and existing endpoint-only shares stay strict.
+Update both connector and portal before using partial endpoint results and the new warning fields.
 `NewDarkFiberCircuit` steps use the optional **Dark fiber circuits** mapping:
 `NewDarkFiberCircuitID` to `source_id` and `Description` to `name`. Like SFNCustomer,
 the step shows the segment description; linked port status remains on surrounding Port

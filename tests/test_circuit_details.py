@@ -494,6 +494,17 @@ def test_broken_configured_location_is_still_an_error(circuit_app):
     assert "missing racks" in response.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("field", ["PortID_A_sec", "PortID_B_sec"])
+def test_direct_api_missing_secondary_reference_remains_strict(circuit_app, field):
+    app, client_id, _, circuit_id, source_path, _, _ = circuit_app
+    with sqlite3.connect(source_path) as db:
+        db.execute(f"UPDATE Patch SET {field}=1842 WHERE PatchID=501")
+    with TestClient(app) as client:
+        response = client.get("/v1/circuits/" + circuit_id, headers=token(client, client_id))
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "source_reference_missing"
+
+
 @pytest.mark.parametrize(
     "resource",
     [

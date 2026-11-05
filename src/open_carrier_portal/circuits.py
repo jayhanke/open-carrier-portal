@@ -6,14 +6,16 @@ from typing import Any, Literal
 from starlette.concurrency import run_in_threadpool
 
 from open_carrier_portal.adapters.base import MonitoringAdapter
-from open_carrier_portal.diagnostics import log_event, log_failure
+from open_carrier_portal.diagnostics import log_event, log_failure, record_data_issue
 from open_carrier_portal.errors import (
     ConfigurationError,
     ConnectorError,
     IntegrationUnavailableError,
+    MissingSourceReferenceError,
     RateLimitError,
     ResourceNotFoundError,
     SourceDatabaseError,
+    SourceDatabaseQueryError,
     SourceDatabaseUnavailableError,
     UpstreamResponseError,
     UpstreamTimeoutError,
@@ -93,9 +95,20 @@ class CircuitReader:
         self._devices: dict[str, CircuitDevice] = {}
         self._sites: dict[str, CircuitSite] = {}
         self._companies: dict[str, CircuitCompany] = {}
-        self._endpoint_sites: tuple[CircuitSite, CircuitSite] | None = None
+        self._endpoint_sites: tuple[CircuitSite | None, CircuitSite | None] | None = None
         self._rows_read = 0
         self._omitted: set[str] = set()
+        self.issues: list[str] = []
+
+    def _issue(self, message: str) -> None:
+        record_data_issue(self.issues, message, event="circuit.data_unavailable")
+
+    def _display_text(self, value: object, label: str, limit: int = 512) -> str | None:
+        text = _text(value)
+        if self.allow_unresolved_path_items and text is not None and len(text) > limit:
+            self._issue(f"{label} was shortened to fit the circuit view.")
+            return text[:limit]
+        return text
 
     def _monitoring_failed(self, exc: ConnectorError) -> None:
         if self.monitoring_required:
@@ -106,7 +119,14 @@ class CircuitReader:
 
     @property
     def missing_fields(self) -> dict[str, list[str]]:
-        return self.source.missing_fields_for(monitoring=self.monitoring is not None)
+        missing = self.source.missing_fields_for(monitoring=self.monitoring is not None)
+        if self.allow_unresolved_path_items and "devices" in missing:
+            fields = [field for field in missing["devices"] if field != "rack_id"]
+            if fields:
+                missing["devices"] = fields
+            else:
+                del missing["devices"]
+        return missing
 
     def require_view(self, visibility: str) -> None:
         requirements = {"circuits": ("source_id", "name")}
@@ -114,10 +134,14 @@ class CircuitReader:
             requirements = {
                 resource: SOURCE_RESOURCES[resource].required for resource in CORE_RESOURCES
             }
-            if visibility != "endpoints":
+            if visibility != "endpoints" and not self.allow_unresolved_path_items:
                 requirements["circuit_layout_items"] = SOURCE_RESOURCES[
                     "circuit_layout_items"
                 ].required
+            if self.allow_unresolved_path_items:
+                for resource in ("racks", "locations"):
+                    requirements.pop(resource)
+                requirements["devices"] = ("source_id", "name")
         missing = self.source.missing_fields_for(
             monitoring=self.monitoring is not None, requirements=requirements
         )
@@ -175,17 +199,38 @@ class CircuitReader:
         if source_id is None:
             if optional:
                 return None
-            raise UpstreamResponseError(f"A required reference to {resource} is missing")
+            raise MissingSourceReferenceError(resource)
         if not self.source.has_resource(resource):
             if optional:
                 self._omitted.add(resource)
+                if self.allow_unresolved_path_items:
+                    self._issue(f"{resource.replace('_', ' ').title()} details are unavailable.")
                 return None
             raise UpstreamResponseError(f"The circuit needs a source mapping for {resource}")
         if resource in self.missing_fields:
+            if optional and self.allow_unresolved_path_items:
+                self._omitted.add(resource)
+                self._issue(f"{resource.replace('_', ' ').title()} mapping is incomplete.")
+                return None
             raise UpstreamResponseError(f"The configured mapping for {resource} is incomplete")
-        row = await self.one(resource, source_id)
+        try:
+            row = await self.one(resource, source_id)
+        except UpstreamResponseError as exc:
+            if not (
+                optional
+                and self.allow_unresolved_path_items
+                and isinstance(exc.__cause__, (ConfigurationError, SourceDatabaseQueryError))
+            ):
+                raise
+            self._omitted.add(resource)
+            self._issue(f"{resource.replace('_', ' ').title()} enrichment could not be read.")
+            return None
         if row is None:
-            raise UpstreamResponseError(f"The shared circuit references missing {resource} data")
+            if optional and self.allow_unresolved_path_items:
+                self._omitted.add(resource)
+                self._issue(f"A referenced {resource.replace('_', ' ')} record is missing.")
+                return None
+            raise MissingSourceReferenceError(resource)
         return row
 
     async def company(self, source_id: object) -> CircuitCompany | None:
@@ -197,6 +242,9 @@ class CircuitReader:
             if row is None:
                 return None
             if row.get("name") is None:
+                if self.allow_unresolved_path_items:
+                    self._issue("A referenced company name is unavailable.")
+                    return None
                 raise UpstreamResponseError("A source company has no name")
             self._companies[key] = CircuitCompany(
                 id=self.public_id("company", key),
@@ -207,14 +255,37 @@ class CircuitReader:
     async def site(self, source_id: object, *, required: bool = False) -> CircuitSite | None:
         if source_id is None:
             if required:
+                if self.allow_unresolved_path_items:
+                    self._issue("A device's rack reference is missing.")
+                    return None
                 raise UpstreamResponseError("A shared resource has no rack reference")
             return None
         key = str(source_id)
         if key not in self._sites:
-            row = await self.reference("racks", source_id, optional=not required)
+            row = await self.reference(
+                "racks", source_id, optional=not required or self.allow_unresolved_path_items
+            )
             if row is None:
                 return None
-            location = await self.reference("locations", row.get("location_id"))
+            location = await self.reference(
+                "locations", row.get("location_id"), optional=self.allow_unresolved_path_items
+            )
+            if row.get("location_id") is None and self.allow_unresolved_path_items:
+                self._issue("A rack's location reference is missing.")
+
+            def coordinate(field: str, limit: int) -> float | None:
+                value = location.get(field) if location else None
+                try:
+                    parsed = _coordinate(value)
+                    if parsed is not None and not -limit <= parsed <= limit:
+                        raise UpstreamResponseError("A source coordinate is out of range")
+                    return parsed
+                except UpstreamResponseError:
+                    if not self.allow_unresolved_path_items:
+                        raise
+                    self._issue("Location coordinates are invalid and were not displayed.")
+                    return None
+
             physical = (
                 None
                 if location is None
@@ -227,8 +298,8 @@ class CircuitReader:
                     postal_code=_text(location.get("postal_code")),
                     floor=_text(location.get("floor")),
                     suite=_text(location.get("suite")),
-                    latitude=_coordinate(location.get("latitude")),
-                    longitude=_coordinate(location.get("longitude")),
+                    latitude=coordinate("latitude", 90),
+                    longitude=coordinate("longitude", 180),
                 )
             )
             self._sites[key] = CircuitSite(
@@ -243,21 +314,29 @@ class CircuitReader:
 
     async def device(self, source_id: object) -> CircuitDevice:
         if source_id is None:
-            raise UpstreamResponseError("A shared port has no device reference")
+            raise MissingSourceReferenceError("devices")
         key = str(source_id)
         if key not in self._devices:
             row = await self.reference("devices", source_id)
             assert row is not None
             if row.get("name") is None:
-                raise UpstreamResponseError("A source device has no name")
-            if self.source.has_resource("rack_positions"):
+                if not self.allow_unresolved_path_items:
+                    raise UpstreamResponseError("A source device has no name")
+                self._issue(
+                    "A device name is unavailable; its verified source identity was retained."
+                )
+            if self.source.has_resource("rack_positions") and (
+                not self.allow_unresolved_path_items or "rack_positions" not in self.missing_fields
+            ):
                 racks = await self.rows("rack_positions", {"device_id": key}, order_by="source_id")
             else:
                 self._omitted.add("rack_units")
+                if self.allow_unresolved_path_items:
+                    self._issue("Rack-unit details are unavailable.")
                 racks = []
             device = CircuitDevice(
                 id=self.public_id("device", key),
-                name=str(row["name"]),
+                name=self._display_text(row.get("name"), "A device name") or "Name unavailable",
                 type=_text(row.get("type")),
                 company=await self.company(row.get("company_id")),
                 site=await self.site(row.get("rack_id"), required=True),
@@ -319,16 +398,20 @@ class CircuitReader:
 
     async def port(self, source_id: object) -> CircuitPort:
         if source_id is None:
-            raise UpstreamResponseError("A circuit component has no endpoint port reference")
+            raise MissingSourceReferenceError("ports")
         key = str(source_id)
         if key not in self._ports:
             row = await self.reference("ports", key)
             assert row is not None
             if row.get("name") is None:
-                raise UpstreamResponseError("A source port has no name")
+                if not self.allow_unresolved_path_items:
+                    raise UpstreamResponseError("A source port has no name")
+                self._issue(
+                    "A port name is unavailable; its verified source identity was retained."
+                )
             port = CircuitPort(
                 id=self.public_id("port", key),
-                name=_text(row.get("name")),
+                name=self._display_text(row.get("name"), "A port name"),
                 device=await self.device(row.get("device_id")),
                 owner_company=await self.company(row.get("owner_company_id")),
                 connector_type=_text(row.get("connector_type")),
@@ -419,16 +502,34 @@ class CircuitReader:
         visibility: PathVisibility,
     ) -> CircuitPath:
         self.require_view(visibility)
-        layout = await self.reference("circuit_layouts", circuit.get("circuit_layout_id"))
-        if layout is None:
-            raise UpstreamResponseError("The shared circuit has no circuit layout")
-        if any(layout.get(field) is None for field in ("port_a_id", "port_z_id")):
-            raise UpstreamResponseError("The shared circuit layout has missing endpoint ports")
-        a_port = await self.port(layout["port_a_id"])
-        z_port = await self.port(layout["port_z_id"])
-        assert a_port.device is not None and a_port.device.site is not None
-        assert z_port.device is not None and z_port.device.site is not None
-        self._endpoint_sites = (a_port.device.site, z_port.device.site)
+        try:
+            layout = await self.reference("circuit_layouts", circuit.get("circuit_layout_id"))
+        except MissingSourceReferenceError:
+            if not self.allow_unresolved_path_items:
+                raise
+            self._issue("The circuit layout reference is missing or its record was not found.")
+            layout = {
+                "source_id": circuit.get("circuit_layout_id"),
+                "port_a_id": None,
+                "port_z_id": None,
+            }
+        assert layout is not None
+        endpoints: list[CircuitPort | None] = []
+        for side, field in (("A", "port_a_id"), ("Z", "port_z_id")):
+            try:
+                endpoint = await self.port(layout.get(field))
+            except MissingSourceReferenceError:
+                if not self.allow_unresolved_path_items:
+                    raise
+                self._issue(
+                    f"Endpoint {side} details are unavailable: a source reference is missing."
+                )
+                endpoint = None
+            endpoints.append(endpoint)
+        self._endpoint_sites = (
+            endpoints[0].device.site if endpoints[0] and endpoints[0].device else None,
+            endpoints[1].device.site if endpoints[1] and endpoints[1].device else None,
+        )
         complete = not self.missing_fields
         items: list[CircuitPathItem] = []
 
@@ -472,17 +573,62 @@ class CircuitReader:
                 )
             )
 
+        async def secondary_port(
+            identifier: object, side: str, position: int
+        ) -> CircuitPort | None:
+            nonlocal complete
+            if identifier in (None, 0, "0"):
+                return None
+            try:
+                return await self.port(identifier)
+            except MissingSourceReferenceError:
+                if not self.allow_unresolved_path_items:
+                    raise
+                complete = False
+                self._issue(
+                    f"Layout position {position}: secondary {side} port details "
+                    "are unavailable because a source reference is missing."
+                )
+                return None
+
         if visibility == "endpoints":
-            for position, field in enumerate(("port_a_id", "port_z_id")):
-                await add_port(layout.get(field), position)
+            for position, endpoint in enumerate(endpoints):
+                if endpoint is None:
+                    add_unresolved(
+                        position,
+                        "Endpoint A" if position == 0 else "Endpoint Z",
+                        "missing_reference",
+                    )
+                else:
+                    await add_port(
+                        layout.get("port_a_id" if position == 0 else "port_z_id"), position
+                    )
         else:
-            rows = await self.rows(
-                "circuit_layout_items",
-                {"circuit_layout_id": str(layout["source_id"])},
-                order_by="position",
-            )
+            unavailable_issue: PathItemIssue = "missing_reference"
+            if self.allow_unresolved_path_items and (
+                not self.source.has_resource("circuit_layout_items")
+                or "circuit_layout_items" in self.missing_fields
+            ):
+                self._issue(
+                    "Ordered layout steps are unavailable because their mapping is incomplete."
+                )
+                unavailable_issue = "mapping_missing"
+                rows = []
+            else:
+                rows = (
+                    await self.rows(
+                        "circuit_layout_items",
+                        {"circuit_layout_id": str(layout["source_id"])},
+                        order_by="position",
+                    )
+                    if layout["source_id"] is not None
+                    else []
+                )
             if not rows:
-                raise UpstreamResponseError("The shared circuit has no ordered path steps")
+                if not self.allow_unresolved_path_items:
+                    raise UpstreamResponseError("The shared circuit has no ordered path steps")
+                self._issue("The circuit has no readable ordered layout steps.")
+                add_unresolved(0, "Circuit layout", unavailable_issue)
             components: dict[
                 str, tuple[str, Literal["patch", "pseudowire", "dark_fiber"]]
             ] = {
@@ -505,7 +651,12 @@ class CircuitReader:
                         continue
                     raise UpstreamResponseError("A path item has no source reference")
                 if kind == "port":
-                    await add_port(source_id, position)
+                    try:
+                        await add_port(source_id, position)
+                    except MissingSourceReferenceError:
+                        if not self.allow_unresolved_path_items:
+                            raise
+                        add_unresolved(position, label, "missing_reference")
                     continue
                 configuration = components.get(kind)
                 if configuration is None:
@@ -533,24 +684,36 @@ class CircuitReader:
                             position=position,
                             kind="dark_fiber",
                             resource_id=self.public_id("dark_fiber", source_id),
-                            name=_text(component.get("name")),
+                            name=self._display_text(
+                                component.get("name"), "A dark-fiber description"
+                            ),
                         )
                     )
                     continue
                 a_id, z_id = component.get("port_a_id"), component.get("port_b_id")
-                a = await self.port(a_id)
-                z = await self.port(z_id)
+                try:
+                    a = await self.port(a_id)
+                    z = await self.port(z_id)
+                except MissingSourceReferenceError:
+                    if not self.allow_unresolved_path_items:
+                        raise
+                    add_unresolved(position, label, "missing_reference")
+                    continue
                 a2_id = component.get("port_a_secondary_id")
                 z2_id = component.get("port_b_secondary_id")
-                a2 = await self.port(a2_id) if a2_id not in (None, 0, "0") else None
-                z2 = await self.port(z2_id) if z2_id not in (None, 0, "0") else None
+                a2 = await secondary_port(a2_id, "A", position)
+                z2 = await secondary_port(z2_id, "Z", position)
                 items.append(
                     CircuitPathItem(
                         position=position,
                         kind=component_kind,
                         resource_id=self.public_id(component_kind, source_id),
-                        name=_text(component.get("pseudowire_id")),
-                        patch_type=_text(component.get("patch_type")),
+                        name=self._display_text(
+                            component.get("pseudowire_id"), "A pseudowire label"
+                        ),
+                        patch_type=self._display_text(
+                            component.get("patch_type"), "A patch type", 120
+                        ),
                         port_a_id=a.id if a else None,
                         port_b_id=z.id if z else None,
                         port_a=a,
@@ -592,11 +755,20 @@ class CircuitReader:
         else:
             a_location = await self.site(circuit.get("a_company_location_id"))
             z_location = await self.site(circuit.get("z_company_location_id"))
+        try:
+            active = _active(circuit.get("active"))
+        except UpstreamResponseError:
+            if not self.allow_unresolved_path_items:
+                raise
+            self._issue("Inventory active status is invalid and is shown as unknown.")
+            active = None
         return CircuitDetails(
             id=circuit_id,
-            name=_text(circuit.get("name")),
-            description=_text(circuit.get("description")),
-            active=_active(circuit.get("active")),
+            name=self._display_text(circuit.get("name"), "The circuit name"),
+            description=self._display_text(
+                circuit.get("description"), "The circuit description", 4000
+            ),
+            active=active,
             service_name=_text(service.get("name")) if service else None,
             service_type=_text(service.get("type")) if service else None,
             bandwidth=_text(service.get("bandwidth")) if service else None,
@@ -604,4 +776,5 @@ class CircuitReader:
             z_location=z_location,
             path=path,
             omitted_enrichment=sorted(self._omitted),
+            issues=list(self.issues),
         )

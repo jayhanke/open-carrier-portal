@@ -170,7 +170,80 @@ def test_unknown_inventory_state_is_not_reported_as_active(live_source):
     )
     with closing(sqlite3.connect(live_source[4])) as db, db:
         db.execute("UPDATE LitCircuit SET Active='invalid' WHERE LitCircuitID=926")
-    assert execute(live_source, request(live_source, source, "circuits")).error == "unavailable"
+    result = execute(live_source, request(live_source, source, "circuits"))
+    assert result.error is None and len(result.inventory.items) == 2
+    assert result.inventory.issues
+    assert (
+        next(
+            field.value for field in result.inventory.items[0].attributes
+            if field.label == "Inventory status"
+        ) == "Unknown"
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "UPDATE Device SET CompanyLocationID=NULL WHERE DeviceID=301",
+        "UPDATE Device SET CompanyLocationID=1842 WHERE DeviceID=301",
+        "DELETE FROM CompanyLocation WHERE CompanyLocationID=1001",
+        "DELETE FROM Location",
+        "DROP TABLE Location",
+    ],
+)
+def test_missing_ancestry_retains_selected_device_and_child_ports(live_source, statement):
+    source = approve(live_source)
+    devices = execute(live_source, request(live_source, source, "devices")).inventory
+    selected = next(item for item in devices.items if item.name == "edge-a")
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(statement)
+    result = execute(
+        live_source, request(live_source, source, "devices", record_id=selected.id)
+    )
+    assert result.error is None
+    assert result.inventory.selected.id == selected.id
+    assert result.inventory.items[0].name == "xe-0/0/1"
+    assert result.inventory.issues
+
+
+def test_missing_child_table_keeps_selected_device_with_explicit_warning(live_source):
+    source = approve(live_source)
+    devices = execute(live_source, request(live_source, source, "devices")).inventory
+    selected = next(item for item in devices.items if item.name == "edge-a")
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute("DROP TABLE Port")
+    result = execute(
+        live_source, request(live_source, source, "devices", record_id=selected.id)
+    )
+    assert result.error is None
+    assert result.inventory.selected.id == selected.id
+    assert result.inventory.items == [] and result.inventory.issues
+    assert execute(live_source, request(live_source, source, "ports")).error == "unavailable"
+
+
+@pytest.mark.parametrize("statement", ["DELETE FROM Service", "DROP TABLE Service"])
+def test_missing_service_enrichment_does_not_break_inventory_list(live_source, statement):
+    source = approve(live_source)
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(statement)
+    result = execute(live_source, request(live_source, source, "circuits"))
+    assert result.error is None and len(result.inventory.items) == 2
+    assert result.inventory.issues
+    assert all(
+        field.label != "Service" for item in result.inventory.items for field in item.attributes
+    )
+
+
+def test_long_inventory_display_fields_are_shortened_with_explicit_warning(live_source):
+    source = approve(live_source)
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute("UPDATE LitCircuit SET LitCircuitName=?, Description=? WHERE LitCircuitID=926",
+                   ("N" * 800, "D" * 5000))
+    result = execute(live_source, request(live_source, source, "circuits"))
+    assert result.error is None and len(result.inventory.items) == 2
+    assert len(result.inventory.items[0].name) == 512
+    assert any(len(field.value) == 4000 for field in result.inventory.items[0].attributes)
+    assert result.inventory.issues
 
 
 def test_search_pagination_and_company_relationships(live_source):

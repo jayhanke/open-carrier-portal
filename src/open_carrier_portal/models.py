@@ -225,6 +225,7 @@ class CircuitDetails(BaseModel):
     z_location: CircuitSite | None = None
     path: CircuitPath | None = None
     omitted_enrichment: list[str] = Field(default_factory=list)
+    issues: list[str] = Field(default_factory=list)
 
 
 class CapabilitySet(BaseModel):
