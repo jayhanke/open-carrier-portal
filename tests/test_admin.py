@@ -4,7 +4,9 @@ import json
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from uuid import uuid4
 
 import httpx
@@ -27,6 +29,9 @@ BASE = "http://127.0.0.1:8000"
 def admin(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         "open_carrier_portal.admin.serve_live_request", lambda *args, **kwargs: False
+    )
+    monkeypatch.setattr(
+        "open_carrier_portal.admin.portal_access_requests", lambda *args, **kwargs: []
     )
     settings = Settings(
         database_path=tmp_path / "metadata.db",
@@ -99,6 +104,423 @@ def company_source(admin, tmp_path):
     return database
 
 
+@pytest.fixture
+def company_link(admin, company_source, monkeypatch):
+    from open_carrier_portal.company_access import approve_company_policy
+    from open_carrier_portal.company_policies import CompanyPolicy, PolicySnapshot
+    from open_carrier_portal.models import ConnectorIdentity
+    from open_carrier_portal.portal_agent import portal_access_requests
+
+    app, settings, connection_file = admin
+    repo = app.state.repository
+    identity = ConnectorIdentity(
+        organization_id=str(uuid4()),
+        organization_name="Owner",
+        connector_id=str(uuid4()),
+        issuer_url=settings.issuer_url,
+    )
+    repo.put_connector_identity(identity)
+    portal = PortalConnection(
+        "https://portal.example",
+        identity.connector_id,
+        identity.organization_id,
+        "t" * 64,
+    )
+    connection_file.touch(mode=0o600)
+    connection_file.write_text(
+        json.dumps(
+            {
+                "portal_url": portal.portal_url,
+                "connector_id": portal.connector_id,
+                "organization_id": portal.organization_id,
+                "token": portal.token,
+            }
+        )
+    )
+    profile = repo.get_source_database_profile("customer-db")
+    mapping = json.loads(profile.mapping_json)
+    mapping["resources"]["circuits"] = {
+        "table": "circuits",
+        "columns": {"source_id": "id", "billing_company_id": "customer"},
+    }
+    with sqlite3.connect(company_source) as db:
+        db.execute("CREATE TABLE circuits (id INTEGER PRIMARY KEY, customer INTEGER)")
+        db.executemany("INSERT INTO circuits VALUES (?, ?)", [(1, 42), (2, 77)])
+    repo.put_source_database_profile(
+        name=profile.name,
+        driver="sqlite",
+        host=None,
+        port=None,
+        database_name=str(company_source),
+        username=None,
+        password_env_var=None,
+        tls_ca_path=None,
+        timeout_seconds=10,
+        mapping_json=json.dumps(mapping),
+    )
+    other = CompanyPolicy(
+        policy_id=uuid4(),
+        revision=1,
+        owner_organization_id=portal.organization_id,
+        recipient_organization_id=uuid4(),
+        recipient_name="Existing recipient",
+        connector_id=portal.connector_id,
+        state="pending",
+    )
+    repo.synchronize_portal_policies(portal, PolicySnapshot(version=1, policies=[other]))
+    approve_company_policy(
+        repo,
+        portal,
+        metadata_path=settings.database_path,
+        policy_id=str(other.policy_id),
+        revision=1,
+        profile_name=profile.name,
+        company_id="77",
+        approved_by="operator",
+    )
+    recipient = str(uuid4())
+    state = {"fail_heartbeat": False, "policies": [other.model_dump(mode="json")], "requests": []}
+
+    def handler(request):
+        assert request.headers["authorization"] == f"Bearer {portal.token}"
+        state["requests"].append(request)
+        current = next(
+            (p for p in state["policies"] if p["recipient_organization_id"] == recipient), None
+        )
+        if request.url.path == "/api/connectors/access-requests":
+            return httpx.Response(
+                200,
+                json={
+                    "requests": [
+                        {
+                            "request_id": str(uuid4()),
+                            "company_id": recipient,
+                            "name": "Recipient <Carrier>",
+                        }
+                    ]
+                },
+            )
+        if request.method == "GET":
+            assert request.url.path == f"/api/connectors/companies/{recipient}"
+            return httpx.Response(
+                200,
+                json={
+                    "company_id": recipient,
+                    "name": "Recipient <Carrier>",
+                    "policy_id": current["policy_id"] if current else None,
+                    "revision": current["revision"] if current else 0,
+                    "visibility": current["visibility"] if current else "endpoints",
+                },
+            )
+        payload = json.loads(request.content)
+        if request.url.path == "/api/connectors/company-links":
+            before_proposal = state.get("before_proposal")
+            if before_proposal:
+                before_proposal()
+            assert payload["connector_id"] == portal.connector_id
+            assert payload["recipient_company_id"] == recipient
+            policy = CompanyPolicy(
+                policy_id=current["policy_id"] if current else uuid4(),
+                revision=payload["expected_revision"] + 1,
+                owner_organization_id=portal.organization_id,
+                recipient_organization_id=recipient,
+                recipient_name="Recipient <Carrier>",
+                connector_id=portal.connector_id,
+                state="pending",
+                visibility=payload["visibility"],
+            ).model_dump(mode="json")
+            state["policies"] = [
+                p for p in state["policies"] if p["policy_id"] != policy["policy_id"]
+            ] + [policy]
+            return httpx.Response(
+                200, json={"policy_id": policy["policy_id"], "policies": state["policies"]}
+            )
+        assert request.url.path == "/api/connectors/heartbeat"
+        if state["fail_heartbeat"]:
+            return httpx.Response(503)
+        for accepted in payload["policy_receipts"]:
+            for policy in state["policies"]:
+                if (
+                    accepted["policy_id"] == policy["policy_id"]
+                    and accepted["revision"] == policy["revision"]
+                ):
+                    policy["state"] = (
+                        "active" if accepted["state"] == "accepted" else "needs_approval"
+                    )
+        return httpx.Response(
+            200,
+            json={
+                "status": "connected",
+                "company_policies": {"version": 1, "policies": state["policies"]},
+            },
+        )
+
+    monkeypatch.setattr(
+        "open_carrier_portal.admin.http_client",
+        lambda trust: httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    monkeypatch.setattr("open_carrier_portal.admin.portal_access_requests", portal_access_requests)
+    return portal, recipient, state
+
+
+def test_company_id_link_picker_approval_and_billing_scope(admin, company_link):
+    from open_carrier_portal.company_access import require_company_circuit
+
+    app, settings, _ = admin
+    portal, recipient, state = company_link
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        page = client.get(
+            "/admin/partners",
+            params={
+                "profile": "customer-db",
+                "portal_company_id": recipient,
+                "q": "42",
+            },
+        )
+        assert page.status_code == 200
+        assert "Portal circuit access requests" in page.text
+        assert (
+            f'<option value="{recipient}" selected>Recipient &lt;Carrier&gt;</option>' in page.text
+        )
+        assert "Portal company: Recipient &lt;Carrier&gt;" in page.text
+        assert 'type="radio" name="company" value="42"' in page.text
+        assert 'type="radio" name="company" value="77"' not in page.text
+        assert f'name="portal_company_id" value="{recipient}"' in page.text
+        assert 'name="expected_revision" value="0"' in page.text
+        assert "Advanced: direct connector access" in page.text
+        data = {
+            "profile": "customer-db",
+            "portal_company_id": recipient,
+            "expected_policy_id": "",
+            "expected_revision": "0",
+            "company": "42",
+            "visibility": "endpoints",
+            "consent": "yes",
+        }
+        result = post(client, "link-portal-company", **data)
+        assert result.status_code == 200
+        assert "Sharing is active" in result.text
+        local = next(
+            p
+            for p in app.state.repository.list_portal_policies(portal)
+            if str(p.policy.recipient_organization_id) == recipient
+        )
+        assert local.policy.state == "active" and local.receipt.source_company_id == "42"
+        assert {
+            p.source_company_id for p in app.state.repository.portal_policy_receipts(portal)
+        } == {
+            "42",
+            "77",
+        }
+        kwargs = {
+            "metadata_path": settings.database_path,
+            "policy_id": str(local.policy.policy_id),
+            "revision": 1,
+            "recipient_organization_id": recipient,
+        }
+        require_company_circuit(app.state.repository, portal, circuit_source_id="1", **kwargs)
+        with pytest.raises(AuthorizationError):
+            require_company_circuit(app.state.repository, portal, circuit_source_id="2", **kwargs)
+        assert (
+            post(client, "stop-company-policy", policy=str(local.policy.policy_id)).status_code
+            == 200
+        )
+        with pytest.raises(AuthorizationError):
+            require_company_circuit(app.state.repository, portal, circuit_source_id="1", **kwargs)
+        assert portal.token not in client.get("/admin/diagnostics").text
+        assert any(r.url.path == "/api/connectors/company-links" for r in state["requests"])
+
+
+@pytest.mark.parametrize("invalid", ["csrf", "consent", "company", "stale", "layout", "mapping"])
+def test_company_link_rejects_before_pending_proposal(admin, company_link, invalid):
+    app, _, _ = admin
+    _, recipient, state = company_link
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        data = {
+            "csrf": csrf(client),
+            "profile": "customer-db",
+            "portal_company_id": recipient,
+            "expected_policy_id": "",
+            "expected_revision": "0",
+            "company": "42",
+            "visibility": "endpoints",
+            "consent": "yes",
+        }
+        if invalid == "csrf":
+            data["csrf"] = "wrong"
+        elif invalid == "consent":
+            data["consent"] = ""
+        elif invalid == "company":
+            data["company"] = "missing"
+        elif invalid == "stale":
+            data["expected_revision"] = "1"
+            data["expected_policy_id"] = str(uuid4())
+        elif invalid == "layout":
+            data["visibility"] = "full_shared_path"
+        else:
+            data["visibility"] = "full_shared_path"
+            data["layout_consent"] = "yes"
+        response = client.post("/admin/link-portal-company", data=data)
+        assert response.status_code == (403 if invalid == "csrf" else 400)
+        assert not any(r.url.path == "/api/connectors/company-links" for r in state["requests"])
+        assert len(state["policies"]) == 1
+
+
+def test_company_link_activation_failure_is_explicit_and_heartbeat_retries(admin, company_link):
+    app, _, _ = admin
+    portal, recipient, state = company_link
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        state["fail_heartbeat"] = True
+        result = post(
+            client,
+            "link-portal-company",
+            profile="customer-db",
+            portal_company_id=recipient,
+            expected_revision="0",
+            company="42",
+            visibility="endpoints",
+            consent="yes",
+        )
+        assert result.status_code == 400
+        assert "approval was saved, but portal activation is unconfirmed" in result.text
+        assert "Sharing is active" not in result.text
+        local = next(
+            p
+            for p in app.state.repository.list_portal_policies(portal)
+            if str(p.policy.recipient_organization_id) == recipient
+        )
+        assert local.policy.state == "pending" and local.receipt.source_company_id == "42"
+        assert "company_link.acknowledgement_failed" in client.get("/admin/diagnostics").text
+        state["fail_heartbeat"] = False
+        assert post(client, "heartbeat").status_code == 200
+        local = next(
+            p
+            for p in app.state.repository.list_portal_policies(portal)
+            if str(p.policy.recipient_organization_id) == recipient
+        )
+        assert local.policy.state == "active"
+
+
+def test_invalid_portal_id_does_not_call_remote_lookup(admin, company_link):
+    app, _, _ = admin
+    _, _, state = company_link
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        result = client.get("/admin/partners?profile=customer-db&portal_company_id=invalid")
+        assert result.status_code == 400 and "Invalid portal Company ID" in result.text
+        assert not any(
+            r.url.path.startswith("/api/connectors/companies/") for r in state["requests"]
+        )
+
+
+def test_request_list_failure_keeps_directory_visible_and_reports_diagnostics(
+    admin, company_source, monkeypatch
+):
+    app, _, connection_file = admin
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        post(client, "identity", name="Owner")
+        connection_file.touch(mode=0o600)
+        connection_file.write_text(
+            json.dumps(
+                {
+                    "portal_url": "https://portal.example",
+                    "connector_id": app.state.repository.get_connector_identity().connector_id,
+                    "organization_id": str(uuid4()),
+                    "token": "t" * 64,
+                }
+            )
+        )
+
+        def fail(*args, **kwargs):
+            raise ValueError("invalid portal request metadata")
+
+        monkeypatch.setattr("open_carrier_portal.admin.portal_access_requests", fail)
+        response = client.get("/admin/partners?profile=customer-db")
+        assert response.status_code == 200
+        assert "Could not load portal access requests" in response.text
+        assert "Example &lt;Carrier&gt;" in response.text
+        assert "access_requests.load_failed" in client.get("/admin/diagnostics").text
+
+
+def test_company_link_and_normal_heartbeat_are_serialized(admin, company_link):
+    app, _, _ = admin
+    _, recipient, state = company_link
+    proposal_started, release_proposal, heartbeat_started = Event(), Event(), Event()
+
+    def hold_proposal():
+        proposal_started.set()
+        assert release_proposal.wait(timeout=5)
+
+    state["before_proposal"] = hold_proposal
+    with TestClient(app, base_url=BASE) as client, ThreadPoolExecutor(max_workers=2) as pool:
+        login(client)
+        token = csrf(client)
+        linking = pool.submit(
+            client.post,
+            "/admin/link-portal-company",
+            data={
+                "csrf": token,
+                "profile": "customer-db",
+                "portal_company_id": recipient,
+                "expected_revision": "0",
+                "company": "42",
+                "visibility": "endpoints",
+                "consent": "yes",
+            },
+        )
+        assert proposal_started.wait(timeout=3)
+        before = len(state["requests"])
+
+        def concurrent_heartbeat():
+            heartbeat_started.set()
+            return client.post("/admin/heartbeat", data={"csrf": token})
+
+        checking = pool.submit(concurrent_heartbeat)
+        assert heartbeat_started.wait(timeout=3)
+        try:
+            with pytest.raises(TimeoutError):
+                checking.result(timeout=0.2)
+            assert len(state["requests"]) == before
+        finally:
+            release_proposal.set()
+        assert linking.result(timeout=5).status_code == 200
+        assert checking.result(timeout=5).status_code == 200
+
+
+def test_company_lookup_is_preserved_across_directory_search_and_pages(
+    admin, company_source, company_link
+):
+    app, _, _ = admin
+    _, recipient, _ = company_link
+    with sqlite3.connect(company_source) as db:
+        db.executemany(
+            "INSERT INTO customer_accounts VALUES (?, ?)",
+            [(i, f"Customer {i}") for i in range(1000, 1150)],
+        )
+    with TestClient(app, base_url=BASE) as client:
+        login(client)
+        page = client.get(
+            "/admin/partners",
+            params={
+                "profile": "customer-db",
+                "portal_company_id": recipient,
+                "q": "Customer",
+            },
+        )
+        next_url = re.search(r'<a rel="next" href="([^"]+)"', page.text).group(1)
+        assert recipient in next_url and "q=Customer" in next_url
+        next_page = client.get(next_url.replace("&amp;", "&"))
+        assert next_page.status_code == 200
+        assert 'type="radio" name="company" value="1100"' in next_page.text
+        assert 'type="radio" name="company" value="1000"' not in next_page.text
+        assert f'name="portal_company_id" value="{recipient}"' in next_page.text
+        assert not re.search(r'<input[^>]+name="company"[^>]+checked', next_page.text)
+
+
 def test_portal_company_approval_requires_live_mapped_company_consent_and_csrf(
     admin, company_source
 ):
@@ -139,9 +561,10 @@ def test_portal_company_approval_requires_live_mapped_company_consent_and_csrf(
         page = client.get("/admin/partners?profile=customer-db")
         assert "Recipient &lt;Carrier&gt;" in page.text
         assert "Recipient <Carrier>" not in page.text
-        assert "Approve company link and circuit policy" in page.text
+        assert "Approve company link and circuit policy" not in page.text
+        assert 'name="portal_company_id"' in page.text
         assert 'class="company-picker"' in page.text
-        assert 'type="radio" name="company" value="42"' in page.text
+        assert "<td>42</td>" in page.text
         assert 'type="text" name="company"' not in page.text
         assert "Search company name or ID" in page.text
         data = {
@@ -230,7 +653,7 @@ def test_broken_optional_portal_pairing_does_not_hide_company_directory(admin, c
         login(client)
         response = client.get("/admin/partners?profile=customer-db")
         assert response.status_code == 200
-        assert "Cannot load portal approvals" in response.text
+        assert "Cannot load sharing approvals" in response.text
         assert "Second company" in response.text and "<td>42</td>" in response.text
         assert 'action="/admin/partner"' in response.text
         assert 'action="/admin/approve-company-policy"' not in response.text
@@ -338,7 +761,8 @@ def test_partners_company_directory_has_explicit_row_limit(admin, company_source
         assert "Previous companies" in last
         events = app.state.admin_store.recent_events("database")
         event = next(
-            event for event in events
+            event
+            for event in events
             if event["event"] == "companies.loaded" and json.loads(event["details"])["truncated"]
         )
         assert json.loads(event["details"]) == {"rows_shown": 100, "truncated": 1}
@@ -363,15 +787,19 @@ def test_company_picker_search_reaches_beyond_first_page(admin, company_source):
         )
     with TestClient(app, base_url=BASE) as client:
         login(client)
-        page = client.get(
-            "/admin/partners", params={"profile": "customer-db", "q": "1199"}
-        )
+        page = client.get("/admin/partners", params={"profile": "customer-db", "q": "1199"})
         assert "Customer 1199" in page.text and "Customer 1198" not in page.text
 
 
-@pytest.mark.parametrize("params", [
-    {"offset": "-1"}, {"offset": "invalid"}, {"offset": "1000000"}, {"q": "x" * 121},
-])
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"offset": "-1"},
+        {"offset": "invalid"},
+        {"offset": "1000000"},
+        {"q": "x" * 121},
+    ],
+)
 def test_company_picker_invalid_search_is_visible_and_logged(admin, company_source, params):
     app, _, _ = admin
     with TestClient(app, base_url=BASE) as client:
@@ -394,9 +822,7 @@ def test_company_picker_search_is_literal_and_pagination_preserves_filter(admin,
         )
     with TestClient(app, base_url=BASE) as client:
         login(client)
-        page = client.get(
-            "/admin/partners", params={"profile": "customer-db", "q": "%_!"}
-        )
+        page = client.get("/admin/partners", params={"profile": "customer-db", "q": "%_!"})
         assert "Customer %_! 1000" in page.text and "Second company" not in page.text
         assert "q=%25_%21&amp;offset=100" in page.text
         next_page = client.get(

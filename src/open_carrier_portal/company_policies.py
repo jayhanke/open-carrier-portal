@@ -66,6 +66,37 @@ class PolicySnapshot(BaseModel):
     policies: list[CompanyPolicy] = Field(max_length=POLICY_LIMIT)
 
 
+class CircuitAccessRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: UUID
+    company_id: UUID
+    name: str = Field(min_length=1, max_length=120)
+
+
+class PortalCompanyTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    company_id: UUID
+    name: str = Field(min_length=1, max_length=120)
+    policy_id: UUID | None = None
+    revision: int = Field(default=0, ge=0, strict=True)
+    visibility: Literal["endpoints", "full_shared_path"] = "endpoints"
+
+    @model_validator(mode="after")
+    def require_policy_revision(self) -> Self:
+        if (self.policy_id is None) != (self.revision == 0):
+            raise ValueError("existing company links require a policy and revision")
+        return self
+
+
+class PortalCompanyProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    policy_id: UUID
+    policies: list[CompanyPolicy] = Field(max_length=POLICY_LIMIT)
+
+
 @dataclass(frozen=True)
 class LocalCompanyPolicy:
     policy: CompanyPolicy

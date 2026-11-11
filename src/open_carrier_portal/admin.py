@@ -14,6 +14,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
+from threading import RLock
 from urllib.parse import quote, urlencode, urlsplit
 
 import httpx
@@ -25,8 +26,8 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from open_carrier_portal.admin_store import ADMIN_SESSION_IDLE_SECONDS, AdminStore
-from open_carrier_portal.company_access import approve_company_policy
-from open_carrier_portal.company_policies import POLICY_LEASE_SECONDS
+from open_carrier_portal.company_access import approve_company_policy, validate_company_selection
+from open_carrier_portal.company_policies import POLICY_LEASE_SECONDS, PortalCompanyTarget
 from open_carrier_portal.config import Settings, is_private_network_host, validate_connector_url
 from open_carrier_portal.diagnostics import (
     configure_logging,
@@ -44,6 +45,9 @@ from open_carrier_portal.portal_agent import (
     DEFAULT_CONNECTION_FILE,
     PortalConnection,
     pair_portal,
+    portal_access_requests,
+    propose_portal_company_link,
+    resolve_portal_company,
     send_heartbeat,
     serve_live_request,
     validate_portal_url,
@@ -208,9 +212,9 @@ def create_admin_app(
     def portal_ca() -> str:
         return settings.portal_ca_bundle or store.get("portal").get("ca", "")
 
-    def heartbeat() -> None:
-        if not connection_file.exists():
-            return
+    portal_sync_lock = RLock()
+
+    def paired_portal() -> PortalConnection:
         connection = PortalConnection.load(
             connection_file, allow_insecure_http=settings.allow_insecure_http
         )
@@ -221,14 +225,21 @@ def create_admin_app(
             or identity.connector_id != connection.connector_id
         ):
             raise ValueError("portal connection does not match enabled connector identity")
-        with http_client(portal_ca()) as client:
-            send_heartbeat(
-                client,
-                connection,
-                allow_insecure_http=settings.allow_insecure_http,
-                repository=repository,
-            )
-        store.save("heartbeat", {"seen": str(time.time())})
+        return connection
+
+    def heartbeat() -> None:
+        if not connection_file.exists():
+            return
+        with portal_sync_lock:
+            connection = paired_portal()
+            with http_client(portal_ca()) as client:
+                send_heartbeat(
+                    client,
+                    connection,
+                    allow_insecure_http=settings.allow_insecure_http,
+                    repository=repository,
+                )
+            store.save("heartbeat", {"seen": str(time.time())})
 
     async def agent_loop() -> None:
         while True:
@@ -533,20 +544,63 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         )
 
     def company_directory(
-        selected_profile: str, profiles: list[dict[str, str]], csrf: str,
-        query: str = "", offset: int = 0,
+        selected_profile: str,
+        profiles: list[dict[str, str]],
+        csrf: str,
+        query: str = "",
+        offset: int = 0,
+        portal_company_id: str = "",
     ) -> str:
         name = (
             selected_profile
             or settings.source_database_profile
             or store.get("source").get("name", "")
         )
+        recipients: dict[str, str] = {}
+        request_notice = ""
+        if connection_file.exists():
+            try:
+                portal = paired_portal()
+                with http_client(portal_ca()) as client:
+                    requests = portal_access_requests(
+                        client, portal, allow_insecure_http=settings.allow_insecure_http
+                    )
+                recipients.update((str(item.company_id), item.name) for item in requests)
+                for local in repository.list_portal_policies(portal):
+                    recipients.setdefault(
+                        str(local.policy.recipient_organization_id), local.policy.recipient_name
+                    )
+                if not requests:
+                    request_notice = "<p>No pending circuit access requests.</p>"
+            except (ValueError, OSError, httpx.HTTPError) as exc:
+                log_failure("portal", "access_requests.load_failed", exc)
+                request_notice = (
+                    '<p role="alert">Could not load portal access requests. Check Carrier Portal '
+                    'pairing, update both apps, and check <a href="/admin/diagnostics">'
+                    "Diagnostics</a>. Reload this page to retry.</p>"
+                )
+        else:
+            request_notice = (
+                '<p><a href="/admin/portal">Pair Carrier Portal</a> to receive requests.</p>'
+            )
+        if portal_company_id and portal_company_id not in recipients:
+            recipients[portal_company_id] = "Selected company - verify identity below"
         content = (
-            "<h3>Companies from your database</h3>"
-            "<p>Read directly through the saved Companies mapping. The company ID is the "
-            "source ID in your database, not a partner ID from another connector. "
-            "Listing companies does not create partners or grant access.</p>"
-            '<form method="get" action="/admin/partners"><label>Database connection'
+            "<h3>Portal circuit access requests</h3>"
+            "<p>Customers find your company on portal Sharing and request circuit access. "
+            "Select the requester below, choose their matching database company, and approve. "
+            "A request does not grant access and company names are never matched automatically.</p>"
+            + request_notice
+            + '<form method="get" action="/admin/partners"><label>Portal requester / linked company'
+            '<select name="portal_company_id" class="company-control">'
+            '<option value="">Choose a requesting or linked company</option>'
+            + "".join(
+                f'<option value="{escape(company_id)}"'
+                f"{' selected' if company_id == portal_company_id else ''}>"
+                f"{escape(company_name)}</option>"
+                for company_id, company_name in recipients.items()
+            )
+            + "</select></label><label>Database connection"
             '<select name="profile" class="company-control">'
             '<option value="">Choose a database connection</option>'
             + "".join(
@@ -556,10 +610,18 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 f"{' (disabled)' if profile['enabled'] != '1' else ''}</option>"
                 for profile in profiles
             )
-            + '</select></label><label>Search company name or ID'
+            + "</select></label><label>Search company name or ID"
             '<input type="search" name="q" class="company-control" maxlength="120" '
             f'value="{escape(query)}">'
-            '</label><button type="submit">Load companies / search</button></form>'
+            '</label><button type="submit">Select requester / search database</button></form>'
+            "<details><summary>Advanced: link manually by Portal Company ID</summary>"
+            '<form method="get" action="/admin/partners"><label>Portal Company ID'
+            '<input name="portal_company_id" class="company-control" '
+            'placeholder="Recipient company UUID" required></label>'
+            f'<input type="hidden" name="profile" value="{escape(name)}">'
+            "<button type='submit'>Look up company</button></form></details>"
+            "<h3>Companies from your database</h3><p>Select by name and database ID. "
+            "Listing companies does not create partners or grant access.</p>"
         )
         if not name:
             return content + "<p>Select a database connection to load its mapped companies.</p>"
@@ -571,9 +633,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     content + "<p>Save a Companies mapping with both Company ID (source_id) and "
                     f'Company name (name) first. <a href="{mapping_url}">Open mapping</a>.</p>'
                 )
-            rows = source.fetch_explorer_page(
-                "companies", query=query, offset=offset, limit=100
-            )
+            rows = source.fetch_explorer_page("companies", query=query, offset=offset, limit=100)
             if any(
                 row[field] is None or not str(row[field]).strip()
                 for row in rows
@@ -597,15 +657,25 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         )
         pagination = '<div class="company-pages" role="navigation" aria-label="Company pages">'
         if offset:
-            previous = "/admin/partners?" + urlencode({
-                "profile": name, "q": query, "offset": max(0, offset - 100),
-            })
+            previous = "/admin/partners?" + urlencode(
+                {
+                    "profile": name,
+                    "q": query,
+                    "offset": max(0, offset - 100),
+                    "portal_company_id": portal_company_id,
+                }
+            )
             pagination += f'<a rel="prev" href="{escape(previous)}">Previous companies</a>'
         if len(rows) > 100:
             if offset < 999_900:
-                next_page = "/admin/partners?" + urlencode({
-                    "profile": name, "q": query, "offset": offset + 100,
-                })
+                next_page = "/admin/partners?" + urlencode(
+                    {
+                        "profile": name,
+                        "q": query,
+                        "offset": offset + 100,
+                        "portal_company_id": portal_company_id,
+                    }
+                )
                 pagination += f'<a rel="next" href="{escape(next_page)}">Next companies</a>'
             else:
                 pagination += "<p>Pagination limit reached; narrow the company search.</p>"
@@ -613,43 +683,46 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         if not rows:
             message = (
                 "No companies match this search."
-                if query else "No companies were returned by the saved Companies mapping."
+                if query
+                else "No companies were returned by the saved Companies mapping."
             )
             return content + f"<p>{message}</p>" + pagination
         visible_rows = rows[:100]
         picker = (
             '<div class="company-picker" role="region" aria-label="Database companies" '
             'tabindex="0">'
-            + table([
-                {
-                    "Company ID in your database": str(row["source_id"]),
-                    "Company": str(row["name"]),
-                }
-                for row in visible_rows
-            ])
+            + table(
+                [
+                    {
+                        "Company ID in your database": str(row["source_id"]),
+                        "Company": str(row["name"]),
+                    }
+                    for row in visible_rows
+                ]
+            )
             + "</div>"
         )
         approval = ""
-        proposals = []
-        if connection_file.exists():
+        target: PortalCompanyTarget | None = None
+        if portal_company_id:
             try:
-                portal = PortalConnection.load(
-                    connection_file, allow_insecure_http=settings.allow_insecure_http
-                )
-                proposals = [
-                    local
-                    for local in repository.list_portal_policies(portal)
-                    if local.policy.state in {"pending", "needs_approval"}
-                    and not local.was_approved
-                    and time.time() - local.synced_at <= POLICY_LEASE_SECONDS
-                ]
-            except (ValueError, OSError) as exc:
-                log_failure("portal", "policies.load_failed", exc)
+                portal = paired_portal()
+                with http_client(portal_ca()) as client:
+                    target = resolve_portal_company(
+                        client,
+                        portal,
+                        portal_company_id,
+                        allow_insecure_http=settings.allow_insecure_http,
+                    )
+            except (ValueError, OSError, httpx.HTTPError) as exc:
+                log_failure("portal", "company_link.lookup_failed", exc)
                 approval = (
-                    '<p role="alert">Cannot load portal approvals. Check Carrier Portal '
-                    'pairing and <a href="/admin/diagnostics">Diagnostics</a>.</p>'
+                    '<p role="alert">Could not verify the portal Company ID. Check that it '
+                    "comes from the recipient's company profile, that this connector is paired, "
+                    "and that both apps are updated. "
+                    '<a href="/admin/diagnostics">Diagnostics</a>.</p>'
                 )
-            if proposals:
+            if target is not None:
                 picker = (
                     '<div class="company-picker" role="region" '
                     'aria-label="Choose database company" tabindex="0"><table><thead><tr>'
@@ -662,49 +735,53 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                         f'id="company-option-{index}" required '
                         f'aria-label="Select {escape(str(row["name"]))}, '
                         f'ID {escape(str(row["source_id"]))}"></td>'
-                        f'<td>{escape(str(row["source_id"]))}</td>'
+                        f"<td>{escape(str(row['source_id']))}</td>"
                         f'<td><label for="company-option-{index}">'
-                        f'{escape(str(row["name"]))}</label></td></tr>'
+                        f"{escape(str(row['name']))}</label></td></tr>"
                         for index, row in enumerate(visible_rows)
                     )
                     + "</tbody></table></div>"
                 )
                 approval = form(
-                    "approve-company-policy",
+                    "link-portal-company",
                     csrf,
                     f'<input type="hidden" name="profile" value="{escape(name)}">'
-                    '<label>Portal sharing proposal'
-                    '<select name="policy" class="company-control" required>'
-                    '<option value="">Choose the portal company to share with</option>'
+                    '<input type="hidden" name="portal_company_id" '
+                    f'value="{target.company_id}">'
+                    '<input type="hidden" name="expected_policy_id" '
+                    f'value="{target.policy_id or ""}">'
+                    '<input type="hidden" name="expected_revision" '
+                    f'value="{target.revision}">'
+                    f"<p><strong>Portal company: {escape(target.name)}</strong><br>"
+                    f"<code>{target.company_id}</code></p>"
+                    '<label>Circuit access<select name="visibility" class="company-control">'
                     + "".join(
-                        f'<option value="{local.policy.policy_id}@{local.policy.revision}">'
-                        f"{escape(local.policy.recipient_name)} - revision "
-                        f"{local.policy.revision} - "
-                        + (
-                            "FULL LAYOUT"
-                            if local.policy.visibility == "full_shared_path" else "endpoints"
+                        f'<option value="{value}"'
+                        f"{' selected' if value == target.visibility else ''}>{label}</option>"
+                        for value, label in (
+                            ("endpoints", "A/Z endpoints and monitoring"),
+                            ("full_shared_path", "Full circuit layout and monitoring"),
                         )
-                        + "</option>"
-                        for local in proposals
                     )
                     + "</select></label>"
                     + "<p>Select the matching database company below. Search covers the "
                     "whole mapped directory; use the page links for more companies. "
-                    "Changing search or page clears the selection; choose the recipient "
-                    "and company before approving.</p>"
-                    + picker + pagination
+                    "Changing search or page clears the database-company selection. "
+                    "The portal Company ID remains selected.</p>"
+                    + picker
+                    + pagination
                     + '<label><input type="checkbox" name="consent" value="yes" required>'
                     "Approve this company's current and future billed circuits, endpoints "
                     "and linked monitoring status for the selected portal recipient.</label>"
                     '<label><input type="checkbox" name="layout_consent" value="yes">'
-                    "For a FULL LAYOUT proposal, also approve all intermediate ports, patches, "
+                    "For full circuit layouts, also approve all intermediate ports, patches, "
                     "pseudowires, dark-fiber descriptions and their device/rack/site context "
                     "and Observium status. "
                     "This does not grant independent inventory browsing.</label>"
                     "<p>The selected ID is validated against this database; "
                     "a company name is never "
                     "used as identity. Approval grants no independent device/port access.</p>",
-                    "Approve company link and circuit policy",
+                    "Link company and share circuits",
                 )
         return (
             content
@@ -714,16 +791,14 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 if len(rows) > 100 or offset or query
                 else f"<p>{len(rows)} mapped companies.</p>"
             )
-            + (approval if proposals else picker + pagination + approval)
+            + (approval if target is not None else picker + pagination + approval)
         )
 
     def portal_policy_content(csrf: str) -> str:
         content = (
-            "<h3>Portal company-sharing approvals</h3>"
-            "<p>Manage proposals and revocation in Carrier Portal &rarr; Permissions. "
-            "Here the data owner selects and approves the database company, or stops sharing. "
-            "Source records stay in your database. Approved partner circuit lists and "
-            "endpoint/status reads are available through the portal's live JSON APIs.</p>"
+            "<h3>Shared portal companies</h3>"
+            "<p>Company links approved here appear on the portal's Sharing page. "
+            "You can stop sharing immediately below. Source records stay in your database.</p>"
         )
         if not connection_file.exists():
             return content + '<p><a href="/admin/portal">Pair Carrier Portal</a> first.</p>'
@@ -740,8 +815,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             )
         if not policies:
             return content + (
-                "<p>No proposals received. Propose sharing on the portal, then "
-                '<a href="/admin/portal">Check connection</a> or wait for the next heartbeat.</p>'
+                "<p>No company links yet. Select a requesting company above.</p>"
             )
         for local in policies:
             policy = local.policy
@@ -757,10 +831,11 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             if local.was_approved and local.receipt is None and policy.state != "revoked":
                 state += " - stopped or mapping changed; new approval required"
             elif policy.state == "active" and local.receipt is None:
-                state = "No local approval - request a new revision in the portal"
+                state = "No local approval - relink this portal Company ID above"
             view_label = (
                 "Full circuit layout"
-                if policy.visibility == "full_shared_path" else "Endpoints only"
+                if policy.visibility == "full_shared_path"
+                else "Endpoints only"
             )
             content += (
                 f"<h4>{escape(policy.recipient_name)} - revision {policy.revision}</h4>"
@@ -781,8 +856,12 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         return content
 
     def render(
-        section: str, csrf: str, selected_profile: str = "",
-        company_query: str = "", company_offset: int = 0,
+        section: str,
+        csrf: str,
+        selected_profile: str = "",
+        company_query: str = "",
+        company_offset: int = 0,
+        portal_company_id: str = "",
     ) -> str:
         identity = repository.get_connector_identity()
         snapshot = repository.administration_snapshot()
@@ -1349,11 +1428,18 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             )
         if section == "partners":
             return (
-                portal_policy_content(csrf)
-                + company_directory(
-                    selected_profile, snapshot["profiles"], csrf, company_query, company_offset
+                company_directory(
+                    selected_profile,
+                    snapshot["profiles"],
+                    csrf,
+                    company_query,
+                    company_offset,
+                    portal_company_id,
                 )
-                + "<h3>Partner access</h3>"
+                + portal_policy_content(csrf)
+                + "<details><summary>Advanced: direct connector access "
+                "(not portal sharing)</summary>"
+                "<h3>Partner access</h3>"
                 "<p>Partners query this connector without the portal. Confirm bilateral consent "
                 "out of band. Grants with no resource IDs cover ALL resources in that scope.</p>"
                 + table(snapshot["partners"])
@@ -1402,11 +1488,16 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     field("partner", "Partner ID") + field("circuit", "Local source circuit ID"),
                     "Revoke circuit share",
                 )
+                + "</details>"
             )
         if section == "remote":
             name = selected_profile or "partner"
             remote = store.get("remote:" + name)
             return (
+                '<p>For portal company sharing, use <a href="/admin/partners">Partners</a>. '
+                "Recipients view shared circuits in the portal; no direct connection setup "
+                "is needed here.</p>"
+                "<details><summary>Advanced: direct connection to another connector</summary>"
                 "<p>Query another company's connector independently of the hosted portal. "
                 "They must issue credentials and grants first. "
                 "Credentials remain in environment variables; "
@@ -1444,6 +1535,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     + field("circuit", "Partner opaque circuit ID"),
                     "View authorized circuit details",
                 )
+                + "</details>"
             )
         if section == "account":
             return (
@@ -1563,6 +1655,111 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 "<p>Own-company inventory access updated. Stopped access is denied immediately.</p>"
                 '<p><a href="/admin/portal">Back to Carrier Portal connection</a></p>'
             )
+        elif action == "link-portal-company":
+            if text(data, "consent", required=False) != "yes":
+                raise ValueError("explicit owner approval is required")
+            visibility = text(data, "visibility")
+            if visibility not in {"endpoints", "full_shared_path"}:
+                raise ValueError("select endpoints or the full circuit layout")
+            layout_consent = text(data, "layout_consent", required=False) == "yes"
+            if visibility == "full_shared_path" and not layout_consent:
+                raise ValueError("explicit full circuit layout approval is required")
+            try:
+                recipient_id = str(uuid.UUID(text(data, "portal_company_id")))
+                expected_id = text(data, "expected_policy_id", required=False)
+                expected_id = str(uuid.UUID(expected_id)) if expected_id else None
+                expected_revision = int(text(data, "expected_revision"))
+                if expected_revision < 0 or (expected_id is None) != (expected_revision == 0):
+                    raise ValueError("invalid expected policy identity")
+            except ValueError:
+                raise ValueError(
+                    "reload the Company ID lookup; the sharing form is invalid"
+                ) from None
+            with portal_sync_lock:
+                portal = paired_portal()
+                profile_name = text(data, "profile")
+                company_id = text(data, "company")
+                validate_company_selection(
+                    repository,
+                    metadata_path=settings.database_path,
+                    profile_name=profile_name,
+                    company_id=company_id,
+                    full_layout=visibility == "full_shared_path",
+                )
+                with http_client(portal_ca()) as client:
+                    target = resolve_portal_company(
+                        client,
+                        portal,
+                        recipient_id,
+                        allow_insecure_http=settings.allow_insecure_http,
+                    )
+                    if (
+                        str(target.policy_id) if target.policy_id else None
+                    ) != expected_id or target.revision != expected_revision:
+                        raise ValueError(
+                            "sharing changed; reload the Company ID lookup before linking"
+                        )
+                    policy_id, revision = propose_portal_company_link(
+                        client,
+                        portal,
+                        repository,
+                        target,
+                        visibility,
+                        allow_insecure_http=settings.allow_insecure_http,
+                    )
+                approve_company_policy(
+                    repository,
+                    portal,
+                    metadata_path=settings.database_path,
+                    policy_id=policy_id,
+                    revision=revision,
+                    profile_name=profile_name,
+                    company_id=company_id,
+                    approved_by=username,
+                    layout_consent=layout_consent,
+                )
+                try:
+                    heartbeat()
+                except (ValueError, OSError, httpx.HTTPError) as exc:
+                    log_failure("portal", "company_link.acknowledgement_failed", exc)
+                    raise ValueError(
+                        "Local company approval was saved, but portal activation is unconfirmed. "
+                        "Check Carrier Portal connection and Diagnostics; the next heartbeat "
+                        "will retry. Do not relink unless you want to replace this approval."
+                    ) from None
+                local = next(
+                    (
+                        item
+                        for item in repository.list_portal_policies(portal)
+                        if str(item.policy.policy_id) == policy_id
+                    ),
+                    None,
+                )
+                if (
+                    local is None
+                    or local.policy.state != "active"
+                    or local.policy.revision != revision
+                    or local.receipt is None
+                    or local.receipt.state != "accepted"
+                    or local.receipt.revision != revision
+                ):
+                    raise ValueError(
+                        "Company approval was saved, but the portal has not activated it. "
+                        "Check the sharing status and Diagnostics before retrying."
+                    )
+                repository.require_portal_company_policy(
+                    portal,
+                    policy_id=policy_id,
+                    revision=revision,
+                    recipient_organization_id=recipient_id,
+                )
+            store.audit(username, f"link-portal-company:{policy_id}")
+            return (
+                f"<p>Sharing is active for <strong>{escape(target.name)}</strong>. "
+                "They can select your company under Browse Data &rarr; Shared company data "
+                "in the portal. Only circuits billed to the selected database company are "
+                "included.</p><p><a href='/admin/partners'>Back to Partners</a></p>"
+            )
         elif action in {"approve-company-policy", "stop-company-policy"}:
             portal = PortalConnection.load(
                 connection_file, allow_insecure_http=settings.allow_insecure_http
@@ -1576,7 +1773,8 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 raise ValueError("an enabled paired connector identity is required")
             if action == "stop-company-policy":
                 policy_id = text(data, "policy")
-                repository.stop_portal_policy(portal, policy_id=policy_id)
+                with portal_sync_lock:
+                    repository.stop_portal_policy(portal, policy_id=policy_id)
             else:
                 if text(data, "consent", required=False) != "yes":
                     raise ValueError("explicit owner approval is required")
@@ -2227,7 +2425,27 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         request.state.admin_activity = request.cookies["ocp_admin"]
         company_query = ""
         company_offset = 0
+        portal_company_id = ""
         if section == "partners":
+            portal_company_id = request.query_params.get("portal_company_id", "").strip()
+            try:
+                if portal_company_id:
+                    portal_company_id = str(uuid.UUID(portal_company_id))
+            except ValueError:
+                log_event(
+                    "admin",
+                    "company_link.invalid_id",
+                    "Invalid portal Company ID; no lookup or directory query was made.",
+                    level=logging.WARNING,
+                )
+                return page(
+                    "Partners",
+                    '<p role="alert">Invalid portal Company ID. Copy the full Company ID '
+                    "from the recipient's portal company profile or Sharing page.</p>",
+                    session["csrf"],
+                    status=400,
+                    username=session["username"],
+                )
             company_query = request.query_params.get("q", "")
             try:
                 company_offset = int(request.query_params.get("offset", "0"))
@@ -2235,24 +2453,32 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     raise ValueError("company search bounds are invalid")
             except ValueError:
                 log_event(
-                    "admin", "companies.invalid_search",
+                    "admin",
+                    "companies.invalid_search",
                     "Company search bounds are invalid; no directory query was made.",
                     level=logging.WARNING,
                 )
                 return page(
                     "Partners",
                     '<p role="alert">Invalid company search. Use at most 120 search characters '
-                    'and a page offset between 0 and 999900.</p>'
+                    "and a page offset between 0 and 999900.</p>"
                     '<p><a href="/admin/partners">Back to Partners</a></p>',
-                    session["csrf"], status=400, username=session["username"],
+                    session["csrf"],
+                    status=400,
+                    username=session["username"],
                 )
         return page(
             "Connect to Carrier Portal"
             if section == "portal"
             else SECTION_LABELS.get(section, section.title()),
             await run_in_threadpool(
-                render, section, session["csrf"], request.query_params.get("profile", ""),
-                company_query, company_offset,
+                render,
+                section,
+                session["csrf"],
+                request.query_params.get("profile", ""),
+                company_query,
+                company_offset,
+                portal_company_id,
             ),
             session["csrf"],
             username=session["username"],

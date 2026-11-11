@@ -6,8 +6,37 @@ from open_carrier_portal.circuits import CircuitReader
 from open_carrier_portal.company_policies import source_fingerprint
 from open_carrier_portal.errors import AuthorizationError
 from open_carrier_portal.portal_agent import PortalConnection
-from open_carrier_portal.repository import Repository
+from open_carrier_portal.repository import Repository, SourceDatabaseProfile
 from open_carrier_portal.source_database import configured_profile_database
+
+
+def validate_company_selection(
+    repository: Repository,
+    *,
+    metadata_path: Path,
+    profile_name: str,
+    company_id: str,
+    full_layout: bool = False,
+) -> tuple[SourceDatabaseProfile, str]:
+    profile = repository.get_source_database_profile(profile_name)
+    if profile is None or not profile.enabled:
+        raise ValueError("enabled database profile was not found")
+    source = configured_profile_database(profile, metadata_path)
+    if full_layout:
+        CircuitReader(repository, source, None, allow_unresolved_path_items=True).require_view(
+            "full_shared_path"
+        )
+    if source.missing_fields_for(
+        requirements={
+            "companies": ("source_id", "name"),
+            "circuits": ("source_id", "billing_company_id"),
+        }
+    ):
+        raise ValueError("map Companies ID/name and Circuits ID/billing company before approval")
+    companies = source.fetch_matching("companies", filters={"source_id": company_id}, limit=1)
+    if len(companies) != 1 or not str(companies[0].get("name") or "").strip():
+        raise ValueError("selected company must resolve to one named company in this database")
+    return profile, str(companies[0]["source_id"])
 
 
 def approve_company_policy(
@@ -22,10 +51,6 @@ def approve_company_policy(
     approved_by: str,
     layout_consent: bool = False,
 ) -> None:
-    profile = repository.get_source_database_profile(profile_name)
-    if profile is None or not profile.enabled:
-        raise ValueError("enabled database profile was not found")
-    source = configured_profile_database(profile, metadata_path)
     local = next(
         (
             item
@@ -36,28 +61,21 @@ def approve_company_policy(
     )
     if local is None:
         raise ValueError("refresh the connector and select a current policy revision")
-    if local.policy.visibility == "full_shared_path":
-        if not layout_consent:
-            raise ValueError("explicit full layout approval is required")
-        CircuitReader(
-            repository, source, None, allow_unresolved_path_items=True
-        ).require_view("full_shared_path")
-    if source.missing_fields_for(
-        requirements={
-            "companies": ("source_id", "name"),
-            "circuits": ("source_id", "billing_company_id"),
-        }
-    ):
-        raise ValueError("map Companies ID/name and Circuits ID/billing company before approval")
-    companies = source.fetch_matching("companies", filters={"source_id": company_id}, limit=1)
-    if len(companies) != 1 or not str(companies[0].get("name") or "").strip():
-        raise ValueError("selected company must resolve to one named company in this database")
+    if local.policy.visibility == "full_shared_path" and not layout_consent:
+        raise ValueError("explicit full layout approval is required")
+    profile, selected_id = validate_company_selection(
+        repository,
+        metadata_path=metadata_path,
+        profile_name=profile_name,
+        company_id=company_id,
+        full_layout=local.policy.visibility == "full_shared_path",
+    )
     repository.approve_portal_policy(
         portal,
         policy_id=policy_id,
         revision=revision,
         profile_name=profile_name,
-        company_id=str(companies[0]["source_id"]),
+        company_id=selected_id,
         fingerprint=source_fingerprint(profile),
         approved_by=approved_by,
         layout_consent=layout_consent,

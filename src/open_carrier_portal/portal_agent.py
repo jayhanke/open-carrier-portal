@@ -15,7 +15,12 @@ from uuid import UUID
 import httpx
 from pydantic import TypeAdapter
 
-from open_carrier_portal.company_policies import PolicySnapshot
+from open_carrier_portal.company_policies import (
+    CircuitAccessRequest,
+    PolicySnapshot,
+    PortalCompanyProposal,
+    PortalCompanyTarget,
+)
 from open_carrier_portal.config import validate_portal_url
 from open_carrier_portal.diagnostics import log_event, log_failure, target_origin
 from open_carrier_portal.live_contract import MAX_RESULT_BYTES, LiveJob, LiveResult
@@ -189,6 +194,130 @@ def send_heartbeat(
             )
             raise ValueError("portal returned an invalid company policy snapshot") from None
     log_event("portal", "heartbeat.accepted", "Portal heartbeat accepted.")
+
+
+def portal_access_requests(
+    client: httpx.Client, connection: PortalConnection, *, allow_insecure_http: bool = False
+) -> list[CircuitAccessRequest]:
+    portal_url = validate_portal_url(connection.portal_url, allow_insecure_http=allow_insecure_http)
+    response = client.get(
+        f"{portal_url}/api/connectors/access-requests",
+        params={"connector_id": connection.connector_id},
+        headers={"Authorization": f"Bearer {connection.token}"},
+        follow_redirects=False,
+    )
+    response.raise_for_status()
+    try:
+        data = response.json()
+        if not isinstance(data, dict) or set(data) != {"requests"}:
+            raise ValueError("invalid request envelope")
+        requests = TypeAdapter(list[CircuitAccessRequest]).validate_python(data["requests"])
+        if len(requests) > 100 or len({item.company_id for item in requests}) != len(requests):
+            raise ValueError("unbounded or duplicate request list")
+        if len({item.request_id for item in requests}) != len(requests) or any(
+            str(item.company_id) == connection.organization_id for item in requests
+        ):
+            raise ValueError("invalid requester identity")
+    except ValueError:
+        log_event(
+            "portal",
+            "access_requests.invalid_response",
+            "Portal returned invalid circuit access request metadata; contents were not logged.",
+            level=logging.ERROR,
+        )
+        raise ValueError("invalid portal access requests; update both apps") from None
+    return requests
+
+
+def resolve_portal_company(
+    client: httpx.Client,
+    connection: PortalConnection,
+    company_id: str,
+    *,
+    allow_insecure_http: bool = False,
+) -> PortalCompanyTarget:
+    recipient = UUID(company_id)
+    portal_url = validate_portal_url(connection.portal_url, allow_insecure_http=allow_insecure_http)
+    log_event("portal", "company_link.lookup_started", "Looking up a portal Company ID.")
+    response = client.get(
+        f"{portal_url}/api/connectors/companies/{recipient}",
+        follow_redirects=False,
+        params={"connector_id": connection.connector_id},
+        headers={"Authorization": f"Bearer {connection.token}"},
+    )
+    response.raise_for_status()
+    try:
+        target = PortalCompanyTarget.model_validate(response.json())
+        if target.company_id != recipient:
+            raise ValueError("different recipient")
+    except ValueError:
+        log_event(
+            "portal",
+            "company_link.invalid_target",
+            "Portal company lookup returned invalid identity metadata; contents were not logged.",
+            level=logging.ERROR,
+        )
+        raise ValueError("portal returned invalid company metadata; update both apps") from None
+    log_event("portal", "company_link.lookup_completed", "Portal Company ID was verified.")
+    return target
+
+
+def propose_portal_company_link(
+    client: httpx.Client,
+    connection: PortalConnection,
+    repository: Repository,
+    target: PortalCompanyTarget,
+    visibility: str,
+    *,
+    allow_insecure_http: bool = False,
+) -> tuple[str, int]:
+    if visibility not in {"endpoints", "full_shared_path"}:
+        raise ValueError("select endpoints or the full circuit layout")
+    portal_url = validate_portal_url(connection.portal_url, allow_insecure_http=allow_insecure_http)
+    log_event("portal", "company_link.started", "Creating an explicitly approved company link.")
+    response = client.post(
+        f"{portal_url}/api/connectors/company-links",
+        follow_redirects=False,
+        headers={"Authorization": f"Bearer {connection.token}"},
+        json={
+            "connector_id": connection.connector_id,
+            "recipient_company_id": str(target.company_id),
+            "expected_policy_id": str(target.policy_id) if target.policy_id else None,
+            "expected_revision": target.revision,
+            "visibility": visibility,
+        },
+    )
+    response.raise_for_status()
+    try:
+        proposal = PortalCompanyProposal.model_validate(response.json())
+        selected = [
+            policy for policy in proposal.policies if policy.policy_id == proposal.policy_id
+        ]
+        if len(selected) != 1:
+            raise ValueError("missing or ambiguous proposal")
+        policy = selected[0]
+        if (
+            str(policy.owner_organization_id) != connection.organization_id
+            or str(policy.connector_id) != connection.connector_id
+            or policy.recipient_organization_id != target.company_id
+            or policy.visibility != visibility
+            or policy.state != "pending"
+            or policy.revision != target.revision + 1
+            or (target.policy_id is not None and policy.policy_id != target.policy_id)
+        ):
+            raise ValueError("proposal identity differs")
+    except ValueError:
+        log_event(
+            "portal",
+            "company_link.invalid_proposal",
+            "Portal company link returned invalid policy metadata; contents were not logged.",
+            level=logging.ERROR,
+        )
+        raise ValueError("portal returned an invalid company-link proposal") from None
+    repository.synchronize_portal_policies(
+        connection, PolicySnapshot(version=1, policies=proposal.policies)
+    )
+    return str(policy.policy_id), policy.revision
 
 
 def serve_live_request(

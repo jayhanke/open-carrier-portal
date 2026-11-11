@@ -247,11 +247,24 @@ Partner API authorization remains unchanged.
 
 #### Owner-approved company policies
 
-Update the portal and connector together. In the portal, establish an active
-relationship, then open **Permissions** and propose sharing with that partner.
-On the paired connector's **Partners** page, load the appropriate mapped database,
-select the proposal, search the directory by company name or ID, select the matching
-company row and explicitly approve. There is no manual company-ID entry.
+Update and restart the portal and connector together. The recipient's company admin
+opens portal **Sharing**, searches companies already on the portal, and selects
+**Request circuit access** beside the data owner. Active operator-provisioned
+companies count as verified for now; no new signup/verification step is added.
+On the data owner's paired connector **Partners** page, select the requesting
+company by name and choose a database. No ID copying is needed.
+The connector verifies the recipient's portal company name and ID. Search the
+mapped directory by company name or database ID, select the matching row, choose
+endpoints or full circuit layout, and explicitly approve. The database ID is selected
+from the directory, never guessed or matched by name. No bilateral relationship
+approval or portal-side sharing proposal is needed, and the recipient needs no connector.
+The Portal Company ID is a public identifier, not an access credential.
+It remains available under the profile and a collapsed **Advanced: link manually
+by Portal Company ID** connector form for manual links. Pending access requests
+are authenticated to the targeted provider, grant nothing, and remain pending
+until an exact accepted receipt activates sharing. Providers can decline requests
+on portal Sharing. Reload Partners to refresh requests; failures are visible and
+logged without hiding the local company directory or pretending the list is empty.
 Company names are display-only, never an identity match.
 
 The connector verifies the company through `companies.source_id`/`companies.name`
@@ -273,12 +286,23 @@ must remain Unavailable/Not linked, never healthy.
 Changing the mapped database identity or mapping invalidates approval immediately,
 even before a restart. **Stop sharing immediately** also invalidates it locally.
 The next heartbeat reports Needs approval and advances the portal revision.
-Re-proposing, relationship revocation, or connector replacement cannot reuse an old
+Relinking or connector replacement cannot reuse an old
 acknowledgement. A changed pairing credential also cannot reuse local approval.
 Authorization requires an enabled connector/source and a policy snapshot received
 within 90 seconds; offline or stale policy metadata is denied.
+New direct shares are owner-authorized and do not depend on bilateral relationships;
+existing relationship-backed policies retain their relationship guard until explicitly
+relinked. Relinking increments the revision and requires fresh local approval.
+Lookup/form revision checks reject stale forms. Link creation, local approval, and
+heartbeat acknowledgement are serialized with normal heartbeats. An acknowledgement
+failure reports that activation is unconfirmed, rather than claiming success; later
+heartbeats retry the saved receipt. Run only one agent per pairing file.
 
-V1 has one company/source-profile link per partner relationship direction and a
+In the portal, **Browse Data** separates **My data** from **Shared company data**.
+Recipients select the authorized sharing company to browse its company-billed circuits.
+The **Sharing** page shows incoming/outgoing status and owner-admin stop controls.
+
+V1 has one direct company/source-profile link per owner/recipient pair and a
 bounded snapshot of at most 100 policy records per owner, including revoked records.
 The portal rejects additional policies rather than silently dropping metadata.
 Company/circuit/monitoring records are not persisted by this workflow; only policy,
@@ -322,9 +346,10 @@ Administration is grouped under **Setup**.
 Full circuit layouts require separate, explicit connector-local consent. Under
 **Carrier Portal → My company inventory**, enable **full circuit layouts** for your
 own company. Existing circuit-only and hierarchy grants do not expand automatically.
-For partner clients, propose **Full circuit layout and port monitoring** in portal
-**Setup → Permissions**, then approve the new revision under connector **Partners**
-with the **FULL LAYOUT** checkbox. The company-billing filter and final live authorization
+For partner clients, select their requesting company under connector **Partners**,
+select **Full circuit layout and monitoring**, choose their mapped database company
+and approve with the separate full-layout checkbox. Relinking requires a fresh revision.
+The company-billing filter and final live authorization
 still apply; this exposes infrastructure within the circuit, not independent browsing.
 The ordered layout projects mapped ports, patches, pseudowires, dark-fiber segments and secondary patch ports
 (up to 200 nodes), with device/rack/site context and live Observium port status.
@@ -399,8 +424,9 @@ broker. Run one Uvicorn worker (no `WEB_CONCURRENCY>1`) and keep machine clocks
 synchronized. Portal restart/disconnection makes in-flight requests fail; no old
 record cache is substituted.
 
-Recipients can use **Browse Data → Shared with my company**, or **Permissions →
-Browse circuits**; the JSON links/APIs remain available.
+Recipients use **Browse Data → Shared company data**, or **Sharing → Browse circuits**.
+The existing recipient JSON APIs remain available independently of the retired
+Permissions page.
 Partner reads support only `circuits.list` and `circuits.read`, scoped to the exact
 owner, recipient, connector, approved policy revision and source fingerprint.
 Listings use parameterized billing-company filters, stable source-ID ordering,
@@ -653,22 +679,28 @@ session hashes, partner grants, configuration and audit events.
   database. Validation checks schema and join keys, not complete source-data
   referential integrity or read-only permissions. Restart the connector after
   saving to apply mappings to the running API.
-- **Partners:** the **Companies from your database** directory reads company names
+- **Partners:** select a company that requested circuit access from portal Sharing,
+  verify the resolved company, and link it to a mapped company row. Previously linked
+  companies are also selectable for deliberate reapproval. Manual Company ID entry
+  is collapsed under Advanced. The
+  **Companies from your database** directory reads company names
   and local source IDs through the saved `companies.source_id` and `companies.name`
   mapping. It defaults to the selected source connection, or lets you choose a
   connection explicitly. The searchable, scrollable directory shows up to 100 companies
   per page, with previous/next links to reach later records. Search matches company
   names or source IDs across the whole mapped directory, not just the current page.
-  For a pending portal proposal, select its recipient and the matching company row;
+  After a verified portal lookup, select the matching database company row;
   the form submits the exact source ID without copying or typing it. Searching or
-  paging clears the recipient/company selection, so choose both before approving.
+  paging clears the database-company selection but retains the selected portal company.
   Listing or selecting companies does not persist company records, create partners,
   or grant access. Missing mappings and database failures are shown explicitly,
   with failures recorded in Diagnostics without company records.
-  **Portal company-sharing approvals** lists the exact received revisions. Propose
-  sharing in the portal; select and approve a mapped local company here, or stop
-  an existing approval immediately. The next heartbeat reports the decision.
-  Provision direct inbound partners after confirming bilateral
+  **Shared portal companies** lists received revisions and local approval status.
+  Link/approve here or stop an existing approval immediately. Successful linking
+  confirms active portal acknowledgement; connection errors explicitly report
+  unconfirmed activation and appear in Diagnostics.
+  Direct inbound OAuth controls are collapsed under **Advanced** and are not needed
+  for portal company sharing. Provision direct inbound partners after confirming bilateral
   approval out of band. Select scopes and specific opaque resource IDs, or
   explicitly opt in to all resources for those scopes. Client secrets appear
   **once**, only in the successful creation response. Copy them privately;
@@ -676,7 +708,9 @@ session hashes, partner grants, configuration and audit events.
   Circuit shares additionally require a matching `circuits:read` grant. Revoking
   a partner disables its relationship, OAuth clients and circuit shares; already
   issued tokens then fail the API's existing live authorization checks.
-- **Partner connections:** configure named outbound connections to other companies' connectors,
+- **Partner connections:** portal recipients need no direct connection setup;
+  a short explanation links to Partners. Collapsed **Advanced** controls configure
+  named outbound connections to other companies' connectors,
   using OAuth credentials they issue to you. Each secret stays in a named local
   environment variable. Test token acquisition and capabilities, or retrieve an
   explicitly authorized opaque circuit path. The connector's capabilities endpoint

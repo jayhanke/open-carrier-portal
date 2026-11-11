@@ -11,9 +11,187 @@ import pytest
 from open_carrier_portal.portal_agent import (
     PortalConnection,
     pair_portal,
+    portal_access_requests,
+    propose_portal_company_link,
+    resolve_portal_company,
     run_agent,
     validate_portal_url,
 )
+
+
+@pytest.mark.parametrize(
+    "invalid", [None, "envelope", "extra", "duplicate", "self", "too_many", "redirect"]
+)
+def test_access_requests_are_bounded_authenticated_and_sanitized(
+    company_link_protocol, invalid, caplog
+):
+    portal, _, target, _ = company_link_protocol
+    item = {"request_id": str(uuid4()), "company_id": str(target.company_id), "name": target.name}
+    payload = {"requests": [item]}
+    if invalid == "envelope":
+        payload["secret"] = "PRIVATE_RESPONSE"
+    elif invalid == "extra":
+        item["secret"] = "PRIVATE_RESPONSE"
+    elif invalid == "duplicate":
+        payload["requests"] *= 2
+    elif invalid == "self":
+        item["company_id"] = portal.organization_id
+    elif invalid == "too_many":
+        payload["requests"] = [
+            item | {"request_id": str(uuid4()), "company_id": str(uuid4())} for _ in range(101)
+        ]
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        assert request.url.params["connector_id"] == portal.connector_id
+        assert request.headers["authorization"] == f"Bearer {portal.token}"
+        if invalid == "redirect":
+            return httpx.Response(302, headers={"Location": "https://other.example"})
+        return httpx.Response(200, json=payload)
+
+    with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
+        if invalid is None:
+            requests = portal_access_requests(client, portal)
+            assert str(requests[0].company_id) == str(target.company_id)
+        else:
+            with pytest.raises((ValueError, httpx.HTTPStatusError)):
+                portal_access_requests(client, portal)
+    assert len(calls) == 1
+    assert portal.token not in caplog.text and "PRIVATE_RESPONSE" not in caplog.text
+
+
+@pytest.fixture
+def company_link_protocol(tmp_path):
+    from open_carrier_portal.company_policies import CompanyPolicy, PortalCompanyTarget
+    from open_carrier_portal.repository import Repository
+
+    portal = PortalConnection("https://portal.example", str(uuid4()), str(uuid4()), "t" * 64)
+    repo = Repository(tmp_path / "metadata.db", "s" * 48)
+    repo.initialize()
+    target = PortalCompanyTarget(
+        company_id=uuid4(),
+        name="Recipient",
+        policy_id=uuid4(),
+        revision=1,
+    )
+    policy = CompanyPolicy(
+        policy_id=target.policy_id,
+        revision=2,
+        owner_organization_id=portal.organization_id,
+        recipient_organization_id=target.company_id,
+        recipient_name=target.name,
+        connector_id=portal.connector_id,
+        state="pending",
+    )
+    return portal, repo, target, policy
+
+
+@pytest.mark.parametrize("invalid", [None, "recipient", "extra", "revision", "redirect"])
+def test_portal_company_lookup_is_authenticated_exact_and_sanitized(
+    company_link_protocol, invalid, caplog
+):
+    portal, _, target, _ = company_link_protocol
+    payload = target.model_dump(mode="json")
+    if invalid == "recipient":
+        payload["company_id"] = str(uuid4())
+    elif invalid == "extra":
+        payload["private"] = "PRIVATE_RESPONSE_SECRET"
+    elif invalid == "revision":
+        payload["revision"] = True
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        assert request.url.path == f"/api/connectors/companies/{target.company_id}"
+        assert request.url.params["connector_id"] == portal.connector_id
+        assert request.headers["authorization"] == f"Bearer {portal.token}"
+        if invalid == "redirect":
+            return httpx.Response(302, headers={"Location": "https://redirect.example"})
+        return httpx.Response(200, json=payload)
+
+    with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
+        if invalid is None:
+            assert resolve_portal_company(client, portal, str(target.company_id)) == target
+        else:
+            with pytest.raises((ValueError, httpx.HTTPStatusError)):
+                resolve_portal_company(client, portal, str(target.company_id))
+    assert len(calls) == 1
+    assert "PRIVATE_RESPONSE_SECRET" not in caplog.text and portal.token not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        "owner",
+        "connector",
+        "recipient",
+        "policy_id",
+        "revision",
+        "state",
+        "visibility",
+        "duplicate",
+        "other_owner",
+        "redirect",
+    ],
+)
+def test_portal_company_proposal_validates_entire_authoritative_snapshot(
+    company_link_protocol, invalid, caplog
+):
+    portal, repo, target, policy = company_link_protocol
+    payload = policy.model_dump(mode="json")
+    if invalid in {"owner", "connector", "recipient", "policy_id"}:
+        key = {
+            "owner": "owner_organization_id",
+            "connector": "connector_id",
+            "recipient": "recipient_organization_id",
+            "policy_id": "policy_id",
+        }[invalid]
+        payload[key] = str(uuid4())
+    elif invalid == "revision":
+        payload["revision"] = 3
+    elif invalid == "state":
+        payload["state"] = "active"
+    elif invalid == "visibility":
+        payload["visibility"] = "full_shared_path"
+    policies = [payload]
+    if invalid == "duplicate":
+        policies.append(dict(payload))
+    if invalid == "other_owner":
+        policies.append(
+            payload | {"policy_id": str(uuid4()), "owner_organization_id": str(uuid4())}
+        )
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        assert request.url.path == "/api/connectors/company-links"
+        assert request.headers["authorization"] == f"Bearer {portal.token}"
+        assert json.loads(request.content) == {
+            "connector_id": portal.connector_id,
+            "recipient_company_id": str(target.company_id),
+            "expected_policy_id": str(target.policy_id),
+            "expected_revision": 1,
+            "visibility": "endpoints",
+        }
+        if invalid == "redirect":
+            return httpx.Response(307, headers={"Location": "https://redirect.example"})
+        return httpx.Response(200, json={"policy_id": payload["policy_id"], "policies": policies})
+
+    with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
+        if invalid is None:
+            assert propose_portal_company_link(client, portal, repo, target, "endpoints") == (
+                str(policy.policy_id),
+                2,
+            )
+            assert repo.list_portal_policies(portal)[0].policy.state == "pending"
+            assert repo.portal_policy_receipts(portal) == []
+        else:
+            with pytest.raises((ValueError, httpx.HTTPStatusError)):
+                propose_portal_company_link(client, portal, repo, target, "endpoints")
+            assert repo.list_portal_policies(portal) == []
+    assert len(calls) == 1 and portal.token not in caplog.text
 
 
 @pytest.mark.parametrize(
