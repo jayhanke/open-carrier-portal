@@ -221,6 +221,8 @@ class LiveQuery(WireModel):
     expires_at: float
     operation: Literal["circuits.list", "circuits.read"]
     circuit_id: str | None = Field(default=None, pattern=r"^circuit_[a-f0-9]{24}$")
+    query: str = Field(default="", max_length=120)
+    order: Literal["source", "name_asc", "name_desc"] = "source"
     offset: int = Field(default=0, ge=0, le=999_900, strict=True)
     limit: int = Field(default=50, ge=1, le=100, strict=True)
 

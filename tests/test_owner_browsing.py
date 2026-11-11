@@ -79,6 +79,20 @@ def test_full_inventory_is_explicit_and_never_relaxes_partner_filter(live_source
     assert b"Example circuit" not in live_source[0].database_path.read_bytes()
 
 
+def test_circuit_only_owner_grant_allows_scoped_search_not_hierarchy(live_source):
+    source = enable(live_source)
+    assert not source.explorer_enabled
+    request = owner_job(live_source, source, query="927", order="name_desc")
+    result = execute(live_source, request)
+    assert result.error is None
+    assert [item.name for item in result.page.items] == ["Unshared circuit"]
+    partner = execute(live_source, job(live_source, query="927", order="name_desc"))
+    assert partner.error is None and partner.page.items == []
+    live_source[1].stop_portal_owner_source(
+        live_source[2], source_profile_id=str(source.source_profile_id)
+    )
+    assert execute(live_source, request).error == "access_denied"
+
 def test_owner_and_partner_resource_namespaces_cannot_be_interchanged(live_source):
     source = enable(live_source)
     own = owner_job(live_source, source)

@@ -290,7 +290,17 @@ async def _read(
         else "endpoints"
     )
     if job.operation == "circuits.list":
-        if approved is not None:
+        if job.query.strip() or job.order != "source":
+            rows = await run_in_threadpool(
+                source.fetch_explorer_page,
+                "circuits",
+                filters={"billing_company_id": approved.source_company_id} if approved else None,
+                query=job.query,
+                order=job.order,
+                offset=job.offset,
+                limit=job.limit,
+            )
+        elif approved is not None:
             rows = await run_in_threadpool(
                 source.fetch_page,
                 "circuits",

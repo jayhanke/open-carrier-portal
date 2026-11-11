@@ -789,6 +789,7 @@ class SourceDatabase:
         related_port_id: object | None = None,
         offset: int = 0,
         limit: int = 50,
+        order: str = "source",
     ) -> list[dict[str, Any]]:
         if resource_type not in {"locations", "racks", "devices", "ports", "companies", "circuits"}:
             raise ConfigurationError("unsupported explorer resource")
@@ -796,6 +797,8 @@ class SourceDatabase:
             raise ConfigurationError("explorer query bounds are invalid")
         if related_port_id is not None and resource_type != "circuits":
             raise ConfigurationError("port membership applies only to circuits")
+        if order not in {"source", "name_asc", "name_desc"}:
+            raise ConfigurationError("unsupported inventory sort order")
 
         def mapped(resource: str) -> str:
             if resource not in self._mapping.resources:
@@ -819,7 +822,7 @@ class SourceDatabase:
                 ("address1", "city", "state", "postal_code")
                 if resource_type == "locations"
                 else ("name", "source_id")
-                if resource_type == "companies"
+                if resource_type in {"companies", "circuits"}
                 else ("name",)
             )
             fields = tuple(field for field in fields if field in columns)
@@ -863,8 +866,14 @@ class SourceDatabase:
                 parameters.append(related_port_id)
             conditions.append(f"{quote('circuit_layout_id')} IN ({membership})")
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        ordering = quote("source_id")
+        if order != "source":
+            if "name" not in columns:
+                raise ConfigurationError("map circuit names before sorting by name")
+            direction = "DESC" if order == "name_desc" else "ASC"
+            ordering = f"LOWER(COALESCE({quote('name')}, '')) {direction}, {quote('source_id')}"
         sql = (
-            f"SELECT * FROM ({base}) AS inventory{where} ORDER BY {quote('source_id')} "
+            f"SELECT * FROM ({base}) AS inventory{where} ORDER BY {ordering} "
             f"LIMIT {placeholder} OFFSET {placeholder}"
         )
         try:

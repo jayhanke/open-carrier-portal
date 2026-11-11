@@ -34,6 +34,52 @@ def test_source_database_reads_only_explicit_mapped_columns(tmp_path: Path) -> N
     assert source.fetch("circuits") == [{"source_id": 7, "name": "Circuit A"}]
 
 
+@pytest.mark.parametrize("query,expected", [
+    ("%", [1]), ("_", [1]), ("!", [1]), ("' OR 1=1 --", []), ("2", [2]),
+])
+def test_circuit_search_is_literal_and_keeps_scope(tmp_path, query, expected):
+    database = tmp_path / "source.db"
+    with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE circuits (id INTEGER, name TEXT, company INTEGER)")
+        db.executemany("INSERT INTO circuits VALUES (?, ?, ?)", [
+            (1, "100%_! fiber", 7), (2, "Ordinary circuit", 7),
+            (3, "Private 100%_! fiber", 8),
+        ])
+    source = SourceDatabase(
+        SQLiteSourceDatabaseSettings(database),
+        SourceMapping({"circuits": ResourceMapping(
+            "circuits", {"source_id": "id", "name": "name", "billing_company_id": "company"}
+        )}),
+    )
+    rows = source.fetch_explorer_page(
+        "circuits", filters={"billing_company_id": 7}, query=query,
+        order="name_asc", offset=0, limit=100,
+    )
+    assert [row["source_id"] for row in rows] == expected
+
+
+def test_circuit_sort_is_stable_and_precedes_pagination(tmp_path):
+    database = tmp_path / "source.db"
+    with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE circuits (id INTEGER, name TEXT)")
+        db.executemany("INSERT INTO circuits VALUES (?, ?)", [
+            (1, "zebra"), (2, "Alpha"), (3, "alpha"),
+        ])
+    source = SourceDatabase(
+        SQLiteSourceDatabaseSettings(database),
+        SourceMapping({"circuits": ResourceMapping(
+            "circuits", {"source_id": "id", "name": "name"}
+        )}),
+    )
+    first = source.fetch_explorer_page("circuits", order="name_asc", limit=1)
+    second = source.fetch_explorer_page("circuits", order="name_asc", offset=1, limit=1)
+    assert [row["source_id"] for row in first] == [2, 3]
+    assert [row["source_id"] for row in second] == [3, 1]
+    descending = source.fetch_explorer_page("circuits", order="name_desc", limit=100)
+    assert [row["source_id"] for row in descending] == [1, 2, 3]
+    with pytest.raises(ConfigurationError, match="unsupported inventory sort"):
+        source.fetch_explorer_page("circuits", order="name; DROP TABLE circuits")
+
 def test_source_database_rejects_invalid_mapping_identifier(tmp_path: Path) -> None:
     with pytest.raises(ConfigurationError):
         SourceDatabase(
@@ -225,6 +271,33 @@ def test_remote_mysql_source_requires_tls_or_explicit_insecure_opt_in() -> None:
     )
     assert settings.allow_insecure is True
 
+
+def test_mysql_circuit_search_binds_scope_and_escaped_query(monkeypatch):
+    cursor = _FakeCursor()
+    connection = _FakeConnection(cursor)
+    monkeypatch.setattr(
+        "open_carrier_portal.source_database.pymysql.connect", lambda **kwargs: connection
+    )
+    source = SourceDatabase(
+        MySQLSourceDatabaseSettings(
+            host="localhost", port=3306, database="inventory",
+            username="reader", password="test-only", allow_insecure=True,
+        ),
+        SourceMapping({"circuits": ResourceMapping("LitCircuit", {
+            "source_id": "LitCircuitID", "name": "LitCircuitName",
+            "billing_company_id": "BillingCompanyID",
+        })}),
+    )
+    source.fetch_explorer_page(
+        "circuits", filters={"billing_company_id": "7"},
+        query="50%_!", order="name_desc", offset=4, limit=2,
+    )
+    sql, parameters = cursor.executions[-1]
+    assert "`billing_company_id` = %s" in sql
+    assert "LOWER(COALESCE(`name`, '')) DESC, `source_id`" in sql
+    assert "50%" not in sql
+    assert parameters == ("7", "%50!%!_!!%", "%50!%!_!!%", 3, 4)
+    assert connection.closed
 
 def test_insecure_remote_mysql_explicitly_disables_tls(
     monkeypatch: pytest.MonkeyPatch,

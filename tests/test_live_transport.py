@@ -108,6 +108,38 @@ def execute(fixture, request, monitoring=None):
     )
 
 
+@pytest.mark.parametrize("order,expected", [
+    ("name_asc", ["Alpha circuit", "Zebra circuit"]),
+    ("name_desc", ["Zebra circuit", "Alpha circuit"]),
+])
+def test_live_search_sorts_before_pagination_and_keeps_company_scope(
+    live_source, order, expected
+):
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute("UPDATE LitCircuit SET LitCircuitName='Zebra circuit' WHERE LitCircuitID=926")
+        db.execute(
+            "INSERT INTO LitCircuit (LitCircuitID, LitCircuitName, BillingCompanyID) "
+            "VALUES (999, 'Alpha circuit', 7)"
+        )
+        db.execute(
+            "UPDATE LitCircuit SET LitCircuitName='AAA secret circuit' WHERE LitCircuitID=927"
+        )
+    first = execute(live_source, job(live_source, query="circuit", order=order, limit=1))
+    assert first.error is None
+    assert [item.name for item in first.page.items] == expected[:1]
+    assert first.page.next_offset == 1
+    second = execute(
+        live_source, job(live_source, query="circuit", order=order, limit=1, offset=1)
+    )
+    assert [item.name for item in second.page.items] == expected[1:]
+    assert second.page.next_offset is None
+    by_id = execute(live_source, job(live_source, query="999", order=order))
+    assert [item.name for item in by_id.page.items] == ["Alpha circuit"]
+    forbidden = execute(live_source, job(live_source, query="AAA", order=order))
+    assert forbidden.error is None and forbidden.page.items == []
+    assert b"Zebra circuit" not in live_source[0].database_path.read_bytes()
+
+
 def test_live_list_and_endpoint_read_are_filtered_and_no_records_are_persisted(live_source):
     settings, repo, _, _, _ = live_source
     result = execute(live_source, job(live_source))
