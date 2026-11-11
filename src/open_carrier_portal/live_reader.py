@@ -317,16 +317,28 @@ async def _read(
             row["source_id"] is None or not str(row["source_id"]).strip() for row in rows
         ):
             raise UpstreamResponseError("circuit identifiers must be unique and nonempty")
+        items = []
+        for row in rows[: job.limit]:
+            description = None if row.get("description") is None else str(row["description"])
+            if description is not None and len(description) > 1000:
+                log_event(
+                    "portal",
+                    "circuit.description_shortened",
+                    "A circuit description was shortened for the list preview.",
+                    level=logging.WARNING,
+                )
+                description = description[:997] + "..."
+            items.append(
+                CircuitSummary(
+                    id=reader.public_id("circuit", row["source_id"]),
+                    name=None if row["name"] is None else str(row["name"]),
+                    description=description,
+                )
+            )
         result = LiveResult(
             request_id=job.request_id,
             page=CircuitPage(
-                items=[
-                    CircuitSummary(
-                        id=reader.public_id("circuit", row["source_id"]),
-                        name=None if row["name"] is None else str(row["name"]),
-                    )
-                    for row in rows[: job.limit]
-                ],
+                items=items,
                 next_offset=job.offset + job.limit if len(rows) > job.limit else None,
             ),
         )

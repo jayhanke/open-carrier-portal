@@ -14,7 +14,13 @@ from open_carrier_portal.adapters.observium import ObserviumAdapter
 from open_carrier_portal.company_access import approve_company_policy
 from open_carrier_portal.company_policies import CompanyPolicy, PolicySnapshot
 from open_carrier_portal.config import Settings
-from open_carrier_portal.live_contract import LiveRequest, LiveResult
+from open_carrier_portal.live_contract import (
+    MAX_RESULT_BYTES,
+    CircuitPage,
+    CircuitSummary,
+    LiveRequest,
+    LiveResult,
+)
 from open_carrier_portal.live_reader import execute_live_request
 from open_carrier_portal.models import ConnectorIdentity
 from open_carrier_portal.portal_agent import PortalConnection, run_agent, serve_live_request
@@ -147,6 +153,7 @@ def test_live_list_and_endpoint_read_are_filtered_and_no_records_are_persisted(l
     assert len(result.page.items) == 1
     circuit = result.page.items[0]
     assert circuit.name == "Example circuit"
+    assert circuit.description == "Read-only shared circuit"
     request = job(live_source, operation="circuits.read", circuit_id=circuit.id)
     read = execute(live_source, request)
     assert read.error is None
@@ -163,8 +170,66 @@ def test_live_list_and_endpoint_read_are_filtered_and_no_records_are_persisted(l
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "LitCircuit" not in tables
         assert b"Example circuit" not in settings.database_path.read_bytes()
+        assert b"Read-only shared circuit" not in settings.database_path.read_bytes()
         assert db.execute("SELECT COUNT(*) FROM grants").fetchone()[0] == 0
     assert repo.administration_snapshot()["partners"] == []
+
+
+@pytest.mark.parametrize("description", [None, "", "x" * 1000, "x" * 1001])
+def test_list_description_previews_are_bounded_without_hiding_circuits(
+    live_source, description, caplog
+):
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(
+            "UPDATE LitCircuit SET Description=? WHERE LitCircuitID=926", (description,)
+        )
+    result = execute(live_source, job(live_source))
+    assert result.error is None
+    actual = result.page.items[0].description
+    if description is not None and len(description) > 1000:
+        assert actual == description[:997] + "..."
+        assert "circuit.description_shortened" in caplog.text
+    else:
+        assert actual == description
+        assert "circuit.description_shortened" not in caplog.text
+
+
+def test_description_search_keeps_partner_billing_scope(live_source):
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute("UPDATE LitCircuit SET Description='Davenport handoff' WHERE LitCircuitID=926")
+        db.execute(
+            "UPDATE LitCircuit SET Description='Secret Davenport route' WHERE LitCircuitID=927"
+        )
+    result = execute(live_source, job(live_source, query="Davenport", order="name_asc"))
+    assert result.error is None
+    assert [item.description for item in result.page.items] == ["Davenport handoff"]
+
+
+def test_summary_preview_does_not_reduce_circuit_detail_description_limit(live_source):
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(
+            "UPDATE LitCircuit SET Description=? WHERE LitCircuitID=926", ("x" * 4000,)
+        )
+    listed = execute(live_source, job(live_source))
+    assert len(listed.page.items[0].description) == 1000
+    result = execute(live_source, job(
+        live_source, operation="circuits.read", circuit_id=listed.page.items[0].id,
+    ))
+    assert result.error is None
+    assert result.circuit.description == "x" * 4000
+
+
+def test_maximum_description_page_fits_live_result_budget():
+    result = LiveResult(
+        request_id=uuid4(),
+        page=CircuitPage(items=[
+            CircuitSummary(
+                id=f"circuit_{index:024x}", name="\x00" * 512, description="\x00" * 1000,
+            )
+            for index in range(100)
+        ]),
+    )
+    assert len(result.model_dump_json().encode("utf-8")) < MAX_RESULT_BYTES
 
 
 def test_pagination_is_billing_filtered_and_parameterized(live_source):

@@ -63,6 +63,7 @@ class InventoryView(WireModel):
 class CircuitSummary(WireModel):
     id: str = Field(pattern=r"^circuit_[a-f0-9]{24}$")
     name: str | None = Field(default=None, max_length=512)
+    description: str | None = Field(default=None, max_length=1000)
 
 
 class MonitoringStatus(WireModel):

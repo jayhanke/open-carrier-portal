@@ -821,8 +821,10 @@ class SourceDatabase:
             fields = (
                 ("address1", "city", "state", "postal_code")
                 if resource_type == "locations"
+                else ("name", "source_id", "description")
+                if resource_type == "circuits"
                 else ("name", "source_id")
-                if resource_type in {"companies", "circuits"}
+                if resource_type == "companies"
                 else ("name",)
             )
             fields = tuple(field for field in fields if field in columns)

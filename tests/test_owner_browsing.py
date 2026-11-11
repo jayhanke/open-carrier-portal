@@ -57,6 +57,7 @@ def test_full_inventory_is_explicit_and_never_relaxes_partner_filter(live_source
     request = owner_job(live_source, source)
     page = execute(live_source, request).page
     assert [item.name for item in page.items] == ["Example circuit", "Unshared circuit"]
+    assert [item.description for item in page.items] == ["Read-only shared circuit", "Private"]
     first = execute(live_source, request.model_copy(update={"limit": 1})).page
     assert first.next_offset == 1
     second = execute(live_source, request.model_copy(update={"limit": 1, "offset": 1})).page

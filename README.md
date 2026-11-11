@@ -351,11 +351,17 @@ select **Full circuit layout and monitoring**, choose their mapped database comp
 and approve with the separate full-layout checkbox. Relinking requires a fresh revision.
 The company-billing filter and final live authorization
 still apply; this exposes infrastructure within the circuit, not independent browsing.
-The portal's combined Circuits view can search approved circuit names/source IDs
+The portal's combined Circuits view can search approved circuit names/source IDs/descriptions
 and sort by name before pagination. Company-billing scope, local approvals, final
 authorization and opaque-ID namespaces remain unchanged. Circuit-only owner
 approval supports these list controls without granting hierarchy exploration.
 Both apps must support the live list `query` and `order` fields before using them.
+Circuit list summaries include the mapped description, without fetching endpoints
+or monitoring per row. Descriptions longer than 1,000 characters are explicitly
+shortened with `...` and a safe `circuit.description_shortened` diagnostic; full
+circuit details retain their existing description limit. Unmapped or null
+descriptions remain absent. Update the portal before restarting a connector that
+emits the new summary field.
 The ordered layout projects mapped ports, patches, pseudowires, dark-fiber segments and secondary patch ports
 (up to 200 nodes), with device/rack/site context and live Observium port status.
 Completely empty source rows (no component type or reference) remain visible as
