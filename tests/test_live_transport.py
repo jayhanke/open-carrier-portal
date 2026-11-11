@@ -154,6 +154,8 @@ def test_live_list_and_endpoint_read_are_filtered_and_no_records_are_persisted(l
     circuit = result.page.items[0]
     assert circuit.name == "Example circuit"
     assert circuit.description == "Read-only shared circuit"
+    assert circuit.billing_company_name == "Example Carrier"
+    assert result.page.issues == []
     request = job(live_source, operation="circuits.read", circuit_id=circuit.id)
     read = execute(live_source, request)
     assert read.error is None
@@ -219,18 +221,29 @@ def test_summary_preview_does_not_reduce_circuit_detail_description_limit(live_s
     assert result.circuit.description == "x" * 4000
 
 
-def test_maximum_description_page_fits_live_result_budget():
+def test_maximum_circuit_summary_page_fits_live_result_budget():
     result = LiveResult(
         request_id=uuid4(),
         page=CircuitPage(items=[
             CircuitSummary(
                 id=f"circuit_{index:024x}", name="\x00" * 512, description="\x00" * 1000,
+                billing_company_name="\x00" * 128,
             )
             for index in range(100)
-        ]),
+        ], issues=["\x00" * 256] * 20),
     )
     assert len(result.model_dump_json().encode("utf-8")) < MAX_RESULT_BYTES
 
+
+@pytest.mark.parametrize("name", [None, "", "   ", "x" * 129])
+def test_partner_billing_company_name_is_optional_bounded_and_diagnosed(live_source, name):
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute("UPDATE company SET CompanyName=? WHERE Company_ID=7", (name,))
+    result = execute(live_source, job(live_source))
+    assert result.error is None
+    expected = "x" * 125 + "..." if name and len(name) > 128 else None
+    assert result.page.items[0].billing_company_name == expected
+    assert result.page.issues
 
 def test_pagination_is_billing_filtered_and_parameterized(live_source):
     _, _, _, _, database = live_source

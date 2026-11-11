@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
+from contextlib import closing
 from dataclasses import asdict, replace
 from uuid import uuid4
 
@@ -11,10 +13,19 @@ from test_live_transport import execute, job
 from test_live_transport import live_source as live_source
 
 from open_carrier_portal.circuits import CircuitReader
-from open_carrier_portal.errors import AuthorizationError, ConfigurationError, ConnectorError
+from open_carrier_portal.errors import (
+    AuthorizationError,
+    ConfigurationError,
+    ConnectorError,
+    SourceDatabaseQueryError,
+)
 from open_carrier_portal.live_contract import LiveJob, OwnerLiveRequest, OwnerSourcesRequest
 from open_carrier_portal.owner_access import approve_owner_source
-from open_carrier_portal.source_database import configured_profile_database
+from open_carrier_portal.source_database import (
+    SourceDatabase,
+    SourceMapping,
+    configured_profile_database,
+)
 
 
 def enable(fixture):
@@ -58,6 +69,9 @@ def test_full_inventory_is_explicit_and_never_relaxes_partner_filter(live_source
     page = execute(live_source, request).page
     assert [item.name for item in page.items] == ["Example circuit", "Unshared circuit"]
     assert [item.description for item in page.items] == ["Read-only shared circuit", "Private"]
+    assert [item.billing_company_name for item in page.items] == [
+        "Example Carrier", "Example Partner",
+    ]
     first = execute(live_source, request.model_copy(update={"limit": 1})).page
     assert first.next_offset == 1
     second = execute(live_source, request.model_copy(update={"limit": 1, "offset": 1})).page
@@ -222,6 +236,86 @@ def test_owner_cannot_select_an_unapproved_profile_or_foreign_tenant(live_source
     repo.put_connector_identity(repo.get_connector_identity().model_copy(update={"enabled": False}))
     assert execute(live_source, request).error == "access_denied"
 
+
+def test_owner_billing_company_lookup_is_one_batch_for_only_visible_references(
+    live_source, monkeypatch
+):
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(
+            "INSERT INTO LitCircuit (LitCircuitID, LitCircuitName, BillingCompanyID) "
+            "VALUES (999, 'Another circuit', 7)"
+        )
+    source = enable(live_source)
+    original = SourceDatabase.fetch_by_ids
+    calls = []
+
+    def fetch(database, resource, identifiers):
+        calls.append((resource, identifiers))
+        return original(database, resource, identifiers)
+
+    monkeypatch.setattr(SourceDatabase, "fetch_by_ids", fetch)
+    first = execute(live_source, owner_job(live_source, source, limit=1))
+    assert first.error is None
+    assert calls == [("companies", ["7"])]
+    calls.clear()
+    full = execute(live_source, owner_job(live_source, source))
+    assert full.error is None
+    assert calls == [("companies", ["7", "8"])]
+    assert [item.billing_company_name for item in full.page.items] == [
+        "Example Carrier", "Example Partner", "Example Carrier",
+    ]
+
+
+def test_missing_billing_company_record_keeps_owner_circuits_with_explicit_issue(live_source):
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute("DELETE FROM company WHERE Company_ID=8")
+    result = execute(live_source, owner_job(live_source, enable(live_source)))
+    assert result.error is None and len(result.page.items) == 2
+    assert result.page.items[1].billing_company_name is None
+    assert result.page.issues == ["Some referenced billing company names are unavailable."]
+
+
+def test_billing_lookup_failure_is_not_a_silent_empty_company(live_source, monkeypatch, caplog):
+    def fail(database, resource, identifiers):
+        raise SourceDatabaseQueryError("test billing lookup failure")
+
+    monkeypatch.setattr(SourceDatabase, "fetch_by_ids", fail)
+    result = execute(live_source, owner_job(live_source, enable(live_source)))
+    assert result.error is None and len(result.page.items) == 2
+    assert all(item.billing_company_name is None for item in result.page.items)
+    assert result.page.issues == ["Billing company names could not be read."]
+    assert "circuit.data_unavailable" in caplog.text
+
+
+def test_missing_company_mapping_does_not_break_circuit_only_owner_grant(live_source):
+    settings, repo, _, _, database = live_source
+    mapping = SourceMapping.nettool_defaults()
+    del mapping.resources["companies"]
+    repo.put_source_database_profile(
+        name="inventory", driver="sqlite", database_name=str(database),
+        host=None, port=None, username=None, password_env_var=None, tls_ca_path=None,
+        timeout_seconds=10, mapping_json=mapping.to_json(),
+    )
+    result = execute(live_source, owner_job(live_source, enable(live_source)))
+    assert result.error is None and len(result.page.items) == 2
+    assert all(item.billing_company_name is None for item in result.page.items)
+    assert result.page.issues == [
+        "Billing company names are unavailable: their mapping is incomplete."
+    ]
+
+
+def test_absent_billing_reference_needs_no_lookup_or_error(live_source, monkeypatch):
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute("UPDATE LitCircuit SET BillingCompanyID=NULL")
+    calls = []
+    monkeypatch.setattr(
+        SourceDatabase, "fetch_by_ids",
+        lambda database, resource, identifiers: calls.append(identifiers),
+    )
+    result = execute(live_source, owner_job(live_source, enable(live_source)))
+    assert result.error is None and len(result.page.items) == 2
+    assert result.page.issues == [] and calls == []
+    assert all(item.billing_company_name is None for item in result.page.items)
 
 def test_request_variants_forbid_partner_owner_switches(live_source):
     data = job(live_source).model_dump(mode="json")

@@ -362,6 +362,13 @@ shortened with `...` and a safe `circuit.description_shortened` diagnostic; full
 circuit details retain their existing description limit. Unmapped or null
 descriptions remain absent. Update the portal before restarting a connector that
 emits the new summary field.
+List summaries also include the mapped billing company name. Partner lists reuse
+the authorized company lookup; owner lists resolve only the returned page's
+distinct billing company references in one bounded batch, without per-circuit
+endpoint or monitoring reads. Only the name is exposed, not the source company ID
+or independent company inventory. Missing mappings/references or failed optional
+lookups are reported in page issues and Diagnostics. Names longer than 128
+characters are shortened with `...` and an explicit issue. Update the portal first.
 The ordered layout projects mapped ports, patches, pseudowires, dark-fiber segments and secondary patch ports
 (up to 200 nodes), with device/rack/site context and live Observium port status.
 Completely empty source rows (no component type or reference) remain visible as

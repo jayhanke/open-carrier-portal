@@ -23,6 +23,7 @@ from open_carrier_portal.errors import (
     ConnectorError,
     ResourceNotFoundError,
     SourceDatabaseError,
+    SourceDatabaseQueryError,
     UpstreamResponseError,
 )
 from open_carrier_portal.live_contract import (
@@ -268,6 +269,7 @@ async def _read(
     source = configured_profile_database(
         replace(profile, timeout_seconds=min(profile.timeout_seconds, 10)), metadata_path
     )
+    companies = []
     if approved is not None:
         companies = await run_in_threadpool(
             source.fetch_matching, "companies", {"source_id": approved.source_company_id}, limit=1
@@ -317,8 +319,52 @@ async def _read(
             row["source_id"] is None or not str(row["source_id"]).strip() for row in rows
         ):
             raise UpstreamResponseError("circuit identifiers must be unique and nonempty")
+        page_rows = rows[: job.limit]
+        company_ids = list(dict.fromkeys(
+            str(row["billing_company_id"]) for row in page_rows
+            if row.get("billing_company_id") is not None
+            and str(row["billing_company_id"]).strip()
+        ))
+        missing_company_mapping = source.missing_fields_for(requirements={
+            "circuits": ("billing_company_id",), "companies": ("source_id", "name"),
+        })
+        company_lookup_failed = False
+        if page_rows and missing_company_mapping:
+            record_data_issue(
+                reader.issues,
+                "Billing company names are unavailable: their mapping is incomplete.",
+                event="circuit.data_unavailable",
+            )
+        elif company_ids and approved is None:
+            try:
+                companies = await run_in_threadpool(source.fetch_by_ids, "companies", company_ids)
+            except (ConfigurationError, SourceDatabaseQueryError):
+                company_lookup_failed = True
+                record_data_issue(
+                    reader.issues, "Billing company names could not be read.",
+                    event="circuit.data_unavailable",
+                )
+        company_names: dict[str, str] = {}
+        for company in companies:
+            name = None if company.get("name") is None else str(company["name"]).strip()
+            if name:
+                if len(name) > 128:
+                    record_data_issue(
+                        reader.issues, "A billing company name was shortened for the circuit list.",
+                        event="circuit.data_unavailable",
+                    )
+                    name = name[:125] + "..."
+                company_names[str(company["source_id"])] = name
+        if (
+            company_ids and not missing_company_mapping and not company_lookup_failed
+            and set(company_ids) - company_names.keys()
+        ):
+            record_data_issue(
+                reader.issues, "Some referenced billing company names are unavailable.",
+                event="circuit.data_unavailable",
+            )
         items = []
-        for row in rows[: job.limit]:
+        for row in page_rows:
             description = None if row.get("description") is None else str(row["description"])
             if description is not None and len(description) > 1000:
                 log_event(
@@ -333,12 +379,14 @@ async def _read(
                     id=reader.public_id("circuit", row["source_id"]),
                     name=None if row["name"] is None else str(row["name"]),
                     description=description,
+                    billing_company_name=company_names.get(str(row.get("billing_company_id"))),
                 )
             )
         result = LiveResult(
             request_id=job.request_id,
             page=CircuitPage(
                 items=items,
+                issues=reader.issues,
                 next_offset=job.offset + job.limit if len(rows) > job.limit else None,
             ),
         )

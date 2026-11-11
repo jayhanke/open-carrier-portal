@@ -64,6 +64,7 @@ class CircuitSummary(WireModel):
     id: str = Field(pattern=r"^circuit_[a-f0-9]{24}$")
     name: str | None = Field(default=None, max_length=512)
     description: str | None = Field(default=None, max_length=1000)
+    billing_company_name: str | None = Field(default=None, max_length=128)
 
 
 class MonitoringStatus(WireModel):
@@ -206,6 +207,9 @@ class LiveCircuit(CircuitSummary):
 
 class CircuitPage(WireModel):
     items: list[CircuitSummary] = Field(max_length=100)
+    issues: list[Annotated[str, Field(min_length=1, max_length=256)]] = Field(
+        default_factory=list, max_length=20
+    )
     next_offset: int | None = Field(default=None, ge=0, le=1_000_000, strict=True)
 
     @model_validator(mode="after")
