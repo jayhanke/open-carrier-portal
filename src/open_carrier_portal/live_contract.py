@@ -130,7 +130,7 @@ PathItemIssue = Literal["unsupported_type", "mapping_missing", "missing_referenc
 
 class LivePathItem(WireModel):
     position: int = Field(ge=0, strict=True)
-    kind: Literal["port", "patch", "pseudowire", "dark_fiber", "unresolved"]
+    kind: Literal["port", "patch", "pseudowire", "dark_fiber", "unresolved", "blank"]
     name: str | None = Field(default=None, max_length=512)
     issue: PathItemIssue | None = None
     patch_type: str | None = Field(default=None, max_length=120)
@@ -139,6 +139,15 @@ class LivePathItem(WireModel):
     @model_validator(mode="after")
     def valid_ports(self) -> Self:
         roles = [port.role for port in self.ports]
+        if self.kind == "blank":
+            if (
+                self.name is not None
+                or self.issue is not None
+                or self.patch_type is not None
+                or roles
+            ):
+                raise ValueError("blank path slots cannot carry labels, issues or readings")
+            return self
         if self.kind == "unresolved":
             if self.issue is None or roles or self.patch_type is not None or not self.name:
                 raise ValueError("unresolved path nodes require a label and issue, not readings")
@@ -167,8 +176,13 @@ class LiveLayout(WireModel):
     @model_validator(mode="after")
     def ordered_items(self) -> Self:
         positions = [item.position for item in self.items]
-        if positions != sorted(set(positions)):
-            raise ValueError("layout positions must be unique and increasing")
+        component_positions = [item.position for item in self.items if item.kind != "blank"]
+        if positions != sorted(positions) or len(component_positions) != len(
+            set(component_positions)
+        ):
+            raise ValueError(
+                "layout positions must increase; only blank slots may share a position"
+            )
         return self
 
 

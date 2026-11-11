@@ -660,22 +660,33 @@ class CircuitReader:
                     raise UpstreamResponseError("The shared circuit has no ordered path steps")
                 self._issue("The circuit has no readable ordered layout steps.")
                 add_unresolved(0, "Circuit layout", unavailable_issue)
-            components: dict[
-                str, tuple[str, Literal["patch", "pseudowire", "dark_fiber"]]
-            ] = {
+            components: dict[str, tuple[str, Literal["patch", "pseudowire", "dark_fiber"]]] = {
                 "patch": ("patches", "patch"),
                 "pw": ("pseudowires", "pseudowire"),
                 "pseudowire": ("pseudowires", "pseudowire"),
                 "newdarkfibercircuit": ("new_dark_fiber_circuits", "dark_fiber"),
             }
             for row in rows:
-                source_id = row.get("item_source_id")
                 try:
                     position = int(row["position"])
                 except (KeyError, ValueError, TypeError) as exc:
                     raise UpstreamResponseError("A path item has an invalid position") from exc
+                source_id = row.get("item_source_id")
                 label = str(row.get("item_type") or "").strip()
                 kind = label.casefold()
+                if (
+                    self.allow_unresolved_path_items
+                    and not label
+                    and source_id is None
+                ):
+                    items.append(
+                        CircuitPathItem(
+                            position=position,
+                            kind="blank",
+                            resource_id=self.public_id("layout_item", row["source_id"]),
+                        )
+                    )
+                    continue
                 if source_id is None:
                     if self.allow_unresolved_path_items:
                         add_unresolved(position, label, "missing_reference")

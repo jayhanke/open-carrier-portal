@@ -353,6 +353,12 @@ The company-billing filter and final live authorization
 still apply; this exposes infrastructure within the circuit, not independent browsing.
 The ordered layout projects mapped ports, patches, pseudowires, dark-fiber segments and secondary patch ports
 (up to 200 nodes), with device/rack/site context and live Observium port status.
+Completely empty source rows (no component type or reference) remain visible as
+blank slots, without missing-data warnings. They retain their source positions,
+including when a real component shares that position; neither row is discarded.
+Two nonblank components at the same position remain an ambiguous-layout error.
+This does not change source rows or broaden sharing permissions. The portal must
+support the `blank` layout kind before deploying this connector behavior.
 Live portal layouts retain unknown component types as labeled steps using their declared
 `item_type` (`TableName` in NetTool), in the original order. Unmapped component sections or
 missing component records also retain their label with **Details unavailable**. The layout

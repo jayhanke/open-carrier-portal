@@ -351,6 +351,58 @@ def test_invalid_layout_is_explicitly_unavailable(live_source, statement):
 
 
 @pytest.mark.parametrize("audience", ["owner", "partner"])
+@pytest.mark.parametrize("blank_first", [False, True])
+@pytest.mark.parametrize("blank_type", ["", None, "  "])
+def test_empty_placeholder_at_occupied_position_keeps_blank_and_real_layout(
+    live_source, audience, blank_first, blank_type
+):
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(
+            "INSERT INTO CircuitLayoutItem VALUES (?, 42, 20, ?, NULL)",
+            (0 if blank_first else 99, blank_type),
+        )
+    request = owner_layout(live_source) if audience == "owner" else partner_layout(live_source)
+    store = AdminStore(live_source[0].database_path)
+    store.initialize()
+    with log_context(store, quiet=True):
+        result = execute(live_source, request)
+    assert result.error is None
+    items = result.circuit.layout.items
+    assert [item.position for item in items] == [10, 20, 20, 30, 40]
+    assert [item.kind for item in items[1:3]] == (
+        ["blank", "patch"] if blank_first else ["patch", "blank"]
+    )
+    patch = next(item for item in items if item.kind == "patch")
+    assert [port.role for port in patch.ports][:2] == ["a", "z"]
+    blank = next(item for item in items if item.kind == "blank")
+    assert blank.name is None and blank.issue is None and blank.ports == []
+    assert not result.circuit.issues
+    assert not any(event["event"] == "path.item_unresolved" for event in store.recent_events())
+
+
+def test_standalone_blank_layout_step_is_not_discarded(live_source):
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute("INSERT INTO CircuitLayoutItem VALUES (99, 42, 25, '', NULL)")
+    result = execute(live_source, owner_layout(live_source))
+    assert result.error is None
+    assert [item.position for item in result.circuit.layout.items] == [10, 20, 25, 30, 40]
+    placeholder = result.circuit.layout.items[2]
+    assert placeholder.kind == "blank" and placeholder.issue is None
+    assert placeholder.name is None and placeholder.ports == []
+    assert not result.circuit.issues
+
+
+@pytest.mark.parametrize("item_type,reference", [("UnknownTransport", None), ("", 123)])
+def test_nonempty_duplicate_layout_step_still_fails(live_source, item_type, reference):
+    with closing(sqlite3.connect(live_source[4])) as db, db:
+        db.execute(
+            "INSERT INTO CircuitLayoutItem VALUES (99, 42, 20, ?, ?)", (item_type, reference)
+        )
+    result = execute(live_source, owner_layout(live_source))
+    assert result.error == "unavailable" and result.circuit is None
+
+
+@pytest.mark.parametrize("audience", ["owner", "partner"])
 @pytest.mark.parametrize("field", ["PortID_A_sec", "PortID_B_sec"])
 def test_missing_secondary_port_retains_patch_and_other_layout_steps(
     live_source, audience, field, caplog

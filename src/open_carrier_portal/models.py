@@ -185,7 +185,7 @@ class CircuitPathItem(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     position: int = Field(ge=0)
-    kind: Literal["port", "patch", "pseudowire", "dark_fiber", "unresolved"]
+    kind: Literal["port", "patch", "pseudowire", "dark_fiber", "unresolved", "blank"]
     resource_id: str
     name: str | None = None
     issue: PathItemIssue | None = None
