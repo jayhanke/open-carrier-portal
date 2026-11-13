@@ -554,6 +554,81 @@ border-radius:8px;margin:1rem 0}}
 .company-picker tr:focus-within{{background:#e0f2fe}}
 .company-pages{{display:flex;gap:1rem;flex-wrap:wrap;margin:1rem 0}}
 .company-control{{width:100%;max-width:44rem;box-sizing:border-box}}
+.partner-intro{{color:#475569;line-height:1.6;margin:0 0 1rem}}
+.partner-jumps{{display:flex;flex-wrap:wrap;gap:.6rem;margin-bottom:1.4rem;
+padding:0;border:0;border-radius:0;background:transparent}}
+.partner-jumps a,.partner-secondary{{display:inline-block;padding:.55rem .8rem;
+border:1px solid #cbd5e1;border-radius:6px;color:#075985;text-decoration:none;
+background:#fff;font-size:.9rem;font-weight:600}}
+.partner-workspace{{display:grid;grid-template-columns:minmax(0,1.8fr) minmax(270px,1fr);
+gap:1.4rem;align-items:start}}
+.partner-panel{{min-width:0;border:1px solid #dbe5ee;border-radius:12px;padding:1.3rem}}
+.partner-panel h3{{margin:.2rem 0 1rem;font-size:1.1rem}}
+.partner-panel p{{line-height:1.6;overflow-wrap:anywhere}}
+.partner-panel small{{display:block;line-height:1.6}}
+.partner-panel input,.partner-panel select{{box-sizing:border-box;max-width:100%;width:100%}}
+.partner-panel input[type="checkbox"],.partner-panel input[type="radio"]{{width:auto;
+display:inline-block;vertical-align:middle;flex-shrink:0}}
+.partner-panel button{{padding:.7rem 1rem;font-weight:600;max-width:100%}}
+.partner-kicker{{display:block;color:#64748b;font-size:.75rem;font-weight:700;
+letter-spacing:.07em;text-transform:uppercase;margin-bottom:.5rem}}
+.partner-step{{display:inline-grid;place-items:center;width:1.7rem;height:1.7rem;
+border-radius:50%;background:#e0f2fe;color:#075985;margin-right:.4rem;font-size:.9rem}}
+.partner-requests{{background:#f8fafc;border:1px solid #dbe5ee;border-radius:8px;
+padding:1rem;margin-bottom:1.5rem}}
+.partner-requests h3{{font-size:1rem;margin:0 0 .6rem}}
+.partner-request-list{{display:grid;gap:.5rem;max-height:14rem;overflow:auto}}
+.partner-request{{display:flex;align-items:center;justify-content:space-between;gap:.8rem;
+padding:.7rem;border:1px solid #cbd5e1;border-radius:6px;text-decoration:none;color:#075985;
+background:white;overflow-wrap:anywhere}}
+.partner-request[aria-current="true"]{{background:#e0f2fe;border-color:#0284c7}}
+.partner-request span{{font-size:.85rem;flex-shrink:0}}
+.partner-empty{{padding:.8rem;background:#f8fafc;border-radius:7px;color:#475569}}
+.partner-search{{padding-bottom:1.2rem;margin-bottom:1.4rem;border-bottom:1px solid #dbe5ee}}
+.partner-search label{{font-weight:600;font-size:.9rem}}
+.partner-search select,.partner-search input{{margin-top:.45rem}}
+.partner-search-fields{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+gap:0 1rem}}
+.partner-panel details{{margin:.8rem 0;font-size:.9rem}}
+.partner-panel summary{{cursor:pointer;color:#075985;font-weight:600}}
+.partner-recipient{{padding:1rem;background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px}}
+.partner-recipient p{{margin:.3rem 0}}
+.partner-recipient code,.partner-policy code{{overflow-wrap:anywhere;font-size:.8rem}}
+.partner-panel .company-picker{{max-height:20rem}}
+.partner-panel .company-picker th{{font-size:.8rem;color:#475569}}
+.partner-panel .company-picker td{{font-size:.9rem}}
+.partner-panel .company-picker tr:has(input:checked){{background:#e0f2fe}}
+.partner-review{{padding:1rem;margin-top:1.2rem;background:#f8fafc;
+border:1px solid #dbe5ee;border-radius:8px}}
+.partner-selection{{font-weight:600;color:#075985}}
+.partner-consent{{display:flex;gap:.65rem;align-items:flex-start;font-size:.9rem;line-height:1.6}}
+.partner-consent input{{margin-top:.35rem}}
+.partner-layout-consent[hidden]{{display:none}}
+.partner-policy-list{{max-height:44rem;overflow:auto}}
+.partner-policy{{padding:1.1rem 0;border-top:1px solid #e2e8f0;overflow-wrap:anywhere}}
+.partner-policy h4{{font-size:1rem;margin:0 0 .6rem}}
+.partner-policy p{{font-size:.9rem;margin:.5rem 0;color:#475569}}
+.partner-policy .partner-secondary{{margin:.5rem 0}}
+.partner-policy form button{{background:#fff;color:#b91c1c;border:1px solid #fecaca;
+font-size:.85rem;margin:.3rem 0}}
+.partner-policy form button:hover{{background:#fef2f2}}
+.partner-advanced{{margin-top:1.5rem;border:1px solid #dbe5ee;border-radius:10px;padding:1rem}}
+.partner-advanced>summary{{cursor:pointer;font-weight:600;color:#475569}}
+.partner-jumps a:focus-visible,.partner-panel a:focus-visible,
+.partner-panel summary:focus-visible{{outline:3px solid #38bdf8;outline-offset:3px}}
+@media(max-width:900px){{.partner-workspace{{grid-template-columns:1fr}}}}
+@media(max-width:480px){{.partner-panel{{padding:.9rem}}
+.partner-search-fields{{grid-template-columns:1fr}}.partner-request{{flex-wrap:wrap}}
+.partner-options,.partner-options tbody{{display:block}}
+.partner-options thead{{position:absolute;width:1px;height:1px;overflow:hidden;
+clip:rect(0,0,0,0)}}
+.partner-options tr{{display:grid;grid-template-columns:1.6rem minmax(0,1fr);
+align-items:center;padding:.5rem;border-bottom:1px solid #e2e8f0}}
+.partner-options td{{border:0;padding:.3rem}}
+.partner-options td:first-child{{grid-column:1;grid-row:1 / 3}}
+.partner-options td:nth-child(2){{grid-column:2;grid-row:2;color:#64748b;font-size:.8rem}}
+.partner-options td:nth-child(2)::before{{content:"Database ID: "}}
+.partner-options td:nth-child(3){{grid-column:2;grid-row:1;font-weight:600}}}}
 .mapper-toolbar{{display:flex;align-items:end;gap:1rem;flex-wrap:wrap}}
 .mapper-toolbar label{{flex:1}}.mapper-toolbar select{{width:100%;box-sizing:border-box}}
 .mapper-grid{{display:grid;grid-template-columns:minmax(210px,1fr) minmax(340px,1.8fr);
@@ -656,6 +731,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             or store.get("source").get("name", "")
         )
         recipients: dict[str, str] = {}
+        request_links = ""
         request_notice = ""
         if connection_file.exists():
             try:
@@ -665,6 +741,18 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                         client, portal, allow_insecure_http=settings.allow_insecure_http
                     )
                 recipients.update((str(item.company_id), item.name) for item in requests)
+                for item in requests:
+                    request_url = "/admin/partners?" + urlencode(
+                        {"profile": name, "portal_company_id": str(item.company_id)}
+                    ) + "#link-company"
+                    current = str(item.company_id) == portal_company_id
+                    request_links += (
+                        f'<a class="partner-request" href="{escape(request_url)}" '
+                        'data-action-id="connector.partners.request.select"'
+                        + (' aria-current="true"' if current else "")
+                        + f"><strong>{escape(item.name)}</strong>"
+                        "<span>Review request</span></a>"
+                    )
                 for local in repository.list_portal_policies(portal):
                     recipients.setdefault(
                         str(local.policy.recipient_organization_id), local.policy.recipient_name
@@ -685,13 +773,16 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         if portal_company_id and portal_company_id not in recipients:
             recipients[portal_company_id] = "Selected company - verify identity below"
         content = (
-            "<h3>Portal circuit access requests</h3>"
-            "<p>Customers find your company on portal Sharing and request circuit access. "
-            "Select the requester below, choose their matching database company, and approve. "
-            "A request does not grant access and company names are never matched automatically.</p>"
+            '<div class="partner-requests"><h3>Portal circuit access requests</h3>'
+            + ('<div class="partner-request-list" role="region" aria-label="Access requests" '
+               f'tabindex="0">{request_links}</div>' if request_links else "")
             + request_notice
-            + '<form method="get" action="/admin/partners"><label>Portal requester / linked company'
-            '<select name="portal_company_id" class="company-control">'
+            + '<small>Requests do not grant access. You choose the matching billing company '
+            'and approve sharing below.</small></div>'
+            '<h3 id="link-company"><span class="partner-step">1</span>Choose a portal company</h3>'
+            '<form method="get" action="/admin/partners" class="partner-search">'
+            '<label>Portal requester / linked company'
+            '<select name="portal_company_id" class="company-control" id="partner-recipient">'
             '<option value="">Choose a requesting or linked company</option>'
             + "".join(
                 f'<option value="{escape(company_id)}"'
@@ -699,7 +790,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 f"{escape(company_name)}</option>"
                 for company_id, company_name in recipients.items()
             )
-            + "</select></label><label>Database connection"
+            + '</select></label><div class="partner-search-fields"><label>Database connection'
             '<select name="profile" class="company-control">'
             '<option value="">Choose a database connection</option>'
             + "".join(
@@ -711,19 +802,27 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             )
             + "</select></label><label>Search company name or ID"
             '<input type="search" name="q" class="company-control" maxlength="120" '
-            f'value="{escape(query)}">'
-            '</label><button type="submit">Select requester / search database</button></form>'
+            f'value="{escape(query)}" placeholder="Name or database ID">'
+            '</label></div><button type="submit" '
+            'data-action-id="connector.partners.directory.search">Find database company</button>'
+            '<small>Search the entire mapped directory. Searching or paging clears the '
+            'database-company selection, not the selected portal company.</small></form>'
             "<details><summary>Advanced: link manually by Portal Company ID</summary>"
             '<form method="get" action="/admin/partners"><label>Portal Company ID'
             '<input name="portal_company_id" class="company-control" '
             'placeholder="Recipient company UUID" required></label>'
             f'<input type="hidden" name="profile" value="{escape(name)}">'
-            "<button type='submit'>Look up company</button></form></details>"
-            "<h3>Companies from your database</h3><p>Select by name and database ID. "
-            "Listing companies does not create partners or grant access.</p>"
+            '<button type="submit" data-action-id="connector.partners.company.lookup">'
+            "Look up company</button></form></details>"
+            '<h3><span class="partner-step">2</span>Companies from your database</h3>'
+            "<small>Select the matching billing account by name and database ID. "
+            "Listing companies does not create partners or grant access.</small>"
         )
         if not name:
-            return content + "<p>Select a database connection to load its mapped companies.</p>"
+            return content + (
+                '<p class="partner-empty">Select a database connection above and choose '
+                '<strong>Find database company</strong> to load its mapped companies.</p>'
+            )
         mapping_url = "/admin/mapping?profile=" + quote(name, safe="")
         try:
             source = source_for(repository, name, settings.database_path)
@@ -764,7 +863,10 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     "portal_company_id": portal_company_id,
                 }
             )
-            pagination += f'<a rel="prev" href="{escape(previous)}">Previous companies</a>'
+            pagination += (
+                f'<a rel="prev" href="{escape(previous)}" '
+                'data-action-id="connector.partners.directory.previous">Previous companies</a>'
+            )
         if len(rows) > 100:
             if offset < 999_900:
                 next_page = "/admin/partners?" + urlencode(
@@ -775,7 +877,10 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                         "portal_company_id": portal_company_id,
                     }
                 )
-                pagination += f'<a rel="next" href="{escape(next_page)}">Next companies</a>'
+                pagination += (
+                    f'<a rel="next" href="{escape(next_page)}" '
+                    'data-action-id="connector.partners.directory.next">Next companies</a>'
+                )
             else:
                 pagination += "<p>Pagination limit reached; narrow the company search.</p>"
         pagination += "</div>"
@@ -824,7 +929,8 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             if target is not None:
                 picker = (
                     '<div class="company-picker" role="region" '
-                    'aria-label="Choose database company" tabindex="0"><table><thead><tr>'
+                    'aria-label="Choose database company" tabindex="0">'
+                    '<table class="partner-options" role="table"><thead><tr>'
                     '<th class="company-select">Select</th>'
                     '<th class="company-id">Company ID in your database</th><th>Company</th>'
                     "</tr></thead><tbody>"
@@ -832,6 +938,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                         '<tr><td><input type="radio" name="company" '
                         f'value="{escape(str(row["source_id"]))}" '
                         f'id="company-option-{index}" required '
+                        f'data-company-name="{escape(str(row["name"]))}" '
                         f'aria-label="Select {escape(str(row["name"]))}, '
                         f'ID {escape(str(row["source_id"]))}"></td>'
                         f"<td>{escape(str(row['source_id']))}</td>"
@@ -851,8 +958,17 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     f'value="{target.policy_id or ""}">'
                     '<input type="hidden" name="expected_revision" '
                     f'value="{target.revision}">'
-                    f"<p><strong>Portal company: {escape(target.name)}</strong><br>"
-                    f"<code>{target.company_id}</code></p>"
+                    '<div class="partner-recipient"><span class="partner-kicker">'
+                    'Verified recipient</span>'
+                    f"<p><strong>Portal company: {escape(target.name)}</strong></p>"
+                    '<details><summary>Verify company ID</summary>'
+                    f"<code>{target.company_id}</code></details></div>"
+                    + picker
+                    + pagination
+                    + '<section class="partner-review" aria-labelledby="partner-review-heading">'
+                    '<h3 id="partner-review-heading"><span class="partner-step">3</span>'
+                    'Review sharing</h3><p class="partner-selection" role="status" '
+                    'data-partner-selection>Choose a database company above.</p>'
                     '<label>Circuit access<select name="visibility" class="company-control">'
                     + "".join(
                         f'<option value="{value}"'
@@ -863,23 +979,17 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                         )
                     )
                     + "</select></label>"
-                    + "<p>Select the matching database company below. Search covers the "
-                    "whole mapped directory; use the page links for more companies. "
-                    "Changing search or page clears the database-company selection. "
-                    "The portal Company ID remains selected.</p>"
-                    + picker
-                    + pagination
-                    + '<label><input type="checkbox" name="consent" value="yes" required>'
+                    + '<label class="partner-consent"><input type="checkbox" name="consent" '
+                    'value="yes" required><span>'
                     "Approve this company's current and future billed circuits, endpoints "
-                    "and linked monitoring status for the selected portal recipient.</label>"
-                    '<label><input type="checkbox" name="layout_consent" value="yes">'
+                    "and linked monitoring status for the selected portal recipient.</span></label>"
+                    '<label class="partner-consent partner-layout-consent">'
+                    '<input type="checkbox" name="layout_consent" value="yes"><span>'
                     "For full circuit layouts, also approve all intermediate ports, patches, "
                     "pseudowires, dark-fiber descriptions and their device/rack/site context "
-                    "and Observium status. "
-                    "This does not grant independent inventory browsing.</label>"
-                    "<p>The selected ID is validated against this database; "
-                    "a company name is never "
-                    "used as identity. Approval grants no independent device/port access.</p>",
+                    "and Observium status.</span></label>"
+                    "<small>Only circuits billed to the selected database company are shared. "
+                    "No independent device or port inventory access.</small></section>",
                     "Link company and share circuits",
                 )
         return (
@@ -890,14 +1000,20 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 if len(rows) > 100 or offset or query
                 else f"<p>{len(rows)} mapped companies.</p>"
             )
-            + (approval if target is not None else picker + pagination + approval)
+            + (
+                approval
+                if target is not None
+                else picker + pagination + approval
+                + '<p class="partner-empty">Choose a portal company above to enable approval.</p>'
+            )
         )
 
     def portal_policy_content(csrf: str) -> str:
         content = (
-            "<h3>Shared portal companies</h3>"
-            "<p>Company links approved here appear on the portal's Sharing page. "
-            "You can stop sharing immediately below. Source records stay in your database.</p>"
+            '<span class="partner-kicker">Manage access</span>'
+            '<h3 id="shared-companies">Shared portal companies</h3>'
+            "<small>Review a link to change access or approve again. Stopping sharing takes "
+            "effect here immediately; source records stay in your database.</small>"
         )
         if not connection_file.exists():
             return content + '<p><a href="/admin/portal">Pair Carrier Portal</a> first.</p>'
@@ -914,8 +1030,17 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             )
         if not policies:
             return content + (
-                "<p>No company links yet. Select a requesting company above.</p>"
+                '<p class="partner-empty">No company links yet. Start by choosing a requesting '
+                'company in the linking workflow.</p>'
             )
+        profiles = {
+            profile.profile_id: profile.name
+            for profile in repository.enabled_source_database_profiles()
+        }
+        content += (
+            '<div class="partner-policy-list" role="region" aria-label="Company sharing links" '
+            'tabindex="0">'
+        )
         for local in policies:
             policy = local.policy
             state = (
@@ -936,23 +1061,57 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 if policy.visibility == "full_shared_path"
                 else "Endpoints only"
             )
-            content += (
-                f"<h4>{escape(policy.recipient_name)} - revision {policy.revision}</h4>"
-                f"<p>{escape(state)} &mdash; "
-                f"{view_label}</p>"
+            active = (
+                policy.state == "active"
+                and local.receipt is not None
+                and time.time() - local.synced_at <= POLICY_LEASE_SECONDS
             )
+            badge = (
+                "Sharing active" if active else
+                "Sharing stopped" if policy.state == "revoked" else
+                "Connection expired" if time.time() - local.synced_at > POLICY_LEASE_SECONDS else
+                "Awaiting portal" if local.receipt else "Needs approval"
+            )
+            profile_name = (
+                profiles.get(str(local.receipt.source_profile_id), "") if local.receipt else ""
+            )
+            review_url = "/admin/partners?" + urlencode(
+                {
+                    "portal_company_id": str(policy.recipient_organization_id),
+                    "profile": profile_name,
+                    "q": local.receipt.source_company_id if local.receipt else "",
+                }
+            ) + "#link-company"
+            content += (
+                '<article class="partner-policy">'
+                f"<h4>{escape(policy.recipient_name)}</h4>"
+                f'<span class="setup-badge{" good" if active else ""}">{badge}</span>'
+                f"<p>{view_label}</p>"
+            )
+            if not active and state not in {"pending", "active", "needs_approval", "revoked"}:
+                content += f"<p>{escape(state)}</p>"
             if local.receipt:
                 content += (
-                    f"<p>Database profile ID: {escape(local.receipt.source_profile_id)}; "
-                    f"company ID: {escape(local.receipt.source_company_id)}</p>"
+                    f"<p>Database: <strong>{escape(profile_name)}</strong><br>"
+                    f"Billing company ID: {escape(local.receipt.source_company_id)}</p>"
                 )
+            content += (
+                f'<a class="partner-secondary" href="{escape(review_url)}" '
+                'data-action-id="connector.partners.sharing.review">Review / change sharing</a>'
+                '<details><summary>Link details</summary>'
+                f"<p>Revision {policy.revision}<br>"
+                f"Portal Company ID: <code>{policy.recipient_organization_id}</code><br>"
+                f"Policy ID: <code>{policy.policy_id}</code></p></details>"
+            )
+            if local.receipt:
                 content += form(
                     "stop-company-policy",
                     csrf,
                     f'<input type="hidden" name="policy" value="{policy.policy_id}">',
                     "Stop sharing immediately",
                 )
-        return content
+            content += "</article>"
+        return content + "</div>"
 
     def render(
         section: str,
@@ -1537,7 +1696,17 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             )
         if section == "partners":
             return (
-                company_directory(
+                '<p class="partner-intro">Connect a portal company to its billing account '
+                'in your database, then choose which circuit details to share.</p>'
+                '<nav class="partner-jumps" aria-label="Partners page">'
+                '<a href="#link-company" data-action-id="connector.partners.jump.link">'
+                'Link a company</a>'
+                '<a href="#shared-companies" data-action-id="connector.partners.jump.sharing">'
+                'Manage sharing</a>'
+                '<a href="#direct-partners" data-action-id="connector.partners.jump.direct">'
+                'Connect without the portal</a></nav>'
+                '<div class="partner-workspace"><div class="partner-panel">'
+                + company_directory(
                     selected_profile,
                     snapshot["profiles"],
                     csrf,
@@ -1545,11 +1714,20 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     company_offset,
                     portal_company_id,
                 )
+                + '</div><aside class="partner-panel" aria-labelledby="shared-companies">'
                 + portal_policy_content(csrf)
-                + "<details><summary>Advanced: direct connector access "
+                + '</aside></div><script src="/admin/assets/partners.js" defer></script>'
+                '<details class="partner-advanced" id="direct-partners">'
+                '<summary>Advanced: direct connector access '
                 "(not portal sharing)</summary>"
                 "<h3>Partner access</h3>"
-                "<p>Partners query this connector without the portal. Confirm bilateral consent "
+                "<p>No portal account or pairing is needed. To let another company query this "
+                "connector, create its credential and access grants below. Give them this "
+                "connector's HTTPS address, client ID and one-time secret privately. "
+                'They configure those under <a href="/admin/remote" '
+                'data-action-id="connector.partners.direct.outbound">Partner connections</a> '
+                "on their connector. For access in both directions, repeat on the other connector."
+                "</p><p>Confirm bilateral consent "
                 "out of band. Grants with no resource IDs cover ALL resources in that scope.</p>"
                 + table(snapshot["partners"])
                 + table(snapshot["clients"])
@@ -2288,6 +2466,14 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         else:
             raise ValueError("unknown administration action")
         return "<p>Saved successfully.</p>"
+
+    @app.get("/admin/assets/partners.js")
+    async def partners_script():
+        return Response(
+            Path(__file__).with_name("partners.js").read_text(encoding="utf-8"),
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+        )
 
     @app.get("/admin/assets/mapping.js")
     async def mapping_script():

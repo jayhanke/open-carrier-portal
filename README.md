@@ -703,7 +703,11 @@ session hashes, partner grants, configuration and audit events.
   database. Validation checks schema and join keys, not complete source-data
   referential integrity or read-only permissions. Restart the connector after
   saving to apply mappings to the running API.
-- **Partners:** select a company that requested circuit access from portal Sharing,
+- **Partners:** a numbered linking workflow sits alongside a sharing-status panel.
+  Incoming requests have a **Review request** shortcut; existing links have readable
+  status badges, database names, **Review / change sharing**, and immediate stop controls.
+  Technical IDs and legacy direct OAuth configuration stay under expandable details.
+  Select a company that requested circuit access from portal Sharing,
   verify the resolved company, and link it to a mapped company row. Previously linked
   companies are also selectable for deliberate reapproval. Manual Company ID entry
   is collapsed under Advanced. The
@@ -714,7 +718,9 @@ session hashes, partner grants, configuration and audit events.
   per page, with previous/next links to reach later records. Search matches company
   names or source IDs across the whole mapped directory, not just the current page.
   After a verified portal lookup, select the matching database company row;
-  the form submits the exact source ID without copying or typing it. Searching or
+  the review shows its name and exact source ID without copying or typing it.
+  Full-layout access reveals an additional required consent; the server enforces
+  both approvals even without JavaScript. Searching or
   paging clears the database-company selection but retains the selected portal company.
   Listing or selecting companies does not persist company records, create partners,
   or grant access. Missing mappings and database failures are shown explicitly,
@@ -723,8 +729,12 @@ session hashes, partner grants, configuration and audit events.
   Link/approve here or stop an existing approval immediately. Successful linking
   confirms active portal acknowledgement; connection errors explicitly report
   unconfirmed activation and appear in Logs.
-  Direct inbound OAuth controls are collapsed under **Advanced** and are not needed
-  for portal company sharing. Provision direct inbound partners after confirming bilateral
+  **Connect without the portal** jumps to the direct inbound OAuth controls under
+  **Advanced**. Direct connector-to-connector access requires no portal account or pairing:
+  the owner issues a credential and grants, and the recipient configures the owner's HTTPS
+  address and credential under **Partner connections**. Repeat in the opposite direction
+  for bilateral access. These controls are not needed for portal company sharing.
+  Provision direct inbound partners after confirming bilateral
   approval out of band. Select scopes and specific opaque resource IDs, or
   explicitly opt in to all resources for those scopes. Client secrets appear
   **once**, only in the successful creation response. Copy them privately;
