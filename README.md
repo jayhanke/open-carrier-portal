@@ -367,7 +367,7 @@ the authorized company lookup; owner lists resolve only the returned page's
 distinct billing company references in one bounded batch, without per-circuit
 endpoint or monitoring reads. Only the name is exposed, not the source company ID
 or independent company inventory. Missing mappings/references or failed optional
-lookups are reported in page issues and Diagnostics. Names longer than 128
+lookups are reported in page issues and Logs. Names longer than 128
 characters are shortened with `...` and an explicit issue. Update the portal first.
 The ordered layout projects mapped ports, patches, pseudowires, dark-fiber segments and secondary patch ports
 (up to 200 nodes), with device/rack/site context and live Observium port status.
@@ -718,11 +718,11 @@ session hashes, partner grants, configuration and audit events.
   paging clears the database-company selection but retains the selected portal company.
   Listing or selecting companies does not persist company records, create partners,
   or grant access. Missing mappings and database failures are shown explicitly,
-  with failures recorded in Diagnostics without company records.
+  with failures recorded in Logs without company records.
   **Shared portal companies** lists received revisions and local approval status.
   Link/approve here or stop an existing approval immediately. Successful linking
   confirms active portal acknowledgement; connection errors explicitly report
-  unconfirmed activation and appear in Diagnostics.
+  unconfirmed activation and appear in Logs.
   Direct inbound OAuth controls are collapsed under **Advanced** and are not needed
   for portal company sharing. Provision direct inbound partners after confirming bilateral
   approval out of band. Select scopes and specific opaque resource IDs, or
@@ -744,8 +744,21 @@ session hashes, partner grants, configuration and audit events.
   TLS verification cannot be disabled, redirects are rejected, and tokens are
   neither persisted nor displayed. This is manual browsing, not background
   synchronization. Saving a new connection name preserves other saved connections.
-- **Diagnostics:** Observium connection logs plus a collapsible view of all recent
-  operational events, alongside the existing administration/partner API audit trails.
+- **Navigation:** Setup, Logs, Account and sign-out controls appear in the utility row.
+  Setup navigation below shows checkmarks for configured company identity, selected
+  enabled source, required mappings, valid portal pairing, sharing and direct partner
+  connections. Checks are derived from current saved settings, not page visits, and
+  disappear when the relevant configuration is disabled, removed or becomes incomplete.
+  Mapping checks include the extra references required when monitoring is enabled.
+  They do not perform network/database tests or claim live service health; use
+  readiness checks to validate connectivity and source schema. Portal and sharing
+  remain optional.
+- **Logs:** All recent operational events, with component, action and interaction
+  filters and an Observium connection-log shortcut, alongside the existing
+  administration/partner API audit trails. `/admin/diagnostics` is an authenticated
+  compatibility redirect to `/admin/logs`; there is no separate Diagnostics page.
+  Audit histories show the latest 50 rows each and are separate from operational
+  filtering and retention.
   Operational logs cover startup/configuration, HTTP request outcomes, administrator
   actions/session failures, database connectivity/mapping errors, Observium HTTP and
   transport failures, portal pairing/heartbeats and CLI outcomes. The newest 100 events

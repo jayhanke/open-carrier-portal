@@ -84,7 +84,6 @@ SECTIONS = (
     "mapping",
     "partners",
     "remote",
-    "diagnostics",
     "logs",
     "account",
 )
@@ -93,6 +92,7 @@ SECTION_LABELS = {
     "sources": "Connections",
     "remote": "Partner connections",
 }
+SETUP_SECTIONS = ("identity", "sources", "mapping", "portal", "partners", "remote")
 
 
 def escape(value: object) -> str:
@@ -333,6 +333,86 @@ def create_admin_app(
             set_session_cookie(response, token)
         return response
 
+    def setup_navigation() -> str:
+        identity = repository.get_connector_identity()
+        identity_ready = bool(identity and identity.enabled)
+        name = settings.source_database_profile or store.get("source").get("name", "")
+        profile = repository.get_source_database_profile(name) if name else None
+        source_ready = bool(profile and profile.enabled)
+        mapping_ready = False
+        mapping_status = "Select an enabled source and configure its required mappings."
+        if source_ready and profile:
+            try:
+                missing = SourceMapping.from_json(profile.mapping_json).missing_fields_for(
+                    monitoring=monitoring_enabled()
+                )
+            except ValueError as exc:
+                log_failure("database", "setup.mapping_invalid", exc)
+                mapping_status = "Saved mapping is invalid. Review Mapping and Logs."
+            else:
+                mapping_ready = not missing
+                mapping_status = (
+                    "Required fields are configured; run readiness checks "
+                    "to validate the database."
+                    if mapping_ready else "Required fields still need mapping."
+                )
+        portal = None
+        portal_status = "Optional: pair this connector with Carrier Portal."
+        if connection_file.exists():
+            try:
+                portal = paired_portal()
+            except (ValueError, OSError) as exc:
+                log_failure("portal", "setup.pairing_invalid", exc)
+                portal_status = "Pairing is unavailable. Review Carrier Portal and Logs."
+            else:
+                portal_status = "Paired. This does not confirm source-database health."
+        sharing_ready = repository.has_active_circuit_shares()
+        sharing_status = "Optional: configure an approved company link or circuit share."
+        if portal:
+            try:
+                sharing_ready = sharing_ready or any(
+                    local.receipt is not None and local.policy.state != "revoked"
+                    for local in repository.list_portal_policies(portal)
+                )
+            except ValueError as exc:
+                log_failure("portal", "setup.sharing_invalid", exc)
+                sharing_status = "Saved sharing configuration is invalid. Review Partners and Logs."
+        remote_ready = any(
+            all(remote.get(key) for key in ("url", "client", "secret_env", "scope"))
+            for remote in (
+                store.get("remote:" + name) for name in store.names("remote:")
+            )
+        )
+        completed = {
+            "identity": (identity_ready, "An enabled company identity is configured."),
+            "sources": (
+                source_ready, "An enabled source profile is selected; test its connection."
+            ),
+            "mapping": (mapping_ready, mapping_status),
+            "portal": (portal is not None, portal_status),
+            "partners": (sharing_ready, sharing_status),
+            "remote": (
+                remote_ready, "Optional: configure a direct partner connection."
+            ),
+        }
+        links = ""
+        for section in SETUP_SECTIONS:
+            done, explanation = completed[section]
+            state = "Configured" if done else "Not configured"
+            links += (
+                f'<a data-action-id="connector.nav.{section}" href="/admin/{section}" '
+                f'data-setup-complete="{str(done).lower()}" title="{escape(explanation)}">'
+                f'<span class="step-check{" complete" if done else ""}" aria-hidden="true">'
+                f'{"&#10003;" if done else "&#9675;"}</span>'
+                f'<span class="sr-only">{state}: </span>'
+                f'{escape(SECTION_LABELS.get(section, section.title()))}</a>'
+            )
+        return (
+            '<nav class="setup-navigation" aria-label="Connector setup steps">'
+            + links + '<p>Checks show configured setup, not live service health. '
+            'Portal and partner sharing are optional.</p></nav>'
+        )
+
     def page(
         title: str,
         content: str,
@@ -347,18 +427,18 @@ def create_admin_app(
             if reference:
                 content += f"<p>Diagnostic reference: <code>{escape(reference)}</code>.</p>"
             if signed_in:
-                content += '<p><a href="/admin/diagnostics">View Diagnostics logs</a></p>'
+                content += '<p><a href="/admin/logs">View Logs</a></p>'
         if signed_in and configuration_error:
             content = f'<p class="notice">{escape(configuration_error)}</p>' + content
         nav = (
-            "<nav>"
+            '<nav class="utility-navigation" aria-label="Administration">'
             + "".join(
                 f'<a data-action-id="connector.nav.{s}" href="/admin/{s}">'
                 f'{escape(SECTION_LABELS.get(s, s.title()))}</a>'
-                for s in SECTIONS
+                for s in SECTIONS if s not in SETUP_SECTIONS
             )
             + form("logout", csrf, "", "Sign out")
-            + "</nav>"
+            + "</nav>" + setup_navigation()
             if signed_in
             else ""
         )
@@ -383,6 +463,13 @@ main{{max-width:1100px;margin:2rem auto;padding:0 1rem}}
 nav,section{{background:white;border:1px solid #ccd8e3;border-radius:10px;
 padding:1.3rem;margin:1rem 0}}
 nav a{{display:inline-block;margin:.4rem .9rem .4rem 0;color:#075985}}
+.utility-navigation{{display:flex;align-items:center;flex-wrap:wrap;gap:.3rem 1rem}}
+.utility-navigation form{{margin-left:auto}}.utility-navigation button{{margin:0}}
+.setup-navigation a{{display:inline-flex;align-items:center;gap:.4rem;text-decoration:none}}
+.setup-navigation p{{font-size:.85rem;color:#475569;margin:.6rem 0 0}}
+.step-check{{color:#64748b;font-weight:700}}.step-check.complete{{color:#166534}}
+.sr-only{{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+clip:rect(0,0,0,0);white-space:nowrap;border:0}}
 label{{display:block;margin:.8rem 0}}input,select,textarea,button{{font:inherit;padding:.55rem}}
 input,textarea{{display:block;width:95%;max-width:44rem;border:1px solid #94a3b8;border-radius:5px}}
 textarea{{height:20rem}}button{{background:#075985;color:white;border:0;border-radius:5px;
@@ -587,8 +674,8 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 log_failure("portal", "access_requests.load_failed", exc)
                 request_notice = (
                     '<p role="alert">Could not load portal access requests. Check Carrier Portal '
-                    'pairing, update both apps, and check <a href="/admin/diagnostics">'
-                    "Diagnostics</a>. Reload this page to retry.</p>"
+                    'pairing, update both apps, and check <a href="/admin/logs">'
+                    "Logs</a>. Reload this page to retry.</p>"
                 )
         else:
             request_notice = (
@@ -657,7 +744,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 content + '<p class="notice" role="alert">Could not load mapped companies. '
                 "Check the database connection and saved Companies mapping. "
                 f"Diagnostic reference: <code>{escape(request_reference())}</code>. "
-                '<a href="/admin/diagnostics">View Diagnostics logs</a>.</p>'
+                '<a href="/admin/logs">View Logs</a>.</p>'
             )
         log_event(
             "database",
@@ -731,7 +818,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     '<p role="alert">Could not verify the portal Company ID. Check that it '
                     "comes from the recipient's company profile, that this connector is paired, "
                     "and that both apps are updated. "
-                    '<a href="/admin/diagnostics">Diagnostics</a>.</p>'
+                    '<a href="/admin/logs">Logs</a>.</p>'
                 )
             if target is not None:
                 picker = (
@@ -822,7 +909,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             log_failure("portal", "policies.load_failed", exc)
             return content + (
                 '<p role="alert">Cannot load sharing approvals. Check Carrier Portal '
-                'pairing and <a href="/admin/diagnostics">Diagnostics</a>.</p>'
+                'pairing and <a href="/admin/logs">Logs</a>.</p>'
             )
         if not policies:
             return content + (
@@ -975,7 +1062,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 "<p>A saved source profile is not a health check. Run validation to check "
                 "the selected source connection and mapped columns.</p>"
                 + form("readiness", csrf, "", "Run readiness checks")
-                + '<p><a class="portal-link" href="/admin/diagnostics">View diagnostics &rarr;</a>'
+                + '<p><a class="portal-link" href="/admin/logs">View logs &rarr;</a>'
                 '</p></li><li class="setup-card"><div class="setup-card-head">'
                 '<h3>Choose what to share</h3><span class="setup-badge">Your control</span></div>'
                 "<p>Add trusted partners and grant only the resources they need. "
@@ -1563,22 +1650,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     "Change password and sign out",
                 )
             )
-        return (
-            "<p>Recent events only; source records and credentials are not exported.</p>"
-            + "<h3>Observium connection logs</h3>"
-            + table(store.recent_events("observium"))
-            + "<details><summary>All operational logs</summary>"
-            + "<p>Latest 100 events shown; the latest 2,000 are retained locally. "
-            "The same events are written to service output. For Linux deployments use "
-            "journalctl for your systemd service or docker logs for your container. "
-            "Long-term retention is managed by your deployment.</p>"
-            + table(store.recent_events())
-            + "</details>"
-            + "<h3>Administration</h3>"
-            + table(store.recent_audit())
-            + "<h3>Partner API requests</h3>"
-            + table(snapshot["audit"])
-        )
+        raise ValueError("Unknown administration section.")
 
     def text(data: FormData, key: str, *, required: bool = True) -> str:
         value = data.get(key, "")
@@ -1737,7 +1809,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     log_failure("portal", "company_link.acknowledgement_failed", exc)
                     raise ValueError(
                         "Local company approval was saved, but portal activation is unconfirmed. "
-                        "Check Carrier Portal connection and Diagnostics; the next heartbeat "
+                        "Check Carrier Portal connection and Logs; the next heartbeat "
                         "will retry. Do not relink unless you want to replace this approval."
                     ) from None
                 local = next(
@@ -1758,7 +1830,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 ):
                     raise ValueError(
                         "Company approval was saved, but the portal has not activated it. "
-                        "Check the sharing status and Diagnostics before retrying."
+                        "Check the sharing status and Logs before retrying."
                     )
                 repository.require_portal_company_policy(
                     portal,
@@ -2450,6 +2522,9 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         session = store.session(request.cookies.get("ocp_admin", ""))
         if not session:
             return RedirectResponse("/admin/login", status_code=303)
+        if section == "diagnostics":
+            request.state.admin_activity = request.cookies["ocp_admin"]
+            return RedirectResponse("/admin/logs", status_code=303)
         if section not in SECTIONS:
             return page(
                 "Not found",
@@ -2463,11 +2538,12 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         if section == "logs":
             action = request.query_params.get("action_id", "")
             interaction = request.query_params.get("interaction_id", "")
+            component = request.query_params.get("component", "")
             try:
                 offset = int(request.query_params.get("offset", "0"))
                 rows = await run_in_threadpool(
                     store.recent_events, action_id=action, interaction_id=interaction,
-                    offset=offset, limit=101,
+                    component=component, offset=offset, limit=101,
                 )
             except ValueError:
                 return page(
@@ -2478,8 +2554,16 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             return page(
                 "Logs", logs_markup(
                     rows, base="/admin/logs", application="Connector", action_id=action,
-                    interaction_id=interaction, offset=offset,
-                ), session["csrf"], username=session["username"],
+                    interaction_id=interaction, offset=offset, component=component,
+                )
+                + '<p><a href="/admin/logs?component=observium">Observium connection logs</a></p>'
+                + '<p>Operational filters above do not apply to the separate '
+                'audit histories below. '
+                'Source records and credentials are not exported.</p>'
+                + "<h3>Administration audit (latest 50)</h3>" + table(store.recent_audit())
+                + "<h3>Partner API requests (latest 50)</h3>"
+                + table(repository.administration_snapshot()["audit"]),
+                session["csrf"], username=session["username"],
             )
         company_query = ""
         company_offset = 0

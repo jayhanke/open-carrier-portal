@@ -129,6 +129,7 @@ def attach_interaction(response: Response, request: Request, context: Interactio
 def logs_markup(
     rows: list[dict[str, str]], *, base: str, application: str,
     action_id: str = "", interaction_id: str = "", offset: int = 0,
+    component: str = "",
 ) -> str:
     escape = html.escape
     content = (
@@ -141,6 +142,8 @@ def logs_markup(
         f'value="{escape(action_id, quote=True)}"></label>'
         '<label>Interaction ID<input name="interaction_id" maxlength="36" '
         f'value="{escape(interaction_id, quote=True)}"></label>'
+        '<label>Component (for example, observium)<input name="component" maxlength="64" '
+        f'value="{escape(component, quote=True)}"></label>'
         f'<button type="submit" data-action-id="{application.lower()}.logs.filter">'
         "Filter logs</button></form>"
         f'<p><a href="{base}">Clear filters / newest events</a></p>'
@@ -161,7 +164,10 @@ def logs_markup(
             value = row.get(column, "")
             cell = escape(value)
             if column in {"action_id", "interaction_id"} and value:
-                target = base + "?" + urlencode({column: value})
+                parameters = {column: value}
+                if component:
+                    parameters["component"] = component
+                target = base + "?" + urlencode(parameters)
                 cell = f'<a href="{escape(target, quote=True)}"><code>{cell}</code></a>'
             content += f"<td>{cell}</td>"
         content += "</tr>"
@@ -169,8 +175,11 @@ def logs_markup(
     for label, position in (("Newer", offset - 100), ("Older", offset + 100)):
         if position < 0 or position > 1900 or (label == "Older" and len(rows) <= 100):
             continue
-        target = base + "?" + urlencode({
+        parameters = {
             "action_id": action_id, "interaction_id": interaction_id, "offset": position,
-        })
+        }
+        if component:
+            parameters["component"] = component
+        target = base + "?" + urlencode(parameters)
         content += f'<p><a href="{escape(target, quote=True)}">{label} events</a></p>'
     return content

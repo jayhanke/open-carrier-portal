@@ -258,7 +258,7 @@ def record_data_issue(issues: list[str], message: str, *, event: str) -> None:
     if len(issues) < 19:
         issues.append(message)
     elif len(issues) == 19:
-        issues.append("Additional data is unavailable; see connector Diagnostics for details.")
+        issues.append("Additional data is unavailable; see connector Logs for details.")
 
 
 def target_origin(url: str) -> str:
@@ -282,7 +282,7 @@ def install_request_logging(app: FastAPI, store: AdminStore) -> None:
             {
                 "error": {
                     "code": "internal_error",
-                    "message": "Unexpected application failure; use X-Request-ID in Diagnostics.",
+                    "message": "Unexpected application failure; use X-Request-ID in Logs.",
                     "correlation_id": getattr(request.state, "correlation_id", reference),
                     "retry_after_seconds": None,
                 }

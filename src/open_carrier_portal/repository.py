@@ -799,6 +799,13 @@ class Repository:
             )
         return partner_id
 
+    def has_active_circuit_shares(self) -> bool:
+        with self._connection() as db:
+            return db.execute(
+                "SELECT 1 FROM circuit_shares s JOIN partners p ON p.partner_id=s.partner_id "
+                "WHERE s.status='active' AND p.state='active' LIMIT 1"
+            ).fetchone() is not None
+
     def administration_snapshot(self) -> dict[str, list[dict[str, str]]]:
         queries = {
             "partners": "SELECT partner_id, name, state FROM partners ORDER BY name LIMIT 100",

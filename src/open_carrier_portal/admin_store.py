@@ -247,6 +247,8 @@ class AdminStore:
         from open_carrier_portal.interactions import validate_filters
 
         validate_filters(action_id, interaction_id)
+        if component is not None and len(component) > 64:
+            raise ValueError("Invalid log component filter.")
         if not 0 <= offset <= 1900 or not 1 <= limit <= 101:
             raise ValueError("Invalid log pagination.")
         clauses = []

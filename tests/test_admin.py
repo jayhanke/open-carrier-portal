@@ -730,7 +730,7 @@ def test_partners_company_errors_are_visible_and_logged(admin, company_source, f
         assert response.status_code == 200
         assert "Could not load mapped companies" in response.text
         assert "Diagnostic reference:" in response.text
-        assert 'href="/admin/diagnostics"' in response.text
+        assert 'href="/admin/logs"' in response.text
         assert 'action="/admin/partner"' in response.text
         events = app.state.admin_store.recent_events("database")
         event = next(
@@ -2031,7 +2031,7 @@ def test_observium_failures_are_visible_in_diagnostics_with_request_reference(ad
         assert response.status_code == 400
         reference = response.headers["X-Request-ID"]
         assert reference in response.text
-        assert "View Diagnostics logs" in response.text
+        assert "View Logs" in response.text
         events = app.state.admin_store.recent_events("observium")
         assert events[0]["event"] == "configuration.token_missing"
         assert events[0]["reference"] == reference
