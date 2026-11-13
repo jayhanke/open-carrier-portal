@@ -30,6 +30,13 @@ from open_carrier_portal.errors import (
     MissingSourceReferenceError,
     SourceDatabaseError,
 )
+from open_carrier_portal.interactions import (
+    Interaction,
+    attach_interaction,
+    current_interaction,
+    interaction_context,
+    request_interaction,
+)
 
 
 @dataclass
@@ -76,9 +83,14 @@ def configure_logging() -> None:
 
 @contextmanager
 def log_context(
-    store: AdminStore | None = None, *, is_request: bool = False, quiet: bool = False
+    store: AdminStore | None = None, *, is_request: bool = False, quiet: bool = False,
+    request_id: str | None = None,
 ) -> Generator[LogContext]:
-    context = LogContext(store, str(uuid.uuid4()), is_request, quiet)
+    parent = _context.get()
+    context = LogContext(
+        store or (parent.store if parent else None),
+        request_id or str(uuid.uuid4()), is_request, quiet,
+    )
     token = _context.set(context)
     try:
         yield context
@@ -108,14 +120,22 @@ def log_event(
     if not logger.isEnabledFor(level):
         return
     reference = request_reference() or str(uuid.uuid4())
+    interaction = current_interaction()
+    action_id = interaction.action_id if interaction else ""
+    interaction_id = interaction.interaction_id if interaction else ""
     logger.log(
         level,
-        "%s: %s reference=%s details=%s",
+        "%s: %s reference=%s action_id=%s interaction_id=%s details=%s",
         event,
         message,
         reference or "-",
+        action_id or "-",
+        interaction_id or "-",
         json.dumps(details, sort_keys=True),
-        extra={"event": event, "request_id": reference},
+        extra={
+            "event": event, "request_id": reference,
+            "action_id": action_id, "interaction_id": interaction_id,
+        },
     )
     store = store or (context.store if context else None)
     if store is not None:
@@ -127,6 +147,8 @@ def log_event(
                 message=message,
                 request_id=reference,
                 details=details,
+                action_id=interaction.action_id if interaction else "",
+                interaction_id=interaction.interaction_id if interaction else "",
             )
         except (sqlite3.Error, OSError) as exc:
             logger.error(
@@ -255,6 +277,7 @@ def install_request_logging(app: FastAPI, store: AdminStore) -> None:
     @app.exception_handler(Exception)
     async def unexpected_error(request: Request, _: Exception):
         reference = getattr(request.state, "request_id", str(uuid.uuid4()))
+        interaction = getattr(request.state, "interaction", None)
         return JSONResponse(
             {
                 "error": {
@@ -265,7 +288,9 @@ def install_request_logging(app: FastAPI, store: AdminStore) -> None:
                 }
             },
             status_code=500,
-            headers={"X-Request-ID": reference},
+            headers={
+                "X-Request-ID": reference, **(interaction.headers() if interaction else {}),
+            },
         )
 
     @app.middleware("http")
@@ -273,24 +298,45 @@ def install_request_logging(app: FastAPI, store: AdminStore) -> None:
         existing = _context.get()
         if existing is not None and existing.is_request:
             return await call_next(request)
-        quiet = request.url.path.startswith("/admin/assets/") or request.url.path in {
-            "/health/live",
-            "/health/ready",
-            "/admin/session",
-        }
-        with log_context(store, is_request=True, quiet=quiet) as context:
+        invalid = False
+        try:
+            interaction = request_interaction(request, default="connector.direct")
+        except ValueError:
+            invalid = True
+            interaction = Interaction(
+                "connector.invalid-trace", str(uuid.uuid4()), scope=request.scope
+            )
+        request.state.interaction = interaction
+        quiet = (
+            request.url.path.startswith("/admin/assets/") or request.url.path in {
+                "/health/live", "/health/ready", "/admin/session",
+            }
+        ) and (
+            not interaction.explicit or interaction.action_id.endswith(".background")
+        )
+        with (
+            interaction_context(interaction),
+            log_context(
+                store, is_request=True, quiet=quiet, request_id=interaction.request_id,
+            ) as context,
+        ):
             request.state.request_id = context.request_id
             started = time.monotonic()
             response = None
             try:
-                response = await call_next(request)
-                response.headers["X-Request-ID"] = context.request_id
+                response = (
+                    JSONResponse({"error": "Invalid interaction identifiers."}, status_code=400)
+                    if invalid else await call_next(request)
+                )
+                attach_interaction(response, request, interaction)
                 return response
             finally:
                 route = getattr(request.scope.get("route"), "path", "unmatched")
                 component = "admin" if request.url.path.startswith("/admin") else "api"
                 status = response.status_code if response is not None else 500
-                if status >= 400 or not quiet:
+                if status >= 400 or (
+                    not quiet and request.url.path != "/admin/interactions"
+                ):
                     exc = sys.exception()
                     await run_in_threadpool(
                         log_event,

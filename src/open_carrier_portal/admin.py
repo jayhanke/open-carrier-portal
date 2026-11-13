@@ -39,6 +39,11 @@ from open_carrier_portal.diagnostics import (
     request_reference,
 )
 from open_carrier_portal.errors import ConnectorError, SourceDatabaseError
+from open_carrier_portal.interactions import (
+    current_interaction,
+    interaction_meta,
+    logs_markup,
+)
 from open_carrier_portal.models import ConnectorIdentity
 from open_carrier_portal.owner_access import approve_owner_source
 from open_carrier_portal.portal_agent import (
@@ -80,6 +85,7 @@ SECTIONS = (
     "partners",
     "remote",
     "diagnostics",
+    "logs",
     "account",
 )
 SECTION_LABELS = {
@@ -347,7 +353,8 @@ def create_admin_app(
         nav = (
             "<nav>"
             + "".join(
-                f'<a href="/admin/{s}">{escape(SECTION_LABELS.get(s, s.title()))}</a>'
+                f'<a data-action-id="connector.nav.{s}" href="/admin/{s}">'
+                f'{escape(SECTION_LABELS.get(s, s.title()))}</a>'
                 for s in SECTIONS
             )
             + form("logout", csrf, "", "Sign out")
@@ -367,6 +374,9 @@ def create_admin_app(
         return HTMLResponse(
             f"""<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+{interaction_meta("connector")}
+{'<meta name="ocp-log-endpoint" content="/admin/interactions">' if signed_in else ''}
+<script src="/admin/assets/interactions.js" defer></script>
 <title>{escape(title)} | Connector administration</title><style>
 body{{margin:0;background:#f1f5f9;color:#172b3a;font:16px system-ui,sans-serif}}
 main{{max-width:1100px;margin:2rem auto;padding:0 1rem}}
@@ -540,7 +550,8 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
         return (
             f'<form method="post" action="/admin/{action}">'
             f'<input type="hidden" name="csrf" value="{escape(csrf)}">{content}'
-            f"<button>{escape(button)}</button></form>"
+            f'<button data-action-id="connector.action.{escape(action)}">'
+            f"{escape(button)}</button></form>"
         )
 
     def company_directory(
@@ -1225,8 +1236,10 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     '<div id="map-slots" class="mapper-targets"></div></div></div>'
                     '<p id="map-active-label" class="mapper-help"></p>'
                     '<div class="mapper-actions">'
-                    '<button id="map-preview" type="button">Preview 5 mapped rows</button>'
-                    '<button id="map-save" type="button">Validate and save mappings</button>'
+                    '<button id="map-preview" type="button" '
+                    'data-action-id="connector.mapping.preview">Preview 5 mapped rows</button>'
+                    '<button id="map-save" type="button" '
+                    'data-action-id="connector.mapping.save">Validate and save mappings</button>'
                     "</div><details><summary>Source configuration (advanced)</summary>"
                     '<button id="map-template" type="button">'
                     "Load example mappings as draft</button>"
@@ -2208,6 +2221,28 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
         )
 
+    @app.get("/admin/assets/interactions.js")
+    async def interaction_script():
+        return Response(
+            Path(__file__).with_name("interactions.js").read_text(encoding="utf-8"),
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.post("/admin/interactions")
+    async def record_interaction(request: Request):
+        session = store.session(request.cookies.get("ocp_admin", ""))
+        if not session:
+            return Response("Sign in required.", status_code=401)
+        supplied = request.headers.get("x-csrf-token", "")
+        if not secrets.compare_digest(session["csrf"], supplied):
+            return Response("Invalid form token.", status_code=403)
+        context = current_interaction()
+        if context is None or not context.explicit:
+            return Response("Interaction identifiers required.", status_code=400)
+        log_event("admin", "ui.activated", "UI control activated.")
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
     @app.get("/admin/session")
     @app.post("/admin/session")
     async def session_activity(request: Request):
@@ -2389,6 +2424,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
     @app.get("/admin/{section}")
     async def admin_page(section: str, request: Request):
         if section == "login":
+            request.scope["interaction_page"] = "admin/login"
             csrf = secrets.token_urlsafe(32)
             response = page(
                 "Sign in",
@@ -2423,6 +2459,28 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 username=session["username"],
             )
         request.state.admin_activity = request.cookies["ocp_admin"]
+        request.scope["interaction_page"] = f"admin/{section}"
+        if section == "logs":
+            action = request.query_params.get("action_id", "")
+            interaction = request.query_params.get("interaction_id", "")
+            try:
+                offset = int(request.query_params.get("offset", "0"))
+                rows = await run_in_threadpool(
+                    store.recent_events, action_id=action, interaction_id=interaction,
+                    offset=offset, limit=101,
+                )
+            except ValueError:
+                return page(
+                    "Logs", '<p role="alert">Invalid log filters or page. '
+                    '<a href="/admin/logs">Reset filters</a>.</p>',
+                    session["csrf"], status=400, username=session["username"],
+                )
+            return page(
+                "Logs", logs_markup(
+                    rows, base="/admin/logs", application="Connector", action_id=action,
+                    interaction_id=interaction, offset=offset,
+                ), session["csrf"], username=session["username"],
+            )
         company_query = ""
         company_offset = 0
         portal_company_id = ""

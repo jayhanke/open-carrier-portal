@@ -22,7 +22,12 @@ from open_carrier_portal.company_policies import (
     PortalCompanyTarget,
 )
 from open_carrier_portal.config import validate_portal_url
-from open_carrier_portal.diagnostics import log_event, log_failure, target_origin
+from open_carrier_portal.diagnostics import log_context, log_event, log_failure, target_origin
+from open_carrier_portal.interactions import (
+    current_interaction,
+    interaction_context,
+    interaction_from_headers,
+)
 from open_carrier_portal.live_contract import MAX_RESULT_BYTES, LiveJob, LiveResult
 
 if TYPE_CHECKING:
@@ -30,6 +35,11 @@ if TYPE_CHECKING:
     from open_carrier_portal.repository import Repository
 
 DEFAULT_CONNECTION_FILE = Path.home() / ".open-carrier-portal" / "portal-connection.json"
+
+
+def interaction_headers() -> dict[str, str]:
+    context = current_interaction()
+    return context.headers() if context is not None else {}
 
 
 @dataclass(frozen=True)
@@ -105,6 +115,7 @@ def pair_portal(
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             response = client.post(
                 f"{portal_url}/api/connectors/pair",
+                headers=interaction_headers(),
                 json={"code": code, "connector_id": connector_id},
             )
             response.raise_for_status()
@@ -158,7 +169,7 @@ def send_heartbeat(
         )
     response = client.post(
         f"{portal_url}/api/connectors/heartbeat",
-        headers={"Authorization": f"Bearer {connection.token}"},
+        headers={"Authorization": f"Bearer {connection.token}", **interaction_headers()},
         json=payload,
     )
     response.raise_for_status()
@@ -203,7 +214,7 @@ def portal_access_requests(
     response = client.get(
         f"{portal_url}/api/connectors/access-requests",
         params={"connector_id": connection.connector_id},
-        headers={"Authorization": f"Bearer {connection.token}"},
+        headers={"Authorization": f"Bearer {connection.token}", **interaction_headers()},
         follow_redirects=False,
     )
     response.raise_for_status()
@@ -243,7 +254,7 @@ def resolve_portal_company(
         f"{portal_url}/api/connectors/companies/{recipient}",
         follow_redirects=False,
         params={"connector_id": connection.connector_id},
-        headers={"Authorization": f"Bearer {connection.token}"},
+        headers={"Authorization": f"Bearer {connection.token}", **interaction_headers()},
     )
     response.raise_for_status()
     try:
@@ -278,7 +289,7 @@ def propose_portal_company_link(
     response = client.post(
         f"{portal_url}/api/connectors/company-links",
         follow_redirects=False,
-        headers={"Authorization": f"Bearer {connection.token}"},
+        headers={"Authorization": f"Bearer {connection.token}", **interaction_headers()},
         json={
             "connector_id": connection.connector_id,
             "recipient_company_id": str(target.company_id),
@@ -328,12 +339,10 @@ def serve_live_request(
     settings: Settings,
     settings_loader: Callable[[], Settings] | None = None,
 ) -> bool:
-    from open_carrier_portal.live_reader import execute_live_request, monitoring_for_live
-
     portal_url = validate_portal_url(
         connection.portal_url, allow_insecure_http=settings.allow_insecure_http
     )
-    headers = {"Authorization": f"Bearer {connection.token}"}
+    headers = {"Authorization": f"Bearer {connection.token}", **interaction_headers()}
     with client.stream(
         "POST",
         f"{portal_url}/api/connectors/live/poll",
@@ -355,6 +364,29 @@ def serve_live_request(
         job = TypeAdapter(LiveJob).validate_python(payload["request"])
     except ValueError:
         raise ValueError("portal returned an invalid live request contract") from None
+
+    interaction = interaction_from_headers(response.headers, default="connector.live")
+    with interaction_context(interaction), log_context(request_id=str(job.request_id)):
+        log_event("portal", "live.started", "Serving a live job.", operation=job.operation)
+        try:
+            return _serve_claimed_job(
+                client, connection, job, repository=repository, settings=settings,
+                settings_loader=settings_loader,
+            )
+        except (ValueError, OSError, httpx.HTTPError) as exc:
+            log_failure("portal", "live.job_failed", exc)
+            raise
+
+
+def _serve_claimed_job(
+    client: httpx.Client, connection: PortalConnection, job: LiveJob, *,
+    repository: Repository, settings: Settings,
+    settings_loader: Callable[[], Settings] | None,
+) -> bool:
+    from open_carrier_portal.live_reader import execute_live_request, monitoring_for_live
+
+    portal_url = connection.portal_url
+    headers = {"Authorization": f"Bearer {connection.token}", **interaction_headers()}
 
     async def execute() -> LiveResult:
         effective = settings
@@ -381,6 +413,11 @@ def serve_live_request(
             )
 
     result = asyncio.run(execute())
+    log_event(
+        "portal", "live.read_completed", "Live job read completed.",
+        level=logging.WARNING if result.error else logging.INFO,
+        outcome=result.error or "success",
+    )
     encoded = result.model_dump_json().encode()
     if len(encoded) > MAX_RESULT_BYTES:
         log_event(
@@ -409,6 +446,7 @@ def serve_live_request(
     response.raise_for_status()
     if response.json() != {"status": "accepted"}:
         raise ValueError("portal returned an invalid live result acknowledgement")
+    log_event("portal", "live.result_accepted", "Portal accepted the live result.")
     return True
 
 

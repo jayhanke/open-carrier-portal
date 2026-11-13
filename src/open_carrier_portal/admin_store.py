@@ -55,9 +55,27 @@ class AdminStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     occurred REAL NOT NULL, level TEXT NOT NULL, component TEXT NOT NULL,
                     event TEXT NOT NULL, message TEXT NOT NULL, request_id TEXT NOT NULL,
-                    details TEXT NOT NULL
+                    details TEXT NOT NULL, action_id TEXT NOT NULL DEFAULT '',
+                    interaction_id TEXT NOT NULL DEFAULT ''
                 );
             """)
+            columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(local_operational_logs)")
+            }
+            for column in ("action_id", "interaction_id"):
+                if column not in columns:
+                    db.execute(
+                        f"ALTER TABLE local_operational_logs ADD COLUMN {column} "
+                        "TEXT NOT NULL DEFAULT ''"
+                    )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS local_logs_by_interaction "
+                "ON local_operational_logs(interaction_id, id)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS local_logs_by_action "
+                "ON local_operational_logs(action_id, id)"
+            )
 
     def set_password(self, username: str, password: str, *, reset: bool = False) -> None:
         username = username.strip().casefold()
@@ -204,27 +222,49 @@ class AdminStore:
         message: str,
         request_id: str,
         details: dict[str, str | int],
+        action_id: str = "",
+        interaction_id: str = "",
     ) -> None:
         with self.connection() as db:
             db.execute(
                 "INSERT INTO local_operational_logs "
-                "(occurred, level, component, event, message, request_id, details) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (time.time(), level, component, event, message, request_id, json.dumps(details)),
+                "(occurred, level, component, event, message, request_id, details, "
+                "action_id, interaction_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    time.time(), level, component, event, message, request_id,
+                    json.dumps(details), action_id, interaction_id,
+                ),
             )
             db.execute(
                 "DELETE FROM local_operational_logs WHERE id NOT IN "
                 "(SELECT id FROM local_operational_logs ORDER BY id DESC LIMIT 2000)"
             )
 
-    def recent_events(self, component: str | None = None) -> list[dict[str, str]]:
+    def recent_events(
+        self, component: str | None = None, *, action_id: str = "", interaction_id: str = "",
+        offset: int = 0, limit: int = 100,
+    ) -> list[dict[str, str]]:
+        from open_carrier_portal.interactions import validate_filters
+
+        validate_filters(action_id, interaction_id)
+        if not 0 <= offset <= 1900 or not 1 <= limit <= 101:
+            raise ValueError("Invalid log pagination.")
+        clauses = []
+        parameters: list[str | int] = []
+        for column, value in (
+            ("component", component), ("action_id", action_id), ("interaction_id", interaction_id),
+        ):
+            if value is not None and value != "":
+                clauses.append(f"{column} = ?")
+                parameters.append(value)
         with self.connection() as db:
             rows = db.execute(
-                "SELECT occurred, level, component, event, message, request_id, details "
+                "SELECT occurred, level, component, event, message, request_id, details, "
+                "action_id, interaction_id "
                 "FROM local_operational_logs "
-                + ("WHERE component = ? " if component is not None else "")
-                + "ORDER BY id DESC LIMIT 100",
-                (component,) if component is not None else (),
+                + ("WHERE " + " AND ".join(clauses) + " " if clauses else "")
+                + "ORDER BY id DESC LIMIT ? OFFSET ?",
+                [*parameters, limit, offset],
             ).fetchall()
         return [
             {
@@ -235,6 +275,8 @@ class AdminStore:
                 "message": row["message"],
                 "reference": row["request_id"],
                 "details": row["details"],
+                "action_id": row["action_id"],
+                "interaction_id": row["interaction_id"],
             }
             for row in rows
         ]

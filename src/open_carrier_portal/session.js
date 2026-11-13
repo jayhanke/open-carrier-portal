@@ -27,11 +27,12 @@
     resume.type = "button";
     resume.textContent = "Resume session";
     resume.addEventListener("click", async () => {
+      const send = window.ocpInteractions?.capture(resume).fetch || fetch;
       if (busy) return;
       busy = true;
       resume.disabled = true;
       try {
-        const response = await fetch("/admin/session", {cache: "no-store"});
+        const response = await send("/admin/session", {cache: "no-store"});
         if (response.status === 401) {
           expired();
           return;
@@ -60,18 +61,18 @@
         busy = false;
         resume.disabled = false;
       }
-      if (!signedOut) renew();
+      if (!signedOut) renew(send);
     });
     notice.append(link, " ", resume);
   };
-  const renew = async () => {
+  const renew = async (send = fetch) => {
     if (busy || signedOut || !pending || document.visibilityState !== "visible" ||
         Date.now() - attempted < 60000) return;
     busy = true;
     pending = false;
     attempted = Date.now();
     try {
-      const response = await fetch("/admin/session", {
+      const response = await send("/admin/session", {
         method: "POST",
         headers: {"X-CSRF-Token": csrf.content}
       });

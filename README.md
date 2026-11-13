@@ -769,6 +769,41 @@ session hashes, partner grants, configuration and audit events.
   setup/token, expired admin form verification, DNS/TLS/timeout, rejected credentials,
   HTTP 404/429/5xx, redirects and invalid JSON are distinguished. No raw
   configuration/secret bundle is exported.
+- **Logs:** A dedicated `/admin/logs` page for signed-in local administrators,
+  separate from the portal's platform-owner Logs page. Only this connector's
+  `local_operational_logs` records are displayed; no portal logs are copied or
+  fetched. Click an **Action ID** to group uses of the same control, or an
+  **Interaction ID** to see a single press and its requests/events. Both fields
+  also have exact-match filters, with 100 events per page and the existing 2,000
+  event retention. Old log rows remain available with blank interaction fields.
+  Logs are independently written to connector service output:
+  `journalctl -u ocp-connector -f`.
+  Buttons, form submissions, links and disclosure controls receive DOM IDs and
+  `data-action-id` attributes, including controls created by the mapping editor.
+  Primary actions have readable IDs such as `connector.mapping.preview`,
+  `connector.mapping.save` and `connector.action.readiness`; other IDs derive from
+  static page/control identity/structure, not control labels or entered values.
+  Set an explicit `data-action-id` for new controls that must keep their logical ID
+  through layout redesigns. Each press gets a fresh UUID; requests keep separate
+  generated `X-Request-ID` references. JavaScript is required to identify the
+  pressed control; direct requests remain usable and are labelled `connector.direct`.
+  `X-Action-ID` / `X-Interaction-ID` headers, or reserved `__ocp_action` /
+  `__ocp_interaction` link/form parameters, carry the press through requests and
+  same-origin redirects. The browser removes reserved parameters after loading.
+  Invalid IDs are explicitly rejected, and recording a UI activation requires a
+  local admin session and its CSRF token. IDs are diagnostic metadata, never
+  credentials or authorization claims.
+  Portal live reads carry the originating press in poll response headers and
+  result-upload headers without changing job/result JSON. Source/monitoring events
+  inherit that interaction and use the live-job UUID as their request reference.
+  Copy the Interaction ID between the two separate log pages to follow a read.
+  Routine background/assets/session checks stay quiet; checks explicitly made by
+  a button press and failures are logged. Existing audit retention is unchanged.
+  Same-turn fetches are tagged automatically. Async handlers must capture
+  `const interaction = window.ocpInteractions.capture(button)` before awaiting or
+  scheduling work, then use `interaction.fetch(...)` for each follow-up request.
+  This preserves the press across asynchronous work even when another control is
+  clicked meanwhile. The bundled mapping and session UI follow this behavior.
   Observium redirects do not pass a health check, even if they contain success-shaped
   JSON; configure the final HTTPS installation base URL instead.
   The read-only Observium health check requests `api/v0/devices/` with `pageno=1`
