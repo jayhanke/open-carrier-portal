@@ -336,26 +336,27 @@ def create_admin_app(
     def setup_navigation() -> str:
         identity = repository.get_connector_identity()
         identity_ready = bool(identity and identity.enabled)
-        name = settings.source_database_profile or store.get("source").get("name", "")
-        profile = repository.get_source_database_profile(name) if name else None
-        source_ready = bool(profile and profile.enabled)
-        mapping_ready = False
-        mapping_status = "Select an enabled source and configure its required mappings."
-        if source_ready and profile:
+        profiles = repository.enabled_source_database_profiles()
+        source_ready = bool(profiles)
+        mapping_ready = source_ready
+        mapping_status = (
+            "Required fields are configured for every enabled connection; "
+            "run readiness checks to validate the databases."
+            if source_ready else "Add an enabled connection and configure its required mappings."
+        )
+        for profile in profiles:
             try:
                 missing = SourceMapping.from_json(profile.mapping_json).missing_fields_for(
                     monitoring=monitoring_enabled()
                 )
             except ValueError as exc:
                 log_failure("database", "setup.mapping_invalid", exc)
+                mapping_ready = False
                 mapping_status = "Saved mapping is invalid. Review Mapping and Logs."
             else:
-                mapping_ready = not missing
-                mapping_status = (
-                    "Required fields are configured; run readiness checks "
-                    "to validate the database."
-                    if mapping_ready else "Required fields still need mapping."
-                )
+                if missing:
+                    mapping_ready = False
+                    mapping_status = "Required fields still need mapping in an enabled connection."
         portal = None
         portal_status = "Optional: pair this connector with Carrier Portal."
         if connection_file.exists():
@@ -386,7 +387,7 @@ def create_admin_app(
         completed = {
             "identity": (identity_ready, "An enabled company identity is configured."),
             "sources": (
-                source_ready, "An enabled source profile is selected; test its connection."
+                source_ready, "Enabled database connections are configured; test their connections."
             ),
             "mapping": (mapping_ready, mapping_status),
             "portal": (portal is not None, portal_status),
@@ -968,6 +969,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             profile = repository.get_source_database_profile(source) if source else None
             identity_ready = bool(identity and identity.enabled)
             source_selected = bool(profile and profile.enabled)
+            connections_configured = bool(repository.enabled_source_database_profiles())
             portal = store.get("heartbeat")
             paired = connection_file.exists()
             connected = bool(
@@ -1003,17 +1005,24 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                     "Set up your connections",
                     "Selected"
                     if source_selected
+                    else "Configured"
+                    if not source and connections_configured
                     else "Profile disabled"
                     if profile
                     else "Profile missing"
                     if source
                     else "Not selected",
-                    "selected" if source_selected else "attention" if source else "",
+                    "selected" if source_selected or (not source and connections_configured)
+                    else "attention" if source else "",
                     "A database profile is selected. Test its connection before sharing data."
                     if source_selected
                     else f"The selected profile ({source}) is missing or disabled. "
                     "Review your source settings before continuing."
                     if source
+                    else "Enabled database connections are configured. Test their connections "
+                    "and mappings before sharing. A legacy API-default selection is separate "
+                    "and is not required for portal browsing."
+                    if connections_configured
                     else "Add your database and monitoring connections. You can manage "
                     "existing connections or add more as your setup grows.",
                     "Manage connections",
@@ -1021,7 +1030,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 (
                     "mapping",
                     "Check your database mapping",
-                    "Review mapping" if source_selected else "After source setup",
+                    "Review mapping" if connections_configured else "After source setup",
                     "",
                     "Match your database tables and columns to the connector's fields. "
                     "Validate the mapping and preview a few records before sharing.",
@@ -1060,7 +1069,7 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                 '<li class="setup-card setup-verify"><div class="setup-card-head">'
                 '<h3>Verify your setup</h3><span class="setup-badge">Run checks</span></div>'
                 "<p>A saved source profile is not a health check. Run validation to check "
-                "the selected source connection and mapped columns.</p>"
+                "source connectivity and mapped columns.</p>"
                 + form("readiness", csrf, "", "Run readiness checks")
                 + '<p><a class="portal-link" href="/admin/logs">View logs &rarr;</a>'
                 '</p></li><li class="setup-card"><div class="setup-card-head">'
@@ -2252,7 +2261,10 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
             if repository.get_connector_identity() is None:
                 raise ValueError("company identity is not initialized")
             name = settings.source_database_profile or store.get("source").get("name")
-            if name:
+            names = [name] if name else [
+                profile.name for profile in repository.enabled_source_database_profiles()
+            ]
+            for name in names:
                 source = source_for(repository, name, settings.database_path)
                 source.health_check()
                 source.validate_mapping()
@@ -2266,8 +2278,8 @@ padding:1rem;font-size:.85rem}}.mapper-preview{{overflow:auto;max-height:24rem}}
                             for field in fields
                         )
                     )
-                checks.append("Source connectivity/mapping passed")
-            else:
+                checks.append(f"Source connectivity/mapping passed: {name}")
+            if not names:
                 checks.append("No source selected: circuit retrieval is not ready")
             checks.append(
                 "Portal is optional; heartbeat does not enable live portal data retrieval"

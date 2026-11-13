@@ -79,12 +79,15 @@ def test_configuration_checks_change_without_connecting_to_source(admin, tmp_pat
             timeout_seconds=10,
             mapping_json=json.dumps(mapping),
         )
-        store.save("source", {"name": "selected"})
+        assert store.get("source") == {}
         _, setup = navigation(browser)
         assert completed(setup, "identity")
         assert completed(setup, "sources")
         assert completed(setup, "mapping")
         assert not database.exists()
+        dashboard = browser.get("/admin/setup").text.split("<h2>Setup</h2>", 1)[1]
+        assert "legacy API-default selection is separate" in dashboard
+        assert "After source setup" not in dashboard
         store.save("observium", {"url": "https://monitoring.example"})
         _, setup = navigation(browser)
         assert not completed(setup, "mapping")
@@ -154,6 +157,69 @@ def test_sharing_check_is_not_limited_to_first_hundred_rows(admin):
         assert completed(navigation(browser)[1], "partners")
         repo.revoke_partner(partner)
         assert not completed(navigation(browser)[1], "partners")
+
+
+def test_mapping_checks_all_enabled_connections_and_ignores_disabled_ones(admin, tmp_path):
+    app, _, _ = admin
+    repo = app.state.repository
+
+    def profile(name, mapping, enabled=True):
+        repo.put_source_database_profile(
+            name=name, driver="sqlite", database_name=str(tmp_path / f"{name}.db"),
+            host=None, port=None, username=None, password_env_var=None, tls_ca_path=None,
+            timeout_seconds=10, mapping_json=mapping.to_json(), enabled=enabled,
+        )
+
+    profile("complete", SourceMapping.sharing_defaults())
+    profile("incomplete", SourceMapping({}))
+    with TestClient(app, base_url=BASE) as browser:
+        login(browser)
+        _, setup = navigation(browser)
+        assert completed(setup, "sources") and not completed(setup, "mapping")
+        profile("incomplete", SourceMapping({}), enabled=False)
+        assert completed(navigation(browser)[1], "mapping")
+        profile("incomplete", SourceMapping.sharing_defaults())
+        assert completed(navigation(browser)[1], "mapping")
+        assert app.state.admin_store.get("source") == {}
+
+
+def test_readiness_checks_enabled_connections_without_selecting_api_default(
+    admin, tmp_path, monkeypatch,
+):
+    app, _, _ = admin
+    tested = []
+
+    class Source:
+        def health_check(self):
+            pass
+
+        def validate_mapping(self):
+            pass
+
+        def missing_fields_for(self, **kwargs):
+            return {}
+
+    def source_for(repository, name, metadata_path):
+        tested.append(name)
+        return Source()
+
+    monkeypatch.setattr("open_carrier_portal.admin.source_for", source_for)
+    for name in ("first", "second"):
+        app.state.repository.put_source_database_profile(
+            name=name, driver="sqlite", database_name=str(tmp_path / f"{name}.db"),
+            host=None, port=None, username=None, password_env_var=None, tls_ca_path=None,
+            timeout_seconds=10, mapping_json=SourceMapping.sharing_defaults().to_json(),
+        )
+    with TestClient(app, base_url=BASE) as browser:
+        login(browser)
+        post(browser, "identity", name="Example Carrier")
+        response = post(browser, "readiness")
+        assert response.status_code == 200
+        assert "Source connectivity/mapping passed: first" in response.text
+        assert "Source connectivity/mapping passed: second" in response.text
+        assert "circuit retrieval is not ready" not in response.text
+        assert tested == ["first", "second"]
+        assert app.state.admin_store.get("source") == {}
 
 
 def test_pairing_and_sharing_checks_follow_current_configuration(admin, company_link):

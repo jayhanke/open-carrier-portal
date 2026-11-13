@@ -395,6 +395,13 @@ class Repository:
             return None
         return self._source_profile(row)
 
+    def enabled_source_database_profiles(self) -> list[SourceDatabaseProfile]:
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM source_database_profiles WHERE enabled=1 ORDER BY name"
+            ).fetchall()
+        return [self._source_profile(row) for row in rows]
+
     def get_source_database_profile_by_id(self, profile_id: str) -> SourceDatabaseProfile | None:
         with self._connection() as db:
             row = db.execute(

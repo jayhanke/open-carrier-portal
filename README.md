@@ -745,11 +745,16 @@ session hashes, partner grants, configuration and audit events.
   neither persisted nor displayed. This is manual browsing, not background
   synchronization. Saving a new connection name preserves other saved connections.
 - **Navigation:** Setup, Logs, Account and sign-out controls appear in the utility row.
-  Setup navigation below shows checkmarks for configured company identity, selected
-  enabled source, required mappings, valid portal pairing, sharing and direct partner
+  Setup navigation below shows checkmarks for configured company identity, enabled
+  database connections, required mappings, valid portal pairing, sharing and direct partner
   connections. Checks are derived from current saved settings, not page visits, and
   disappear when the relevant configuration is disabled, removed or becomes incomplete.
   Mapping checks include the extra references required when monitoring is enabled.
+  Connections does not require selecting a legacy API-default profile. Mapping is
+  complete when every enabled database connection has its required fields configured;
+  disabled profiles do not block completion. Without an explicit API-default profile,
+  readiness checks validate all enabled database connections without selecting one,
+  changing API configuration or granting access.
   They do not perform network/database tests or claim live service health; use
   readiness checks to validate connectivity and source schema. Portal and sharing
   remain optional.
